@@ -1,0 +1,44 @@
+debug: true
+
+discovery:
+  engine: mdns
+  mdns:
+    zone: local
+    interface: ib0
+
+cluster:
+  engine: none
+  etcdint:
+    debug: true
+    server_addr: 172.16.1.254:2380
+    client_addr: 172.16.1.254:2379
+    wal_size: 18874368
+    store: data/cluster/etcdint
+
+proxy:
+  engine: [ sheepdog ]
+  sheepdog:
+    debug: true
+    maxconn: 10240
+    listen:
+      - tcp://172.16.1.254:7000
+      - unix://var/run/sheepdog.sock
+
+api:
+  engine: [ json, msgpack ]
+  json:
+    listen:
+      - unix://var/run/storage.sock
+
+backend:
+  engine: filesystem
+  filesystem:
+    debug: true
+    options:
+      sync: true
+
+node:
+  name: cc.z1.sdstack.com
+  uuid: 1234567-89-00-99-99
+  zone: zoneuuid
+  rack: rackuuid

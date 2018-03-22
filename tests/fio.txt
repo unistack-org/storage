@@ -1,0 +1,15 @@
+[global]
+filename=/path/to/device
+runtime=120
+ioengine=libaio
+direct=1
+ramp_time=10    
+group_reporting
+
+[randrw]
+readwrite=randrw
+rwmixread=70
+rwmixwrite=30
+iodepth=4
+blocksize=4k
+
