@@ -1,0 +1,170 @@
+# ROADMAP: unistack storage — распределённая блочная SDS на Go
+
+Цели (зафиксированы владельцем):
+1. **CRUSH-крашмапы как в Ceph** — размещение object/реплик по topology-map
+   (region → zone → rack → host → disk), детерминированное, с reweight/
+   migration при изменении кластера.
+2. **Только Go, скорость не ниже Vitastor** (vitastor.io: ~0.14 мс на 4K,
+   миллионы IOPS на узел; выводы из их докладов: CPU — узкое место →
+   минимум копирований/аллокаций/сериализаций, io_uring, zero-copy сеть).
+3. **Конечная цель: диск внутри ВМ виден как NVMe-устройство**
+   (цепочка vhost-user-blk → qemu-storage-daemon → vfio-user зафиксирована
+   в `unistack/todos/storage-nvme-vfio-user.md`; путь без патчей QEMU).
+
+Стратегия: **greenfield** поверх каркаса репозитория (см. [AUDIT.md](AUDIT.md)):
+реестр-паттерн интерфейсов оставить, sheepdog-слой и CLI-заглушки удалить,
+данные/протоколы не совместимы с чем-либо — протокол свой.
+
+---
+
+## Фаза 0 — Гигиена репозитория (1–2 дня)
+
+- [ ] `go.mod` (`module github.com/unistack-org/storage`, Go 1.23+), `go work` совместимость с `../go.work`
+- [ ] Удалить: `proxy/sheepdog/`, `sds-storage/cmd/*` (заглушки), `api/` (закомментирован),
+      `cache/block`, `cache/filesystem` (пустые), `journal/leveldb`, `kv/` (в текущем виде)
+- [ ] Зафиксировать скелет: `pkg/backend`, `pkg/cache`, `pkg/cluster` (registry), остальное — новые пакеты
+- [ ] CI: build + vet + race-tests (GitHub Actions, gofmt)
+- [ ] README: назначение, статус, ссылки на AUDIT/roadmap
+
+## Фаза 1 — Локальное ядро: быстрый single-node data path (2–4 недели)
+
+Цель: один узел держит диск; fio бьёт наш NBD/сокет — база для всех замеров.
+
+- [ ] `pkg/object`: объект = 64-бит ObjectID (OID), размер блока 2–4 MiB (shift, как Sheepdog object / Vitastor 4M)
+- [ ] `pkg/store` (локальный): файл на диск, **O_DIRECT**, имена по OID;
+      preallocate (fallocate), usage-учёт
+- [ ] **io_uring** ring (`pkg/iouring`: registered fds + registered buffers,
+      SQPOLL опционально); fallback `preadv2/pwritev` на non-Linux
+- [ ] No-alloc data path: пулы буферов (arena/mmap), никаких `make()` на I/O;
+      бенчмарк-гейт «0 allocs/op» в CI
+- [ ] `pkg/journal`: WAL для метаданных objects (задел под journaling Vitastor-типа)
+- [ ] NBD-сервер (`pkg/nbd`, протокол NBD over unix/TCP) — точка входа для QEMU/fio
+- [ ] Приёмка фазы: `fio --ioengine=nbd/libaio` 4K randread ≥ базовой линии
+      (замер локального файла как потолок), latency p99 < 1 мс на NVMe-хосте
+
+## Фаза 2 — Сеть и репликация (3–5 недель)
+
+- [ ] `pkg/net`: свой бинарный протокол (фикс. заголовок 16–32 B: OID, offset,
+      len, epoch, flags; без grpc/protobuf на data path)
+- [ ] Клиентские пулы соединений, pipeline/batch запросов, `MSG_ZEROCOPY`
+      (отправка), приём через io_uring (`SO_ZEROCOPY` позже)
+- [ ] Репликация: N-копий, запись у всех реплик (quorum-запись, read-any),
+      версии объекта (epoch+generation), flush/fsync-семантика для FUA
+- [ ] Отказы: heartbeat, таймауты, деградация при потере реплики;
+      recovery-трафик отдельным приоритетом
+- [ ] Тесты: chaos (обрывы, задержки, partial write), `go test -race`
+
+## Фаза 3 — Кластер, метаданные, CRUSH (4–6 недель) — «как Ceph»
+
+- [ ] `pkg/mds`: метаданные кластера поверх **etcd** (external; embedded
+      `cluster/etcdint` — опция для all-in-one): список OSD, epoch карты,
+      inventory объектов (OID → OSDs), VDI/volume-таблица
+- [x] **CRUSH — ключевой deliverable: вынесен в отдельный репозиторий
+      [`crushkv`](https://github.com/unistack-org/crushkv) (`../crushkv`), ГОТОВО:**
+  - [x] Движок `crushkv/crush` на Go — **byte-exact порт C-ядра Ceph**
+        (builder.c/mapper.c/hash.c): все алгоритмы uniform/list/tree/straw/straw2,
+        choose/chooseleaf, все tunables-профили (legacy…optimal), LN-таблицы,
+        jenkins hash. Проверено ~6000 golden-векторами, сгенерированными
+        настоящим C-кодом Ceph (`crush/testdata/golden_*.txt`) — 100% совпадение.
+  - [x] `crushkv/crushmap`: текстовый парсер `*.crush` (совместим с Ceph),
+        JSON, и **двоичный кодек формата Ceph CrushWrapper** (`binary.go`:
+        magic 0x00010000, bucket-slots с per-alg хвостами, rule-slots,
+        string-мапы с историческим 64-бит quirk, tunables, class maps,
+        choose_args) — decode/encode, круговой тест 600 golden-векторов через
+        text→binary→decode→compile→placement, байт-стабильный encode.
+  - [x] **零-GC data path**:placement считается в mmap-арене
+        (`crush.Work` + `docs/GC_ARENA.md`): 225 OSD, 3 уровня, straw2, rep3 —
+        **34.5 мкс на выбор, 0 B/op, 0 allocs/op**; carve из арены 290 нс vs
+        690–940 нс у `make()`. GC на пути размещения отсутствует полностью.
+  - [x] Тесты: воспроизводимость (golden Ceph), reweight in/out (вес 0),
+        movement-свойства CRUSH — в `crush/*_test.go`.
+  - [ ] Интеграция в storage: `pkg/crush` — тонкая обёртка: карта в etcd
+        (epoch-ами), кэш `pg/объект → OSD`, отправка карты клиентам.
+  - [ ] Reweight-валидатор, `rule`-валидатор под наши volume-class (SSD/HDD),
+        эмуляция отказов (chi-square равномерность на больших x) — поверх crushkv.
+- [ ] `pkg/cluster`: вступление узла, epoch-карты, отправка карты клиентам
+      (клиент считает placement сам и шлёт данные напрямую OSD — без прокси,
+      как Vitastor/Ceph)
+- [ ] CLI `unistorage`: node add/ls/out, volume create/ls/rm, map dump/check,
+      reweight, recovery status
+
+## Фаза 4 — Экспорт в ВМ: «NVMe внутри виртуалки» (2–4 недели)
+
+Порядок от простого к целевому (детали и команды —
+`unistack/todos/storage-nvme-vfio-user.md`):
+
+- [ ] **4a MVP (дни): NBD → QEMU `-blockdev driver=nbd` → `-device nvme`**
+      — в госте сразу `/dev/nvme0n1`; цена: лишние копирования, latency выше
+- [ ] **4b Целевой: Go vhost-user-blk server (`pkg/vub`)** — unix-сокет,
+      handshake (GET/SET_FEATURES, SET_MEM_TABLE, SET_VRING_*), mmap гостевой
+      памяти (hugepages), разбор desc/avail/used rings, multi-queue; QSD как
+      мост `--export type=vfio-user` → QEMU `-device vfio-user-pci`
+      (в госте virtio-blk) + вариант NVMe через QSD NBD-экспорт + QEMU NVMe
+- [ ] Интеграция с `unistack/pkg/storage` (Provider-драйвер `unistorage`:
+      CreateVolume/DeleteVolume/Attach) и `pkg/qemu` (`Drive.VfioUser`)
+- [ ] Отказоустойчивость экспорта: смерть Go-бэкенда → QSD reconnect,
+      без висячих сокетов/hugepages
+- [ ] e2e-тест: Linux+KVM, гость пишет/читает, fio внутри гостя
+
+## Фаза 5 — Производительность до уровня Vitastor (постоянно, с замерами на каждую фазу)
+
+- [ ] Бенч-стенд: 3–5 нод, NVMe, 25/40GbE; профили из `tests/fio.txt` +
+      randread/randwrite 4K/64K/1M, depth 4/16/128
+- [ ] Цели (ориентир Vitastor highload-доклады): 4K randread **> 100k IOPS/ноду**
+      на 3-реплики по TCP, **> 200k** с MSG_ZEROCOPY; латентность single
+      4K read < 0.2–0.3 мс (их 0.14 мс — с RDMA; зафиксировать: RDMA — stretch)
+- [ ] Оптимизации по результатам perf: pinned per-CPU workers (SO_REUSEPORT /
+      EPOLL_TAG), registered io_uring fds+bufers, отключение GC-давления
+      (GOGC off на data-потоках / ballast), hugepages для буферов,
+      NUMA-affinity, опционально kernel-bypass (netmap/eBPF) — только если
+      perf покажет сеть узким местом
+- [ ] Регулярный сравнительный отчёт против Vitastor на том же железе
+      (fio-скрипты в `bench/`)
+
+## Фаза 6 — Функциональность уровня Ceph-фич (после 1–5)
+
+- [ ] снапшоты (copy-on-write по OID-поколениям), клон volumа
+- [ ] thin provisioning + UNMAP/discard (в NBD и vhost-user-blk)
+- [ ] erasure coding (RS) для холодных классов
+- [ ] квоты, QoS (IOPS/BPS-шейпинг per-volume)
+- [ ] бекапы/экспорт (qemu-img convert-совместимый raw-стрим)
+- [ ] AES-256-XTS шифрование per-volume (ключ в MDS)
+- [ ] balancer: автоматический reweight по free-space (веса в CRUSH map)
+
+6. **Сравнение с Vitastor по placement (по их исходникам, /tmp/vitastor)**:
+
+   | Аспект | Vitastor | Мы (crushkv) |
+   |---|---|---|
+   | Алгоритм размещения | **нет CRUSH**: формула O(1) для EC + таблица `pg_mapping` в etcd, составленная офлайн LP-планировщиком | CRUSH-деревья (straw2 и др.), детерминированный выбор на клиенте, карта в MDS |
+   | Balance при изменениях | перестроение таблицы офлайн-планировщиком + массовый трафик переезда (LP минимизирует movement) | CRUSH-минимальный movement по построению (движок протестирован на movement-свойствах) |
+   | Чтение карты в data path | etcd в пути клиента (Watch pg_mapping) — плюс: централизованный контроль; минус: etcd в критическом пути | карта epoch-ами в памяти клиента, кэш pg→OSD; компиляция карты один раз на epoch |
+   | Веса/ревилиты | per-OSD утилизация в таблице планировщика | веса 16.16 в карте, reweight in/out из коробки (byte-exact Ceph) |
+   | Failure domain | задаётся планировщиком руками/скриптами | топология деревом (region→zone→rack→host→osd), правила `failure_domain` |
+   | Скорость placement | O(1) табличный lookup (очень быстро) | straw2 3-уровня rep3: 34.5 мкс/выбор (225 OSD), 0 аллокаций; кэш pg→OSD даёт тот же O(1) на горячем пути |
+   | Совместимость | своя система | **байт-в-байт совместимость с Ceph CRUSH** (текст `.crush` и бинарный CrushWrapper) — можно брать готовые Ceph-крашмапы |
+
+   Вывод: у Vitastor плюсы — O(1) и отсутствие movement-шторма при EC за счёт
+   офлайн-планирования; минусы — etcd в пути клиента и отсутствие стандарта
+   карты. Наш путь: CRUSH (переносимый, проверенный 15-ю годами Ceph) + кэш
+   pg→OSD = тот же O(1) на горячем пути без внешних зависимостей.
+
+## Риски / решения к зафиксировать
+
+1. **io_uring только Linux** — продуктовая платформа Linux; macOS только для
+   разработки (fallback-путь preadv2).
+2. **«NVMe в госте»**: честный выбор — NVMe-эмуляция QEMU поверх NBD (просто,
+   медленно) vs virtio-blk через vfio-user (быстро, в госте `/dev/vd*`).
+   Решение владельца: MVP=NBD+nvme, целевой=vhost-user. Не называть в GUI
+   «NVMe» то, что отдаёт virtio-blk.
+3. **Скорость Go против C++ Vitastor**: достижимо при no-alloc data path +
+   io_uring + минимум протокола (их же выводы: CPU — узкое место). Риск:
+   GC → **mitigation реализован и измерен** (crushkv/docs/GC_ARENA.md):
+   placement в mmap-арене, 0 B/op на горячем пути; тот же приём (arena +
+   переиспользование буферов) — обязательный стандарт для I/O-пути storage.
+4. **CRUSH-совместимость** с Ceph-форматом карты: **реализовано в crushkv** —
+   читаем и пишем и текстовый `*.crush`, и бинарный CrushWrapper Ceph
+   (byte-exact движок + golden-тесты). У Ceph есть PG-слой, а у нас объект
+   выбирается напрямую (свой pg→OSD-кэш при необходимости) — совместимость
+   по формату карты и алгоритму выбора, семантика верхнего слоя своя.
+5. Объём: это год+ полной разработки до production. MVP (фазы 0–4a) —
+   несколько недель до «NVMe в госте».
