@@ -262,9 +262,13 @@
       детектор (только транспортные ошибки; любой протокольный ответ = жив), prober
       пингует по свежим соединениям, evict => meta weight 0 (placement исключает),
       восстановление => weight 1; SetOutTime(0) = noout; тесты TestClusterOutTime*;
-      (3) пресеты правил
-      поверх crush-билдера (`rack-aware rep3`, `EC 2+2 по ДЦ` = их level_placement dc=112233,
-      `dc preferred` = их `dc ?= "x"`), чтобы не писать CRUSH-rule руками.
+      (3) пресеты правил DONE (crushkv 961dd00): `crush.RackAwareRep3(root, domain)` —
+      rep3 с failure_domain по выбору (rack/ДЦ: уникальность гарантирована на уровне
+      выбранного домена, выше — нет, как в Ceph); `crush.EC2Plus2AcrossDCs(root, dcType)` —
+      EC k+m, chooseleaf_indep по ДЦ = их level_placement dc=NN..N (один шард на ДЦ);
+      `crush.DCPreferred(ruleset, dcBucket, domain)` = их `dc ?= "x"` (правило на ДЦ,
+      адресация правил — индекс в слайсе, Ruleset = метаданные). numrep=0 → размер пула.
+      Тесты TestPreset* (5 шт, -race).
       Справочник Vitastor: docs/config/pool.ru.md (failure_domain, level_placement,
       raw_placement DSL, pg_minsize, osd_out_time, noout, reweight, tags).
 - [ ] Цели (ориентир Vitastor highload-доклады): 4K randread **> 100k IOPS/ноду**
