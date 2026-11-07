@@ -186,6 +186,10 @@
       на Linux+KVM (x86_64 или aarch64 Linux-хост с QEMU ≥ 8)
 - [ ] Интеграция с `unistack/pkg/storage` (Provider-драйвер `unistorage`:
       CreateVolume/DeleteVolume/Attach) и `pkg/qemu` (`Drive.VfioUser`)
+- [ ] **4c VDUSE-экспорт (Linux, после 4a на Linux-хосте)**: `/dev/vduse` —
+      userspace-блочное устройство без QEMU; Vitastor прямо называет NBD
+      «устаревшим» и продвигает VDUSE для блочных устройств в хосте
+      (нужен для CSI-сценариев и монтирования тома как диска вне ВМ)
 - [ ] Отказоустойчивость экспорта: смерть Go-бэкенда → QSD reconnect,
       без висячих сокетов/hugepages
 - [ ] e2e-тест: Linux+KVM, гость пишет/читает, fio внутри гостя
@@ -202,6 +206,30 @@
       (GOGC off на data-потоках / ballast), hugepages для буферов,
       NUMA-affinity, опционально kernel-bypass (netmap/eBPF) — только если
       perf покажет сеть узким местом
+- [ ] **In-memory мета-индекс объектов** (урок Vitastor: метаданные всегда в
+      RAM, ~512 МБ/ТБ при блоке 128K; журнал по умолчанию тоже в RAM — 32 МБ
+      на SSD-кластер): OSD не читает заголовок объекта с диска на пути
+      запроса; per-object версия живёт в RAM-индексе (дешёвый CAS/версионность)
+- [ ] **Ленивый fsync: операция SYNC + режим immediate_commit=off** (урок
+      Vitastor): запись без fdatasync, клиент кэширует незафиксированное в
+      памяти, повторяет после реконнекта, SYNC каждые client_dirty_limit
+      байт — главный источник их цифр на дешёвых SSD; NBD flush/SYNC → в
+      Volume.Flush
+- [ ] **Восстановление пообъектное, не PG-ами** (урок Vitastor; Ceph из-за
+      PG-гранулярности получает взрывной recovery): recovery-воркер чинит
+      отдельные объекты строки pg
+- [ ] **Клиент «вечно ждёт», а не ошибается** (урок Vitastor: EPIPE →
+      бесконечный retry): при полном рестарте кластера клиенты зависают,
+      но не отваливаются; наш StatusStale→refresh дополнить экспоненциальным
+      retry до восстановления кворума (опция hard/soft semantics)
+- [ ] Тест-кейс «призрачные удаления» (их известный баг): create/delete
+      тома в деградированном кластере + подъём вернувшихся OSD — удалённые
+      объекты не должны воскреснуть (epoch fencing это покрывает — проверить)
+- [ ] Опционально: **монитор-ребалансировщик** (аналог Vitastor lp_solve,
+      равномерность 96–99%): stateless-демон поверх etcd правит веса CRUSH
+      по free-space и публикует новые epoch; OSD с ним не общаются (только
+      etcd). Наших χ²=25 при 65k pg хватает без LP — LP только для кластеров
+      с сильной неравномерностью дисков
 - [ ] Регулярный сравнительный отчёт против Vitastor на том же железе
       (fio-скрипты в `bench/`)
 
@@ -216,6 +244,10 @@
 - [ ] balancer: автоматический reweight по free-space (веса в CRUSH map)
 
 ### Сравнение с Vitastor по placement (по их исходникам, /tmp/vitastor)
+
+   Источник архитектуры: vitastor/docs/intro/architecture.ru.md (PG-таблица в
+   etcd + lp_solve; NBD «устарел» → VDUSE; метаданные и журнал в RAM;
+   lazy fsync/SYNC; recovery объектами; монитор = node.js поверх etcd).
 
    | Аспект | Vitastor | Мы (crushkv) |
    |---|---|---|
