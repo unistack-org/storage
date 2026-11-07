@@ -23,6 +23,15 @@ type Conn struct {
 	seq  uint32
 	dead bool // transport error: the stream state is unknown
 	ep   atomic.Uint32
+	// Per-connection wire scratch: a stack array handed to io.ReadFull
+	// (io.Reader interface) escapes to the heap, so reusing these keeps
+	// the request loop allocation-free.
+	sreq  [ReqHeaderSize]byte
+	sresp [RespHeaderSize]byte
+	// h is a reusable request header: do() takes it by value semantics
+	// (we stamp Seq/Epoch then encode immediately), so one scratch
+	// header per Conn avoids the &ReqHeader{...} argument allocation.
+	h ReqHeader
 }
 
 // SetEpoch stamps every subsequent request with the given placement
@@ -102,9 +111,8 @@ func (cc *Conn) do(ctx context.Context, h *ReqHeader, payload, p []byte) (int, e
 		}
 		return 0, err
 	}
-	var rb [ReqHeaderSize]byte
-	h.Encode(rb[:])
-	if _, err := cc.wr.Write(rb[:]); err != nil {
+	h.Encode(cc.sreq[:])
+	if _, err := cc.wr.Write(cc.sreq[:]); err != nil {
 		return fail(err)
 	}
 	if len(payload) > 0 {
@@ -120,11 +128,10 @@ func (cc *Conn) do(ctx context.Context, h *ReqHeader, payload, p []byte) (int, e
 		defer cc.c.SetDeadline(time.Time{})
 	}
 
-	var bh [RespHeaderSize]byte
-	if _, err := io.ReadFull(cc.rd, bh[:]); err != nil {
+	if _, err := io.ReadFull(cc.rd, cc.sresp[:]); err != nil {
 		return fail(err)
 	}
-	rh, err := DecodeRespHeader(bh[:])
+	rh, err := DecodeRespHeader(cc.sresp[:])
 	if err != nil {
 		return fail(err)
 	}
@@ -147,50 +154,57 @@ func (cc *Conn) do(ctx context.Context, h *ReqHeader, payload, p []byte) (int, e
 	return int(rh.Value), nil
 }
 
+// op fills the connection's scratch request header and runs one exchange.
+// Callers pass the caller-owned payload/p directly: no allocation per op.
+func (cc *Conn) op(ctx context.Context, op Op, oid, off uint64, length uint32, flags uint16, payload, p []byte) (int, error) {
+	h := &cc.h
+	h.Op, h.Flags, h.OID, h.Offset, h.Length = op, flags, oid, off, length
+	return cc.do(ctx, h, payload, p)
+}
+
 // Ping checks the connection round-trip.
 func (cc *Conn) Ping(ctx context.Context) error {
-	_, err := cc.do(ctx, &ReqHeader{Op: OpPing}, nil, nil)
+	_, err := cc.op(ctx, OpPing, 0, 0, 0, 0, nil, nil)
 	return err
 }
 
 // Read reads len(p) bytes of object oid at off.
 func (cc *Conn) Read(ctx context.Context, oid, off uint64, p []byte) (int, error) {
-	return cc.do(ctx, &ReqHeader{Op: OpRead, OID: oid, Offset: off, Length: uint32(len(p))}, nil, p)
+	return cc.op(ctx, OpRead, oid, off, uint32(len(p)), 0, nil, p)
 }
 
 // Write writes p to object oid at off.
 func (cc *Conn) Write(ctx context.Context, oid, off uint64, p []byte, fua bool) error {
-	h := &ReqHeader{Op: OpWrite, OID: oid, Offset: off, Length: uint32(len(p))}
+	var flags uint16
 	if fua {
-		h.Flags |= FlagsFUA
+		flags |= FlagsFUA
 	}
-	_, err := cc.do(ctx, h, p, nil)
+	_, err := cc.op(ctx, OpWrite, oid, off, uint32(len(p)), flags, p, nil)
 	return err
 }
 
 // WriteZeroes zeroes [off, off+n) on object oid.
 func (cc *Conn) WriteZeroes(ctx context.Context, oid, off, n uint64, hole, fua bool) error {
-	h := &ReqHeader{Op: OpWriteZeroes, OID: oid, Offset: off, Length: uint32(n)}
+	var flags uint16
 	if hole {
-		h.Flags |= FlagsHole
+		flags |= FlagsHole
 	}
 	if fua {
-		h.Flags |= FlagsFUA
+		flags |= FlagsFUA
 	}
-	_, err := cc.do(ctx, h, nil, nil)
+	_, err := cc.op(ctx, OpWriteZeroes, oid, off, uint32(n), flags, nil, nil)
 	return err
 }
 
 // Trim punches a hole over [off, off+n) on object oid.
 func (cc *Conn) Trim(ctx context.Context, oid, off, n uint64) error {
-	h := &ReqHeader{Op: OpTrim, OID: oid, Offset: off, Length: uint32(n)}
-	_, err := cc.do(ctx, h, nil, nil)
+	_, err := cc.op(ctx, OpTrim, oid, off, uint32(n), 0, nil, nil)
 	return err
 }
 
 // Sync persists all prior writes on this connection.
 func (cc *Conn) Sync(ctx context.Context) error {
-	_, err := cc.do(ctx, &ReqHeader{Op: OpSync}, nil, nil)
+	_, err := cc.op(ctx, OpSync, 0, 0, 0, 0, nil, nil)
 	return err
 }
 

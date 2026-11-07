@@ -208,20 +208,24 @@ func (s *Server) handle(c net.Conn) {
 	rd := bufio.NewReaderSize(c, 128<<10)
 	wr := bufio.NewWriterSize(c, 128<<10)
 	ctx := context.Background()
+	// Per-connection reusable buffers: stack arrays passed to
+	// io.ReadFull/bufio.Writer escape (bufio.Writer.Write forwards to an
+	// io.Writer interface), costing one allocation per request. Reusing
+	// these makes the warm request loop allocation-free.
+	rw := &connRW{rh: make([]byte, ReqHeaderSize), hdr: make([]byte, RespHeaderSize)}
 	for {
-		var rh [ReqHeaderSize]byte
-		if _, err := io.ReadFull(rd, rh[:]); err != nil {
+		if _, err := io.ReadFull(rd, rw.rh); err != nil {
 			if !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) {
 				s.logf("sdsnet: read request header: %v", err)
 			}
 			return
 		}
-		h, err := DecodeReqHeader(rh[:])
+		h, err := DecodeReqHeader(rw.rh)
 		if err != nil {
 			// Echo the raw seq (decoded headers zero it on error) so
 			// the pipelined client stays in sync with our replies.
-			rawSeq := binary.BigEndian.Uint32(rh[4:8])
-			s.replyW(wr, &RespHeader{Seq: rawSeq, Status: statusFromErr(err)}, nil)
+			rawSeq := binary.BigEndian.Uint32(rw.rh[4:8])
+			s.replyRW(wr, rw, &RespHeader{Seq: rawSeq, Status: statusFromErr(err)}, nil)
 			if wr.Flush() != nil {
 				return
 			}
@@ -229,14 +233,14 @@ func (s *Server) handle(c net.Conn) {
 		}
 		var payload []byte
 		if h.Op == OpWrite && h.Length > 0 {
-			payload = make([]byte, h.Length)
+			payload = rw.getBuf(int(h.Length))
 			if _, err := io.ReadFull(rd, payload); err != nil {
 				s.logf("sdsnet: read request payload: %v", err)
 				return
 			}
 		}
-		resp, out := s.dispatch(ctx, backend, &h, payload)
-		if err := s.replyW(wr, &resp, out); err != nil {
+		resp, out := s.dispatch(ctx, backend, &h, payload, rw)
+		if err := s.replyRW(wr, rw, &resp, out); err != nil {
 			return
 		}
 		if err := wr.Flush(); err != nil {
@@ -245,9 +249,24 @@ func (s *Server) handle(c net.Conn) {
 	}
 }
 
+// connRW holds per-connection reusable wire buffers (see handle).
+type connRW struct {
+	rh  []byte // request header scratch
+	hdr []byte // response header scratch
+	b   []byte // payload scratch (write payload / read reply), grown on demand
+}
+
+func (rw *connRW) getBuf(n int) []byte {
+	if cap(rw.b) >= n {
+		return rw.b[:n]
+	}
+	rw.b = make([]byte, n)
+	return rw.b
+}
+
 // dispatch executes one request. The returned out slice (read payload)
 // is streamed by the caller right after the response header.
-func (s *Server) dispatch(ctx context.Context, backend Backend, h *ReqHeader, payload []byte) (RespHeader, []byte) {
+func (s *Server) dispatch(ctx context.Context, backend Backend, h *ReqHeader, payload []byte, rw *connRW) (RespHeader, []byte) {
 	if h.Length > MaxPayload {
 		return RespHeader{Seq: h.Seq, Status: StatusTooBig}, nil
 	}
@@ -275,7 +294,7 @@ func (s *Server) dispatch(ctx context.Context, backend Backend, h *ReqHeader, pa
 		return RespHeader{Seq: h.Seq, Status: StatusOK}, nil
 
 	case OpRead:
-		buf := make([]byte, h.Length)
+		buf := rw.getBuf(int(h.Length))
 		n, err := backend.ReadAt(ctx, h.OID, h.Offset, buf)
 		switch {
 		case err == nil:
@@ -328,10 +347,12 @@ func (s *Server) reply(c net.Conn, h *RespHeader) error {
 	return err
 }
 
-func (s *Server) replyW(w *bufio.Writer, h *RespHeader, out []byte) error {
-	var b [RespHeaderSize]byte
-	h.Encode(b[:])
-	if _, err := w.Write(b[:]); err != nil {
+// replyRW writes one response on per-connection scratch: zero
+// allocations per reply (a stack [RespHeaderSize]byte handed to
+// bufio.Writer escapes to the heap).
+func (s *Server) replyRW(w *bufio.Writer, rw *connRW, h *RespHeader, out []byte) error {
+	h.Encode(rw.hdr)
+	if _, err := w.Write(rw.hdr); err != nil {
 		return err
 	}
 	if len(out) > 0 {

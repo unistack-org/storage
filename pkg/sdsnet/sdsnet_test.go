@@ -8,6 +8,7 @@ import (
 	"net"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -155,12 +156,18 @@ func (m *memBackend) WriteZeroes(_ context.Context, oid, off, n uint64, _ bool) 
 func (m *memBackend) Sync(context.Context) error { return nil }
 
 // startServer boots a Server on a random port with a mem backend.
+// The server must not log through t: its goroutines can outlive the
+// test (a stray t.Logf then races with testing's own bookkeeping), so
+// the final Serve error is captured and reported when shutdown runs on
+// the test goroutine.
 func startServer(t *testing.T, be Backend) (addr string, shutdown func()) {
 	t.Helper()
-	s := &Server{Backend: be, Logf: t.Logf}
+	s := &Server{Backend: be}
+	var serveErr atomic.Pointer[error]
 	go func() {
 		if err := s.Serve("127.0.0.1:0"); err != nil {
-			t.Logf("serve: %v", err)
+			e := err
+			serveErr.Store(&e)
 		}
 	}()
 	deadline := time.Now().Add(2 * time.Second)
@@ -170,7 +177,13 @@ func startServer(t *testing.T, be Backend) (addr string, shutdown func()) {
 	if s.Addr() == "" {
 		t.Fatal("server did not start")
 	}
-	return s.Addr(), func() { s.Close() }
+	return s.Addr(), func() {
+		s.Close()
+		// Close() makes Serve return net.ErrClosed: expected shutdown.
+		if p := serveErr.Load(); p != nil && *p != nil && !errors.Is(*p, net.ErrClosed) {
+			t.Errorf("serve: %v", *p)
+		}
+	}
 }
 
 func TestEndToEnd(t *testing.T) {
@@ -255,7 +268,7 @@ func statusOf(t *testing.T, err error) Status {
 
 func TestReadOnly(t *testing.T) {
 	be := newMemBackend(1 << 20)
-	s := &Server{Backend: be, ReadOnly: true, Logf: t.Logf}
+	s := &Server{Backend: be, ReadOnly: true}
 	go s.Serve("127.0.0.1:0")
 	for s.Addr() == "" {
 		time.Sleep(time.Millisecond)

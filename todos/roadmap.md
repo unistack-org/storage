@@ -224,7 +224,11 @@
       Наши рычаги обгона: (1) Go 1.24+: per-CPU sharded workers c
       LockOSThread+busy-poll (SQPOLL), GOGC=off+ballast на data-потоках —
       GC-давление убираем полностью, а не снижаем; (2) арены/arena-аллокации
-      вместо per-request-аллокаций (гейт 0 allocs/op в CI); (3) свой бинарный
+      вместо per-request-аллокаций (гейт 0 allocs/op в CI) — СДЕЛАНО для обоих
+      протоколов: NBD (TestNBDZeroAllocGate, 0 allocs/op, Read4K 22мкс) и
+      sdsnet клиент↔OSD (TestSDSNetZeroAllocGate, 0 allocs/op: Read4K 28мкс,
+      Write4K 19мкс, 64K ~2.2GB/s; приём — пер-соединительные scratch-буферы,
+      sync.Pool проигрывает из-за boxing в Put); (3) свой бинарный
       протокол (фикс. заголовок, батчинг, recvmmsg/sendmmsg) — NBD/VDUSE
       только гостю, не внутри кластера; (4) VDUSE multi-queue уже готов —
       их NBD однопоточный, UBLK в их стеке новее и тоже MQ (следить);

@@ -3,17 +3,23 @@ package sdsnet
 import (
 	"context"
 	"errors"
+	"net"
+	"sync/atomic"
 	"testing"
 	"time"
 )
 
 // startServerExports boots a Server that routes names to backends.
+// Like startServer: no t.* logging from server goroutines (they can
+// outlive the test); the Serve error is reported at shutdown.
 func startServerExports(t *testing.T, exports map[string]Backend) (string, *Server, func()) {
 	t.Helper()
-	s := &Server{Exports: exports, Logf: t.Logf}
+	s := &Server{Exports: exports}
+	var serveErr atomic.Pointer[error]
 	go func() {
 		if err := s.Serve("127.0.0.1:0"); err != nil {
-			t.Logf("serve: %v", err)
+			e := err
+			serveErr.Store(&e)
 		}
 	}()
 	deadline := time.Now().Add(2 * time.Second)
@@ -23,7 +29,13 @@ func startServerExports(t *testing.T, exports map[string]Backend) (string, *Serv
 	if s.Addr() == "" {
 		t.Fatal("server did not start")
 	}
-	return s.Addr(), s, func() { s.Close() }
+	return s.Addr(), s, func() {
+		s.Close()
+		// Close() makes Serve return net.ErrClosed: expected shutdown.
+		if p := serveErr.Load(); p != nil && *p != nil && !errors.Is(*p, net.ErrClosed) {
+			t.Errorf("serve: %v", *p)
+		}
+	}
 }
 
 func TestUnknownExportRejected(t *testing.T) {
