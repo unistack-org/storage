@@ -3,6 +3,7 @@ package client
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"testing"
@@ -171,7 +172,7 @@ func TestClusterVolumeRoundTrip(t *testing.T) {
 	defer cancel()
 
 	const size = 128 << 20 // 128 MiB = 32 objects
-	if _, err := c.cl.CreateVolume(ctx, "vm0", size, 3, 64, "data"); err != nil {
+	if _, err := c.cl.CreateVolume(ctx, "vm0", size, 3, 0, 64, "data"); err != nil {
 		t.Fatalf("CreateVolume: %v", err)
 	}
 	v, err := c.cl.OpenVolume(ctx, "vm0")
@@ -243,7 +244,7 @@ func TestClusterQuorumKillOne(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	if _, err := c.cl.CreateVolume(ctx, "vm0", 64<<20, 3, 64, "data"); err != nil {
+	if _, err := c.cl.CreateVolume(ctx, "vm0", 64<<20, 3, 0, 64, "data"); err != nil {
 		t.Fatalf("CreateVolume: %v", err)
 	}
 	v, err := c.cl.OpenVolume(ctx, "vm0")
@@ -285,7 +286,7 @@ func TestClusterStaleEpochRefresh(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	if _, err := c.cl.CreateVolume(ctx, "vm0", 64<<20, 3, 64, "data"); err != nil {
+	if _, err := c.cl.CreateVolume(ctx, "vm0", 64<<20, 3, 0, 64, "data"); err != nil {
 		t.Fatalf("CreateVolume: %v", err)
 	}
 	v, err := c.cl.OpenVolume(ctx, "vm0")
@@ -333,5 +334,123 @@ func TestClusterStaleEpochRefresh(t *testing.T) {
 func fill(p []byte, seed byte, off int) {
 	for i := range p {
 		p[i] = seed + byte(i+off)
+	}
+}
+
+// setOSDWeight rewrites the OSD record's weight in meta. Weight 0 drops
+// the OSD from the client's placement registry (the Registry builder
+// treats weight<=0 as out), simulating a lost replica without killing
+// the daemon.
+func (c *cluster) setOSDWeight(tb testing.TB, ctx context.Context, id int32, w float64) {
+	tb.Helper()
+	info, err := meta.GetOSD(ctx, c.meta, id)
+	if err != nil {
+		tb.Fatalf("GetOSD %d: %v", id, err)
+	}
+	info.Weight = w
+	if _, err := meta.PutOSD(ctx, c.meta, info); err != nil {
+		tb.Fatalf("PutOSD %d: %v", id, err)
+	}
+}
+
+// forceRefresh resets the refresh throttle so the next client Refresh
+// rebuilds the placement snapshot from meta.
+func (c *cluster) forceRefresh() {
+	c.cl.lastRef.Store(0)
+}
+
+func TestClusterMinSizeCreation(t *testing.T) {
+	c := newCluster(t, 3)
+	c.publishMap(1)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	if _, err := c.cl.CreateVolume(ctx, "bad-high", 1<<20, 3, 4, 64, "data"); err == nil {
+		t.Fatal("min_size 4 with replicas 3 accepted")
+	}
+	if _, err := c.cl.CreateVolume(ctx, "bad-low", 1<<20, 3, -1, 64, "data"); err == nil {
+		t.Fatal("negative min_size accepted")
+	}
+	spec, err := c.cl.CreateVolume(ctx, "def", 1<<20, 3, 0, 64, "data")
+	if err != nil {
+		t.Fatalf("CreateVolume default: %v", err)
+	}
+	if spec.MinSize != 2 {
+		t.Fatalf("default min_size = %d, want 2", spec.MinSize)
+	}
+	if spec, err = c.cl.CreateVolume(ctx, "one", 1<<20, 3, 1, 64, "data"); err != nil {
+		t.Fatalf("CreateVolume min_size=1: %v", err)
+	}
+	if spec.MinSize != 1 {
+		t.Fatalf("min_size = %d, want 1", spec.MinSize)
+	}
+}
+
+func TestClusterMinSizeDegraded(t *testing.T) {
+	c := newCluster(t, 3)
+	c.publishMap(1)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	if _, err := c.cl.CreateVolume(ctx, "vm0", 64<<20, 3, 1, 64, "data"); err != nil {
+		t.Fatalf("CreateVolume: %v", err)
+	}
+	v, err := c.cl.OpenVolume(ctx, "vm0")
+	if err != nil {
+		t.Fatalf("OpenVolume: %v", err)
+	}
+	data := make([]byte, 64<<10)
+	fill(data, 0x33, 7)
+	if _, err := v.WriteAt(ctx, data, 0); err != nil {
+		t.Fatalf("baseline write: %v", err)
+	}
+
+	// vm1 uses the default quorum (2/3). Exercise it while all
+	// replicas are in.
+	if _, err := c.cl.CreateVolume(ctx, "vm1", 64<<20, 3, 0, 64, "data"); err != nil {
+		t.Fatalf("CreateVolume vm1: %v", err)
+	}
+	v1, err := c.cl.OpenVolume(ctx, "vm1")
+	if err != nil {
+		t.Fatalf("OpenVolume vm1: %v", err)
+	}
+	if _, err := v1.WriteAt(ctx, data, 0); err != nil {
+		t.Fatalf("write vm1 healthy: %v", err)
+	}
+
+	// Two replicas out: min_size 1 keeps the volume writable and
+	// readable on the single survivor.
+	c.setOSDWeight(t, ctx, 1, 0)
+	c.setOSDWeight(t, ctx, 2, 0)
+	c.forceRefresh()
+
+	if _, err := v.WriteAt(ctx, data, 1<<20); err != nil {
+		t.Fatalf("write with min_size=1 and two osds out: %v", err)
+	}
+	got := make([]byte, len(data))
+	for _, off := range []uint64{0, 1 << 20} {
+		if n, err := v.ReadAt(ctx, got, off); err != nil || n != len(data) {
+			t.Fatalf("read at %d with two osds out: n=%d err=%v", off, n, err)
+		}
+		if !bytes.Equal(got, data) {
+			t.Fatalf("data mismatch at %d with two osds out", off)
+		}
+	}
+
+	// vm1 under the same topology: writes must fail fast with
+	// ErrDegraded (1 live target < min_size 2) while reads keep
+	// answering from the survivor.
+	start := time.Now()
+	if _, err := v1.WriteAt(ctx, data, 1<<20); !errors.Is(err, ErrDegraded) {
+		t.Fatalf("degraded write err = %v, want ErrDegraded", err)
+	}
+	if d := time.Since(start); d > time.Second {
+		t.Fatalf("degraded write took %v, want fast fail", d)
+	}
+	if n, err := v1.ReadAt(ctx, got, 0); err != nil || n != len(data) {
+		t.Fatalf("degraded read: n=%d err=%v", n, err)
+	}
+	if !bytes.Equal(got, data) {
+		t.Fatal("degraded read data mismatch")
 	}
 }

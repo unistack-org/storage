@@ -17,7 +17,7 @@ func benchVolumeN(b testing.TB, n int) (*Volume, context.Context) {
 	ctx, cancel := context.WithCancel(context.Background())
 	b.Cleanup(cancel)
 	const size = 64 << 20
-	if _, err := c.cl.CreateVolume(ctx, "bench", size, n, 64, "data"); err != nil {
+	if _, err := c.cl.CreateVolume(ctx, "bench", size, n, 0, 64, "data"); err != nil {
 		b.Fatalf("CreateVolume: %v", err)
 	}
 	v, err := c.cl.OpenVolume(ctx, "bench")

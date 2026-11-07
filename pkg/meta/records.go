@@ -30,9 +30,15 @@ type VolumeSpec struct {
 	Size     uint64 `json:"size"`      // logical bytes
 	OIDShift uint32 `json:"oid_shift"` // object size = 1<<OIDShift
 	Replicas int    `json:"replicas"`
-	Rule     string `json:"rule"` // crush rule name
-	PGNum    int    `json:"pg_num"`
-	Epoch    uint32 `json:"epoch"` // map epoch the volume was created/last rebalanced at
+	// MinSize is the minimum number of live replicas a volume stays
+	// writable with (quorum width). 0 means the Ceph-style default
+	// Replicas/2+1. Below it, writes fail fast instead of hanging:
+	// the volume is degraded and must be recovered (Vitastor
+	// pg_minsize equivalent).
+	MinSize int    `json:"min_size,omitempty"`
+	Rule    string `json:"rule"` // crush rule name
+	PGNum   int    `json:"pg_num"`
+	Epoch   uint32 `json:"epoch"` // map epoch the volume was created/last rebalanced at
 }
 
 // MapRecord stores one crush map generation.

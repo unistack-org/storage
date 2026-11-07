@@ -243,7 +243,12 @@ func (c *Cluster) MapEpoch(ctx context.Context, epoch uint32, src []byte) error 
 
 // CreateVolume registers a volume in meta. pgNum must be a power of two;
 // the volume is thin: nothing is written to OSDs until first touch.
-func (c *Cluster) CreateVolume(ctx context.Context, name string, size uint64, replicas, pgNum int, rule string) (meta.VolumeSpec, error) {
+// minSize is the write quorum width (Vitastor pg_minsize / Ceph
+// min_size): commits need minSize replica acks, and a volume whose
+// placement row has fewer than minSize live targets is degraded —
+// writes fail fast instead of waiting on unreachable replicas. 0
+// selects the default Replicas/2+1.
+func (c *Cluster) CreateVolume(ctx context.Context, name string, size uint64, replicas, minSize, pgNum int, rule string) (meta.VolumeSpec, error) {
 	if name == "" || size == 0 {
 		return meta.VolumeSpec{}, errors.New("client: volume name and size required")
 	}
@@ -253,11 +258,18 @@ func (c *Cluster) CreateVolume(ctx context.Context, name string, size uint64, re
 	if replicas < 1 {
 		replicas = 3
 	}
+	if minSize == 0 {
+		minSize = replicas/2 + 1
+	}
+	if minSize < 1 || minSize > replicas {
+		return meta.VolumeSpec{}, fmt.Errorf("client: volume %q: min_size %d out of range 1..%d", name, minSize, replicas)
+	}
 	spec := meta.VolumeSpec{
 		Name:     name,
 		Size:     size,
 		OIDShift: object.SizeShift,
 		Replicas: replicas,
+		MinSize:  minSize,
 		Rule:     rule,
 		PGNum:    pgNum,
 	}
@@ -289,12 +301,19 @@ func (c *Cluster) OpenVolume(ctx context.Context, name string) (*Volume, error) 
 	if spec.Replicas > maxReplicas {
 		return nil, fmt.Errorf("client: volume %q: replicas %d > %d", name, spec.Replicas, maxReplicas)
 	}
+	w := spec.MinSize
+	if w == 0 {
+		w = spec.Replicas/2 + 1
+	}
+	if w < 1 || w > spec.Replicas {
+		return nil, fmt.Errorf("client: volume %q: min_size %d out of range 1..%d", name, w, spec.Replicas)
+	}
 	return &Volume{
 		cluster: c,
 		spec:    spec,
 		pgNum:   pgNum,
 		mask:    pgNum - 1,
-		w:       spec.Replicas/2 + 1,
+		w:       w,
 	}, nil
 }
 
@@ -327,6 +346,12 @@ func (v *Volume) pgFor(snap *placement.Snapshot, index uint64) uint32 {
 // targets returns the volume's replicas for object index in snapshot
 // snap, filling scratch (callers pass a stack array so the hot path
 // allocates nothing).
+// ErrDegraded reports that a volume has fewer live targets than its
+// min_size: writes fail fast (the data is recoverable by restoring
+// replicas) instead of hanging on unreachable ones. Reads stay
+// tolerant — any live replica answers identically.
+var ErrDegraded = errors.New("client: volume degraded: live targets below min_size")
+
 func (v *Volume) targets(snap *placement.Snapshot, index uint64, scratch []placement.Ref) ([]placement.Ref, error) {
 	pg := v.pgFor(snap, index)
 	row := snap.Row(pg)
@@ -344,8 +369,8 @@ func (v *Volume) targets(snap *placement.Snapshot, index uint64, scratch []place
 			refs = append(refs, ref)
 		}
 	}
-	if len(refs) < v.spec.Replicas {
-		return refs, fmt.Errorf("client: pg %d has %d/%d live replicas", pg, len(refs), v.spec.Replicas)
+	if len(refs) < v.w {
+		return refs, fmt.Errorf("%w: pg %d has %d live targets, min_size %d", ErrDegraded, pg, len(refs), v.w)
 	}
 	return refs, nil
 }

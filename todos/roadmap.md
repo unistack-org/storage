@@ -254,11 +254,12 @@
       randread/randwrite 4K/64K/1M, depth 4/16/128
 - [ ] **Отказоустойчивость по домену отказа (по мотивам Vitastor pool config)**:
       механизм уже есть (CRUSH `failure_domain` = chooseleaf distinct rack, golden-тесты),
-      взять из Vitastor три вещи: (1) явный `min_size` тома = их pg_minsize — том жив
-      при >=N живых репликах, поведение при недоборе (read-only/деградация) — политика тома;
-      (2) `out_time`-выдержка (default 600 с) перед вытеснением упавшего OSD из
-      placement — защита от ребаланса на «мигающих» OSD; (3) пресеты правил поверх
-      crush-билдера (`rack-aware rep3`, `EC 2+2 по ДЦ` = их level_placement dc=112233,
+      взять из Vitastor три вещи: (1) DONE `min_size` тома = их pg_minsize — поле
+      VolumeSpec.MinSize, кворум записи W=min_size, ниже — write fast-fail ErrDegraded,
+      чтения толерантны (любая живая реплика); флаг sdsd `-min-size`; тесты
+      TestClusterMinSize*; (2) `out_time`-выдержка (default 600 с) перед вытеснением
+      упавшего OSD из placement — защита от ребаланса на «мигающих» OSD; (3) пресеты правил
+      поверх crush-билдера (`rack-aware rep3`, `EC 2+2 по ДЦ` = их level_placement dc=112233,
       `dc preferred` = их `dc ?= "x"`), чтобы не писать CRUSH-rule руками.
       Справочник Vitastor: docs/config/pool.ru.md (failure_domain, level_placement,
       raw_placement DSL, pg_minsize, osd_out_time, noout, reweight, tags).

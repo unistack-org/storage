@@ -91,6 +91,7 @@ func main() {
 	epoch := flag.Uint("epoch", 1, "with -cluster: epoch to publish -crushmap under (must be unique)")
 	pgNum := flag.Int("pg-num", 64, "with -cluster: cluster pg_num for the placement table")
 	replicas := flag.Int("replicas", 3, "with -cluster: replicas per object")
+	minSize := flag.Int("min-size", 0, "with -cluster: write quorum width (0 = replicas/2+1); below it writes fail fast (degraded volume)")
 	rule := flag.String("rule", "", "with -cluster: crush rule name (default: first rule in the map)")
 	var creates exportFlag
 	flag.Var(&creates, "create", "with -cluster: create volume name:size if absent, repeatable")
@@ -130,6 +131,7 @@ func main() {
 			epoch:    uint32(*epoch),
 			pgNum:    *pgNum,
 			replicas: *replicas,
+			minSize:  *minSize,
 			rule:     *rule,
 			creates:  creates,
 			exports:  exports,
@@ -223,6 +225,7 @@ type clusterParams struct {
 	epoch    uint32
 	pgNum    int
 	replicas int
+	minSize  int
 	rule     string
 	creates  []string
 	exports  []string
@@ -330,10 +333,11 @@ func clusterExports(ctx context.Context, p clusterParams) ([]*nbd.Export, error)
 		if _, err := meta.GetVolume(ctx, ms, name); err == nil {
 			continue // already exists
 		}
-		if _, err := cl.CreateVolume(ctx, name, size, p.replicas, p.pgNum, p.rule); err != nil {
+		spec, err := cl.CreateVolume(ctx, name, size, p.replicas, p.minSize, p.pgNum, p.rule)
+		if err != nil {
 			return nil, fmt.Errorf("create volume %q: %w", name, err)
 		}
-		p.logger.Printf("created volume %q (%s, r=%d, pg=%d)", name, humanSize(size), p.replicas, p.pgNum)
+		p.logger.Printf("created volume %q (%s, r=%d, min_size=%d, pg=%d)", name, humanSize(size), p.replicas, spec.MinSize, p.pgNum)
 	}
 
 	var es []*nbd.Export
