@@ -55,8 +55,12 @@
 - [x] **io_uring** ring (`pkg/iouring`: registered fds, fixed offsets;
       SQPOLL опционально позже); fallback worker-pool `pread/pwrite` на non-Linux;
       Linux-часть проверена кросс-компиляцией (amd64+arm64), runtime-приёмка на Linux-хосте
-- [ ] No-alloc data path: пулы буферов (arena/mmap), никаких `make()` на I/O;
-      бенчмарк-гейт «0 allocs/op» в CI
+- [x] No-alloc data path: никаких `make()` на I/O — единый пер-соединительный
+      буфер `ioBuf` + preallocated header-буферы (стековые массивы утекали в
+      heap через bufio.Write: 5 allocs/req -> 0). Гейт `TestNBDZeroAllocGate`
+      (4000 конвейерных 4K READ, лимит 2 КБ/req) + бенчмарки
+      `BenchmarkNBD{Read,Write}*`: **0 allocs/op** (Apple M1, loopback:
+      4K READ 22 мкс, 64K 2.0 ГБ/с, 1M 8.4 ГБ/с)
 - [x] `pkg/journal`: WAL для метаданных objects (16B заголовок: seq/len/crc32c,
       torn-tail устойчивость, replay, truncate) — задел под journaling Vitastor-типа
 - [x] NBD-сервер (`sds-nbd/nbd`, протокол NBD over TCP) — точка входа для QEMU/fio;

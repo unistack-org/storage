@@ -33,7 +33,7 @@ func (r *bufioReader) ReadFull(p []byte) error {
 	return err
 }
 
-func newClient(t *testing.T, addr string) *client {
+func newClient(t testing.TB, addr string) *client {
 	t.Helper()
 	c, err := net.Dial("tcp", addr)
 	if err != nil {
@@ -45,7 +45,7 @@ func newClient(t *testing.T, addr string) *client {
 	return cl
 }
 
-func (cl *client) handshake(t *testing.T) {
+func (cl *client) handshake(t testing.TB) {
 	t.Helper()
 	var b [18]byte
 	if err := cl.br.ReadFull(b[:]); err != nil {
@@ -73,7 +73,7 @@ func (cl *client) handshake(t *testing.T) {
 // for that option (the spec forbids pipelining options, so the final reply
 // is identified by: for LIST, a reply of type ACK/ERR; here we simply collect
 // replies while collecting server entries for LIST).
-func (cl *client) option(t *testing.T, option uint32, data []byte) (replies []optionReply) {
+func (cl *client) option(t testing.TB, option uint32, data []byte) (replies []optionReply) {
 	t.Helper()
 	var hdr [16]byte
 	binary.BigEndian.PutUint64(hdr[:8], ihaveoptMagic)
@@ -118,7 +118,7 @@ type optionReply struct {
 
 // goExport negotiates an export via OPT_GO (+ structured replies first) and
 // enters transmission.
-func (cl *client) goExport(t *testing.T, name string) {
+func (cl *client) goExport(t testing.TB, name string) {
 	t.Helper()
 	cl.requestStructured(t)
 	data := make([]byte, 4+len(name)+2)
@@ -129,7 +129,7 @@ func (cl *client) goExport(t *testing.T, name string) {
 	cl.applyExportReplies(t, replies)
 }
 
-func (cl *client) requestStructured(t *testing.T) {
+func (cl *client) requestStructured(t testing.TB) {
 	t.Helper()
 	replies := cl.option(t, optStructuredReply, nil)
 	if replies[len(replies)-1].typ != repACK {
@@ -139,7 +139,7 @@ func (cl *client) requestStructured(t *testing.T) {
 }
 
 // applyExportReplies parses INFO replies (size + flags) out of GO/INFO replies.
-func (cl *client) applyExportReplies(t *testing.T, replies []optionReply) {
+func (cl *client) applyExportReplies(t testing.TB, replies []optionReply) {
 	t.Helper()
 	for _, r := range replies {
 		if r.typ == repInfo {
@@ -166,14 +166,14 @@ func (cl *client) applyExportReplies(t *testing.T, replies []optionReply) {
 }
 
 // exportNameLegacy performs the old OPT_EXPORT_NAME negotiation.
-func (cl *client) exportNameLegacy(t *testing.T, name string) {
+func (cl *client) exportNameLegacy(t testing.TB, name string) {
 	t.Helper()
 	replies := cl.option(t, optExportName, []byte(name)) // never returns: success has no reply
 	_ = replies
 }
 
 // readExportNameLegacyResponse reads the size+flags(+124 zeros) reply.
-func (cl *client) readExportNameLegacyResponse(t *testing.T, noZeroes bool) {
+func (cl *client) readExportNameLegacyResponse(t testing.TB, noZeroes bool) {
 	t.Helper()
 	var b [10]byte
 	if err := cl.br.ReadFull(b[:]); err != nil {
@@ -189,7 +189,7 @@ func (cl *client) readExportNameLegacyResponse(t *testing.T, noZeroes bool) {
 	}
 }
 
-func (cl *client) request(t *testing.T, typ uint16, flags uint16, offset uint64, length uint32, payload []byte) uint64 {
+func (cl *client) request(t testing.TB, typ uint16, flags uint16, offset uint64, length uint32, payload []byte) uint64 {
 	t.Helper()
 	var hdr [28]byte
 	binary.BigEndian.PutUint32(hdr[:4], requestMagic)
@@ -223,7 +223,7 @@ type chunk struct {
 }
 
 // readSimpleReply reads one simple reply.
-func (cl *client) readSimpleReply(t *testing.T) reply {
+func (cl *client) readSimpleReply(t testing.TB) reply {
 	t.Helper()
 	var hdr [16]byte
 	if err := cl.br.ReadFull(hdr[:]); err != nil {
@@ -240,7 +240,7 @@ func (cl *client) readSimpleReply(t *testing.T) reply {
 
 // readCommandReply reads a reply to a non-read transmission command in
 // whichever format was negotiated (simple 16B, or structured chunks).
-func (cl *client) readCommandReply(t *testing.T, handle uint64) reply {
+func (cl *client) readCommandReply(t testing.TB, handle uint64) reply {
 	t.Helper()
 	if !cl.structured {
 		r := cl.readSimpleReply(t)
@@ -255,7 +255,7 @@ func (cl *client) readCommandReply(t *testing.T, handle uint64) reply {
 
 // readReadReply reads the reply to a READ (payload follows simple reply;
 // structured chunks until DONE).
-func (cl *client) readReadReply(t *testing.T, handle uint64, length uint32) reply {
+func (cl *client) readReadReply(t testing.TB, handle uint64, length uint32) reply {
 	t.Helper()
 	if cl.structured {
 		r, _ := cl.readReadReplyData(t, handle)
@@ -278,7 +278,7 @@ func (cl *client) readReadReply(t *testing.T, handle uint64, length uint32) repl
 
 // readReadReplyData consumes structured chunks for handle and returns the
 // assembled reply.
-func (cl *client) readReadReplyData(t *testing.T, handle uint64) (reply, []byte) {
+func (cl *client) readReadReplyData(t testing.TB, handle uint64) (reply, []byte) {
 	t.Helper()
 	var out reply
 	out.handle = handle
@@ -329,35 +329,35 @@ func (cl *client) readReadReplyData(t *testing.T, handle uint64) (reply, []byte)
 
 // cmd helpers -------------------------------------------------------------
 
-func (cl *client) read(t *testing.T, offset uint64, length uint32) ([]byte, uint32) {
+func (cl *client) read(t testing.TB, offset uint64, length uint32) ([]byte, uint32) {
 	t.Helper()
 	h := cl.request(t, CmdRead, 0, offset, length, nil)
 	r := cl.readReadReply(t, h, length)
 	return r.data, r.err
 }
 
-func (cl *client) write(t *testing.T, offset uint64, data []byte) uint32 {
+func (cl *client) write(t testing.TB, offset uint64, data []byte) uint32 {
 	t.Helper()
 	h := cl.request(t, CmdWrite, 0, offset, uint32(len(data)), data)
 	r := cl.readCommandReply(t, h)
 	return r.err
 }
 
-func (cl *client) flush(t *testing.T) uint32 {
+func (cl *client) flush(t testing.TB) uint32 {
 	t.Helper()
 	h := cl.request(t, CmdFlush, 0, 0, 0, nil)
 	r := cl.readCommandReply(t, h)
 	return r.err
 }
 
-func (cl *client) trim(t *testing.T, offset uint64, length uint32) uint32 {
+func (cl *client) trim(t testing.TB, offset uint64, length uint32) uint32 {
 	t.Helper()
 	h := cl.request(t, CmdTrim, 0, offset, length, nil)
 	r := cl.readCommandReply(t, h)
 	return r.err
 }
 
-func (cl *client) writeZeroes(t *testing.T, offset uint64, length uint32, noHole bool) uint32 {
+func (cl *client) writeZeroes(t testing.TB, offset uint64, length uint32, noHole bool) uint32 {
 	t.Helper()
 	var flags uint16
 	if noHole {
@@ -368,13 +368,13 @@ func (cl *client) writeZeroes(t *testing.T, offset uint64, length uint32, noHole
 	return r.err
 }
 
-func (cl *client) disconnect(t *testing.T) {
+func (cl *client) disconnect(t testing.TB) {
 	t.Helper()
 	cl.request(t, CmdDisc, 0, 0, 0, nil)
 }
 
 // testServer starts a Server on a temp dir with one export "vol0".
-func testServer(t *testing.T, size uint64, opts ServerOptions) (addr string, file string) {
+func testServer(t testing.TB, size uint64, opts ServerOptions) (addr string, file string) {
 	t.Helper()
 	dir := t.TempDir()
 	file = filepath.Join(dir, "vol0.img")

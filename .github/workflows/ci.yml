@@ -33,3 +33,6 @@ jobs:
         run: go vet ./...
       - name: test (race)
         run: go test -race -count=1 ./...
+      - name: zero-alloc data path gate (Phase 1)
+        if: matrix.module == 'sds-nbd'
+        run: go test -run TestNBDZeroAllocGate -count=1 -v ./nbd/

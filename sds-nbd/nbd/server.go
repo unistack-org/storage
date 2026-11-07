@@ -171,27 +171,30 @@ type connState struct {
 	readOnly   bool
 	backend    Backend
 	size       uint64
-	bufPool    sync.Pool
 	shutdown   bool
+	// ioBuf is the connection's single reusable I/O buffer. The
+	// transmission loop is sequential per connection, so no pool is
+	// needed: growing this slice on demand and never releasing it
+	// makes the warm data path allocation-free (a sync.Pool Put of a
+	// []byte allocates via interface boxing; this does not).
+	ioBuf []byte
+	// reqHdrBuf and scratch are per-connection preallocated wire buffers.
+	// Stack arrays handed to bufio/io.Writer calls escape to the heap,
+	// which would cost one allocation per request; these fields are
+	// allocated once per connection and reused on the hot path.
+	reqHdrBuf [28]byte
+	scratch   [32]byte // largest header we emit: 20B chunk hdr + 8B offset
 }
 
 func (cs *connState) getBuf(n int) []byte {
-	v := cs.bufPool.Get()
-	if v == nil {
-		return make([]byte, n)
+	if cap(cs.ioBuf) >= n {
+		return cs.ioBuf[:n]
 	}
-	b := v.([]byte)
-	if cap(b) >= n {
-		return b[:n]
-	}
-	return make([]byte, n)
+	cs.ioBuf = make([]byte, n)
+	return cs.ioBuf
 }
 
-func (cs *connState) putBuf(b []byte) {
-	if cap(b) <= 4*MaxPayload {
-		cs.bufPool.Put(b[:0])
-	}
-}
+func (cs *connState) putBuf([]byte) {}
 
 // traceConn wraps a net.Conn with hex logging (SDS_NBD_TRACE=1).
 type traceConn struct {
@@ -582,8 +585,8 @@ type reqHdr struct {
 // transmission is the request/reply loop.
 func (s *Server) transmission(cs *connState) error {
 	for {
-		var hdr [28]byte
-		if err := cs.readn(hdr[:]); err != nil {
+		hdr := cs.reqHdrBuf[:]
+		if err := cs.readn(hdr); err != nil {
 			return err
 		}
 		if binary.BigEndian.Uint32(hdr[:4]) != requestMagic {
@@ -741,18 +744,18 @@ func (s *Server) handleRead(cs *connState, req reqHdr) error {
 	}
 	// Structured: OFFSET_DATA chunks (<= MaxPayload each; length <= MaxPayload so one chunk) + DONE.
 	if n > 0 {
-		var hdr [20]byte
+		hdr := cs.scratch[:20]
 		binary.BigEndian.PutUint32(hdr[:4], structuredReplyMagic)
 		binary.BigEndian.PutUint16(hdr[4:6], 0) // no flags on data chunk
 		binary.BigEndian.PutUint16(hdr[6:8], chunkTypeOffsetData)
 		binary.BigEndian.PutUint64(hdr[8:16], req.handle)
 		binary.BigEndian.PutUint32(hdr[16:20], uint32(n)+8)
-		if _, err := cs.bw.Write(hdr[:]); err != nil {
+		if _, err := cs.bw.Write(hdr); err != nil {
 			return err
 		}
-		var off [8]byte
-		binary.BigEndian.PutUint64(off[:], req.offset)
-		if _, err := cs.bw.Write(off[:]); err != nil {
+		off := cs.scratch[:8]
+		binary.BigEndian.PutUint64(off, req.offset)
+		if _, err := cs.bw.Write(off); err != nil {
 			return err
 		}
 		if _, err := cs.bw.Write(buf); err != nil {
@@ -837,11 +840,11 @@ func (s *Server) handleWrite(cs *connState, req reqHdr) error {
 
 // replySimple writes a simple reply: magic + err + handle (+ optional data).
 func (s *Server) replySimple(cs *connState, handle uint64, errCode uint32, data []byte) error {
-	var hdr [16]byte
+	hdr := cs.scratch[:16]
 	binary.BigEndian.PutUint32(hdr[:4], simpleReplyMagic)
 	binary.BigEndian.PutUint32(hdr[4:8], errCode)
 	binary.BigEndian.PutUint64(hdr[8:16], handle)
-	if _, err := cs.bw.Write(hdr[:]); err != nil {
+	if _, err := cs.bw.Write(hdr); err != nil {
 		return err
 	}
 	if len(data) > 0 {
@@ -854,13 +857,13 @@ func (s *Server) replySimple(cs *connState, handle uint64, errCode uint32, data 
 
 // replyStructuredDone writes a NONE chunk with DONE flag.
 func (s *Server) replyStructuredDone(cs *connState, handle uint64) error {
-	var b [20]byte
+	b := cs.scratch[:20]
 	binary.BigEndian.PutUint32(b[:4], structuredReplyMagic)
 	binary.BigEndian.PutUint16(b[4:6], chunkFlagDone)
 	binary.BigEndian.PutUint16(b[6:8], chunkTypeNone)
 	binary.BigEndian.PutUint64(b[8:16], handle)
 	binary.BigEndian.PutUint32(b[16:20], 0)
-	if _, err := cs.bw.Write(b[:]); err != nil {
+	if _, err := cs.bw.Write(b); err != nil {
 		return err
 	}
 	return cs.bw.Flush()
