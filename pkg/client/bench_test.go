@@ -7,18 +7,17 @@ import (
 	"time"
 )
 
-// benchVolume spins up a 3-OSD cluster with a small volume.
-func benchVolume(b testing.TB) (*Volume, context.Context) {
+// benchVolumeN spins up a cluster with n OSDs and a volume with n
+// replicas (quorum = all: no stragglers, no payload copies).
+func benchVolumeN(b testing.TB, n int) (*Volume, context.Context) {
 	b.Helper()
-	c := newCluster(b, 3)
-	// A benchmark cluster is static: a 50ms refresh interval keeps the
-	// dir-backend meta reads off the hot path (production default 5ms).
+	c := newCluster(b, n)
 	c.cl.SetRefreshInterval(50 * time.Millisecond)
 	c.publishMap(1)
 	ctx, cancel := context.WithCancel(context.Background())
 	b.Cleanup(cancel)
 	const size = 64 << 20
-	if _, err := c.cl.CreateVolume(ctx, "bench", size, 3, 64, "data"); err != nil {
+	if _, err := c.cl.CreateVolume(ctx, "bench", size, n, 64, "data"); err != nil {
 		b.Fatalf("CreateVolume: %v", err)
 	}
 	v, err := c.cl.OpenVolume(ctx, "bench")
@@ -26,6 +25,12 @@ func benchVolume(b testing.TB) (*Volume, context.Context) {
 		b.Fatalf("OpenVolume: %v", err)
 	}
 	return v, ctx
+}
+
+// benchVolume spins up a 3-OSD cluster with a small volume.
+func benchVolume(b testing.TB) (*Volume, context.Context) {
+	b.Helper()
+	return benchVolumeN(b, 3)
 }
 
 // BenchmarkVolumeWrite4K measures the full client write path:
@@ -40,6 +45,25 @@ func BenchmarkVolumeWrite4K(b *testing.B) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		off := uint64(i&255) * 4096 // spread over 1 MiB of objects
+		if _, err := v.WriteAt(ctx, p, off); err != nil {
+			b.Fatalf("write: %v", err)
+		}
+	}
+}
+
+// BenchmarkVolumeWrite4KSingle measures the single-replica write path
+// (the single-node MVP configuration): one synchronous replica write,
+// no fan-out goroutines, channels, detached contexts, or payload
+// copies.
+func BenchmarkVolumeWrite4KSingle(b *testing.B) {
+	v, ctx := benchVolumeN(b, 1)
+	p := make([]byte, 4096)
+	p[0] = 0x5A
+	b.SetBytes(4096)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		off := uint64(i&255) * 4096
 		if _, err := v.WriteAt(ctx, p, off); err != nil {
 			b.Fatalf("write: %v", err)
 		}

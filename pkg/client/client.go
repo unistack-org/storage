@@ -529,6 +529,36 @@ func (pl *payload) release() {
 	}
 }
 
+// doneChanPool recycles quorumWrite completion channels. A channel is
+// returned to the pool only after every worker has sent its index; on
+// the quorum-commit fast path (and on caller cancel) stragglers are
+// still sending, so the channel is deliberately dropped there — it is
+// buffered to maxReplicas, so those sends never block and the channel
+// is collected with the straggler goroutines.
+var doneChanPool = sync.Pool{New: func() any { return make(chan int, maxReplicas) }}
+
+// detachedCtx is the quorum-straggler context: never cancelled, with
+// no deadline. sdsnet.Conn uses only Deadline() on the data path, so
+// this is exactly what context.WithoutCancel(ctx) yields in the common
+// case (ctx without a deadline) — at zero allocation cost, because the
+// empty struct needs no boxing in the context.Context interface.
+type detachedCtx struct{}
+
+func (detachedCtx) Deadline() (time.Time, bool) { return time.Time{}, false }
+func (detachedCtx) Done() <-chan struct{}       { return nil }
+func (detachedCtx) Err() error                  { return nil }
+func (detachedCtx) Value(any) any               { return nil }
+
+// deadlineCtx is detachedCtx carrying the caller's deadline (like
+// WithoutCancel, a deadline survives detachment). Boxed once per
+// write, but only on the rare caller-with-deadline path.
+type deadlineCtx struct{ d time.Time }
+
+func (c deadlineCtx) Deadline() (time.Time, bool) { return c.d, true }
+func (deadlineCtx) Done() <-chan struct{}         { return nil }
+func (deadlineCtx) Err() error                    { return nil }
+func (deadlineCtx) Value(any) any                 { return nil }
+
 // quorumWrite fans the chunk out to refs and commits on v.w acks.
 //
 // Allocation shape matters: this is the hot path of every VM write.
@@ -553,15 +583,37 @@ func (v *Volume) quorumWrite(ctx context.Context, oid, inObj uint64, p []byte, n
 		pl = v.acquirePayload(p, len(refs))
 		p = pl.b
 	}
+	// Single replica (the single-node MVP): no fan-out machinery at
+	// all — one synchronous write, no goroutine, channel, detached
+	// context, or payload copy.
+	if len(refs) == 1 && v.w == 1 {
+		status, err := v.replicaWrite(ctx, refs[0], oid, inObj, p, n, hole)
+		switch {
+		case err != nil:
+			return err
+		case status == sdsnet.StatusOK:
+			return nil
+		case status == sdsnet.StatusStale:
+			return &sdsnet.Error{Op: sdsnet.OpWrite, Status: sdsnet.StatusStale}
+		default:
+			return fmt.Errorf("client: write oid %d: replica status %d", oid, status)
+		}
+	}
 	var results [maxReplicas]res
-	// Straggler context: workers run under it, not under the caller's
-	// ctx, so a quorum commit does not cancel the remaining replicas.
-	// No per-write timer: sdsnet Conn enforces its own per-op deadline
-	// on the socket, so detached stragglers are bounded at the
-	// transport level (a per-write context.WithTimeout costs a timer
-	// allocation on every chunk).
-	ctx2 := context.WithoutCancel(ctx)
-	done := make(chan int, len(refs))
+	// Straggler context: detached from the caller's cancellation, so
+	// a quorum commit does not cancel the remaining replicas and a
+	// caller cancel never abandons an in-flight replica write.
+	// sdsnet.Conn uses only ctx.Deadline() on the data path (never
+	// ctx.Value), so a plain detached context is exactly what
+	// context.WithoutCancel(ctx) yields in the common case — at zero
+	// allocation cost. A caller-set deadline is preserved; stragglers
+	// must not be cancelled early, so it is carried as a value-only
+	// deadline (sdsnet bounds the socket at the transport level).
+	var ctx2 context.Context = detachedCtx{}
+	if d, ok := ctx.Deadline(); ok {
+		ctx2 = deadlineCtx{d: d}
+	}
+	done := doneChanPool.Get().(chan int)
 	for i := range refs {
 		// ref passed by value: the caller's scratch backing array must
 		// not escape through the goroutine closure.
@@ -589,6 +641,15 @@ func (v *Volume) quorumWrite(ctx context.Context, oid, inObj uint64, p []byte, n
 				if ok >= v.w {
 					// Quorum reached: stragglers finish under ctx2,
 					// which is detached from the caller's ctx.
+					if v.w == len(refs) {
+						// The quorum is every replica: this is the
+						// last index and no send is pending, so the
+						// channel goes straight back to the pool.
+						doneChanPool.Put(done)
+					}
+					// Otherwise stragglers may still send into it;
+					// it is buffered to maxReplicas, so their sends
+					// never block and it is collected with them.
 					return nil
 				}
 			case r.status == sdsnet.StatusStale:
@@ -604,6 +665,9 @@ func (v *Volume) quorumWrite(ctx context.Context, oid, inObj uint64, p []byte, n
 			return ctx.Err()
 		}
 	}
+	// Every worker's index has been received here: no send is pending,
+	// so the channel can be reused.
+	doneChanPool.Put(done)
 	if firstStale != nil {
 		return firstStale
 	}
