@@ -19,6 +19,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"syscall"
@@ -60,6 +61,10 @@ func (e *exportFlag) Set(v string) error {
 	return nil
 }
 
+// ballast is the retained steady-state allocation from -ballast-mb.
+// Package-level so the GC always counts it as live.
+var ballast []byte
+
 // osdFlag collects repeatable -osd "id@addr" specs (cluster mode).
 type osdFlag []string
 
@@ -92,7 +97,23 @@ func main() {
 	flag.Var(&exports, "export", "export spec name=path[:size] (file/-store) or name (cluster), repeatable")
 	var vduseSpecs exportFlag
 	flag.Var(&vduseSpecs, "vduse", "export a -export as a VDUSE virtio-blk device (Linux): spec export or export=devname, repeatable")
+	gogc := flag.Int("gogc", 0, "GOGC heap-growth percent (0 = runtime default 100; higher = fewer GC cycles, more memory)")
+	ballastMB := flag.Int("ballast-mb", 0, "steady-state ballast in MiB: a retained allocation that raises the live-heap floor so the GC runs proportionally less often")
 	flag.Parse()
+
+	if *gogc > 0 {
+		debug.SetGCPercent(*gogc)
+	}
+	if *ballastMB > 0 {
+		// The ballast is written once and kept in a package-level
+		// variable for the process lifetime; it raises the live-heap
+		// base so the GC target is reached later, trading a fixed
+		// chunk of RSS for fewer GC cycles.
+		ballast = make([]byte, *ballastMB<<20)
+		for i := range ballast {
+			ballast[i] = 1 // touch every page so RSS reflects it
+		}
+	}
 
 	logger := log.New(os.Stderr, "sdsd: ", log.LstdFlags|log.Lmsgprefix)
 
