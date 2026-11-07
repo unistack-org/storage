@@ -2,3 +2,5 @@ github.com/OneOfOne/xxhash v1.2.8 h1:31czK/TI9sNkxIKfaUfGlU47BAxQ0ztGgd9vPyqimf8
 github.com/OneOfOne/xxhash v1.2.8/go.mod h1:eZbhyaAYD41SGSSsnmcpxVoRiQ/MPUTjUdIIOT9Um7Q=
 github.com/hashicorp/golang-lru v1.0.2 h1:dV3g9Z/unq5DpblPpw+Oqcv4dU/1omnb4Ok8iPY6p1c=
 github.com/hashicorp/golang-lru v1.0.2/go.mod h1:iADmTwqILo4mZ8BN3D2Q6+9jd8WM5uGBxy+E8yxSoD4=
+github.com/unistack-org/crushkv v0.0.0-20261107123532-3e0600f56452 h1:+HCUCIvG5hgXay1uEOUnkcgygsOGB1pgzDT/J03j2co=
+github.com/unistack-org/crushkv v0.0.0-20261107123532-3e0600f56452/go.mod h1:RQFrD7PvPgLSUEy9PIbmPjBl5Dzjba9x/SAIuwbKoLQ=
