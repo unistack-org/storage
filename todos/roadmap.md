@@ -206,6 +206,16 @@
 
 - [ ] Бенч-стенд: 3–5 нод, NVMe, 25/40GbE; профили из `tests/fio.txt` +
       randread/randwrite 4K/64K/1M, depth 4/16/128
+- [ ] **Отказоустойчивость по домену отказа (по мотивам Vitastor pool config)**:
+      механизм уже есть (CRUSH `failure_domain` = chooseleaf distinct rack, golden-тесты),
+      взять из Vitastor три вещи: (1) явный `min_size` тома = их pg_minsize — том жив
+      при >=N живых репликах, поведение при недоборе (read-only/деградация) — политика тома;
+      (2) `out_time`-выдержка (default 600 с) перед вытеснением упавшего OSD из
+      placement — защита от ребаланса на «мигающих» OSD; (3) пресеты правил поверх
+      crush-билдера (`rack-aware rep3`, `EC 2+2 по ДЦ` = их level_placement dc=112233,
+      `dc preferred` = их `dc ?= "x"`), чтобы не писать CRUSH-rule руками.
+      Справочник Vitastor: docs/config/pool.ru.md (failure_domain, level_placement,
+      raw_placement DSL, pg_minsize, osd_out_time, noout, reweight, tags).
 - [ ] Цели (ориентир Vitastor highload-доклады): 4K randread **> 100k IOPS/ноду**
       на 3-реплики по TCP, **> 200k** с MSG_ZEROCOPY; латентность single
       4K read < 0.2–0.3 мс (их 0.14 мс — с RDMA; зафиксировать: RDMA — stretch)
