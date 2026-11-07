@@ -86,6 +86,16 @@
   **0 аллокаций** (`docs/GC_ARENA.md`);
 - legacy-формат crushkv удалён, двоичный кодек теперь только Ceph-совместимый.
 
+## MVP-экспорт в ВМ (фаза 4a) — готов
+
+В репозитории появился модуль `sds-nbd/`: NBD-сервер на чистом stdlib Go +
+демон `sdsd`. Проверено end-to-end на macOS arm64 + QEMU 11.1: `qemu-img
+info/convert` (двусторонний roundtrip по md5) и Alpine-гость с
+`-device nvme`, который делает mkfs.ext4/mount на `/dev/nvme0n1` поверх
+NBD — данные видны в backing-файле хоста. Это первый рабочий «диск внутри
+виртуалки»; целевые vhost-user/vfio-user — фаза 4b в
+[roadmap.md](roadmap.md).
+
 ## Рекомендация
 
 Не «чинить» репозиторий, а использовать его как место **нового greenfield

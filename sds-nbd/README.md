@@ -1,0 +1,97 @@
+# sds-nbd — NBD-сервер на Go (MVP экспорта «диск внутри ВМ»)
+
+Модуль `github.com/unistack-org/sds-nbd`: сервер протокола
+[NBD (Network Block Device)](https://github.com/NetworkBlockDevice/nbd/blob/master/doc/proto.md)
+на чистом stdlib Go (без внешних зависимостей) + демон `sdsd`.
+
+Назначение (фаза 4a роадмапа): отдать блок-устройство клиенту QEMU так,
+чтобы внутри виртуалки оно появилось как **`/dev/nvme0n1`**:
+
+```
+гость (Linux) ── /dev/nvme0n1 ──> QEMU NVMe-эмуляция ──> blockdev nbd ── TCP ──> sdsd (Go) ──> файл/устройство на хосте
+```
+
+## Быстрый старт
+
+```sh
+cd storage/sds-nbd
+GOWORK=off go build -o sdsd ./cmd/sdsd
+
+# экспорт vol0 = файл 1 GiB (разрежённый)
+./sdsd -listen 127.0.0.1:10809 -export vol0=/var/lib/sdsd/vol0.img:1G
+
+# на macOS (dev-хост) отключить TRIM/WRITE_ZEROES (нет hole punching):
+./sdsd -listen 127.0.0.1:10809 -export vol0=/tmp/vol0.img:1G \
+       -trim=false -write-zeroes=false
+```
+
+Флаги демона: `-listen`, `-export name=path[:size]` (повторяемый),
+`-data-dir`, `-trim`, `-write-zeroes`, `-max-conns`.
+
+## Проверка утилитами QEMU
+
+```sh
+qemu-img info nbd://127.0.0.1:10809/vol0          # размер, формат raw
+qemu-img convert -f raw -O raw disk.img nbd://127.0.0.1:10809/vol0   # запись
+qemu-img convert nbd://127.0.0.1:10809/vol0 /tmp/readback.bin        # чтение
+```
+
+## Виртуалка с NVMe-диском (проверено на macOS arm64, QEMU 11.1)
+
+```sh
+qemu-system-aarch64 -machine virt -accel hvf -cpu host -m 2048 \
+  -drive if=pflash,format=raw,unit=0,file=$HOME/share/qemu/edk2-aarch64-code.fd,readonly=on \
+  -cdrom alpine-standard-3.22.1-aarch64.iso \
+  -display none -serial stdio \
+  -drive file.driver=nbd,file.host=127.0.0.1,file.port=10809,file.export=vol0,format=raw,if=none,id=n0 \
+  -device nvme,drive=n0,serial=vol00001 \
+  -netdev user,id=net0 -device virtio-net-pci,netdev=net0
+```
+
+В госте (Alpine standard ISO):
+
+```sh
+apk add --no-cache e2fsprogs
+mkfs.ext4 -F -q /dev/nvme0n1
+mount -t ext4 /dev/nvme0n1 /mnt
+echo secret > /mnt/secret.txt && sync && umount /mnt
+```
+
+## Что проверено (MVP-критерии)
+
+- `go test ./... -count=1` и `-race` — все тесты зелёные (7 тестов, 1 skip —
+  TRIM/WRITE_ZEROES, Linux-gated).
+- `qemu-img info` — рукопожатие newstyle+fixed-newstyle, LIST, GO,
+  INFO (EXPORT/BLOCK_SIZE), structured replies.
+- Двусторонний `qemu-img convert` 8 MiB случайных данных: md5 бэкинга и
+  обратного чтения совпадают.
+- Реальный гость: Alpine aarch64 стартует, `nvme nvme0: pci function ...`,
+  `/dev/nvme0n1` 1 GiB; mkfs.ext4 + mount + запись файла; magic `53 EF`
+  (ext4 superblock) и содержимое файла видны в backing-файле на хосте.
+
+## Реализация протокола
+
+- Handshake: **18 байт** — u64 `NBDMAGIC` + u64 `IHAVEOPT` + u16 флагов
+  (FIXED_NEWSTYLE, NO_ZEROES). Старый 10-байтовый hello QEMU 11 не читает.
+- Опции: EXPORT_NAME (legacy), ABORT, LIST, INFO, GO, STRUCTURED_REPLY;
+  LIST_META/SET_META/STARTTLS/EXTENDED_HEADERS — вежливый отказ (QEMU
+  корректно деградирует).
+- Transmission: READ, WRITE (+FUA→fsync), FLUSH, DISC; TRIM/WRITE_ZEROES —
+  при включённых флагах (Linux: `fallocate punches`; на других ОС флаги
+  выключают). BLOCK_STATUS — отказ (meta-контекстов нет).
+- Все ответы передачи учитывают согласованный формат: после
+  STRUCTURED_REPLY **каждый** ответ (включая WRITE/FLUSH/TRIM и ошибки)
+  идёт structured-чанками; simple-ответ на WRITE QEMU считает протокольной
+  ошибкой (гость получает EIO).
+- MaxPayload 4 MiB, TCP_NODELAY, пул буферов на соединение, при Close()
+  активным соединениям шлётся ESHUTDOWN.
+- Отладка: `SDS_NBD_TRACE=1` — hex-трассировка байтов соединения в лог.
+
+## Ограничения MVP и путь дальше
+
+- Один файл-бэкенд на экспорт; репликация/EC появятся с интеграцией в
+  `storage/` (OSD-слой).
+- NVMe-эмуляция QEMU даёт «честный» `/dev/nvme*` в госте, но с лишними
+  копированиями; целевой путь фазы 4b — vhost-user / vfio-user (см.
+  `todos/roadmap.md`).
+- Продакшн-платформа Linux (io_uring, hole punching); macOS — dev-хост.

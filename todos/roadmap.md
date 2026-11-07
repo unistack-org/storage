@@ -93,8 +93,11 @@
 Порядок от простого к целевому (детали и команды —
 `unistack/todos/storage-nvme-vfio-user.md`):
 
-- [ ] **4a MVP (дни): NBD → QEMU `-blockdev driver=nbd` → `-device nvme`**
-      — в госте сразу `/dev/nvme0n1`; цена: лишние копирования, latency выше
+- [x] **4a MVP (дни): NBD → QEMU `-blockdev driver=nbd` → `-device nvme`**
+      — **сделано**: `storage/sds-nbd` (Go, stdlib-only NBD-сервер + демон `sdsd`);
+      проверено: `qemu-img info/convert` туда-обратно по md5, Alpine-гость с
+      `-device nvme` видит `/dev/nvme0n1` (1 GiB), mkfs.ext4 + mount + запись
+      файла, байты видны в backing-файле на хосте. Детали: `sds-nbd/README.md`
 - [ ] **4b Целевой: Go vhost-user-blk server (`pkg/vub`)** — unix-сокет,
       handshake (GET/SET_FEATURES, SET_MEM_TABLE, SET_VRING_*), mmap гостевой
       памяти (hugepages), разбор desc/avail/used rings, multi-queue; QSD как
