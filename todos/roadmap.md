@@ -38,17 +38,31 @@
 
 Цель: один узел держит диск; fio бьёт наш NBD/сокет — база для всех замеров.
 
-- [ ] `pkg/object`: объект = 64-бит ObjectID (OID), размер блока 2–4 MiB (shift, как Sheepdog object / Vitastor 4M)
-- [ ] `pkg/store` (локальный): файл на диск, **O_DIRECT**, имена по OID;
-      preallocate (fallocate), usage-учёт
-- [ ] **io_uring** ring (`pkg/iouring`: registered fds + registered buffers,
-      SQPOLL опционально); fallback `preadv2/pwritev` на non-Linux
+- [x] `pkg/object`: объект = 64-бит ObjectID (OID), размер блока 2–4 MiB (shift, как Sheepdog object / Vitastor 4M)
+- [x] `pkg/store` (локальный): файл на диск, **O_DIRECT** (Linux; на darwin —
+      F_NOCACHE), имена по OID; preallocate (fallocate), usage-учёт,
+      кэш fd, Lookup() для hole-punch
+- [x] **io_uring** ring (`pkg/iouring`: registered fds, fixed offsets;
+      SQPOLL опционально позже); fallback worker-pool `pread/pwrite` на non-Linux;
+      Linux-часть проверена кросс-компиляцией (amd64+arm64), runtime-приёмка на Linux-хосте
 - [ ] No-alloc data path: пулы буферов (arena/mmap), никаких `make()` на I/O;
       бенчмарк-гейт «0 allocs/op» в CI
-- [ ] `pkg/journal`: WAL для метаданных objects (задел под journaling Vitastor-типа)
-- [ ] NBD-сервер (`pkg/nbd`, протокол NBD over unix/TCP) — точка входа для QEMU/fio
+- [x] `pkg/journal`: WAL для метаданных objects (16B заголовок: seq/len/crc32c,
+      torn-tail устойчивость, replay, truncate) — задел под journaling Vitastor-типа
+- [x] NBD-сервер (`sds-nbd/nbd`, протокол NBD over TCP) — точка входа для QEMU/fio;
+      **StoreBackend**: экспорт поверх pkg/store (`sdsd -store -direct [-preallocate]`),
+      split по 4M-границам, WRITE_ZEROES через punch hole (Linux), fallback zeroes на darwin
+- [x] Бенчмарк-клиент `sdsbench` (pipelined NBD, QD, латентные перцентили)
 - [ ] Приёмка фазы: `fio --ioengine=nbd/libaio` 4K randread ≥ базовой линии
       (замер локального файла как потолок), latency p99 < 1 мс на NVMe-хосте
+      — **базовая линия fio-внутри-VM (Alpine 3.22 / kernel 6.12, QEMU aarch64
+      nvme→NBD→sdsd -store -direct на macOS-хосте, io_uring, direct=1, QD:**
+      seqwrite 1M QD8 = 1080 MiB/s; seqread 1M QD8 = 911 MiB/s;
+      randwrite 4K QD32 (30 c) = 10.7k IOPS / 41.9 MiB/s (clat avg 2.96 мс);
+      randread 4K QD32 (30 c) = 15.1k IOPS / 59.0 MiB/s (clat avg 2.10 мс);
+      потолок хоста не проверен (macOS: F_NOCACHE read синхронный);
+      sdsbench (host→sdsd, loopback, QD32): seqwrite 1M 733 MB/s,
+      randwrite 4K 49k IOPS; приёмка p99<1мс — на Linux+NVMe
 
 ## Фаза 2 — Сеть и репликация (3–5 недель)
 

@@ -21,6 +21,7 @@ import (
 	"syscall"
 
 	"github.com/unistack-org/sds-nbd/nbd"
+	"github.com/unistack-org/storage/pkg/store"
 )
 
 // sizeSuffix parses sizes like 512M, 10G, 1T, 4096.
@@ -58,6 +59,9 @@ func main() {
 	dataDir := flag.String("data-dir", "", "directory for relative export paths")
 	trim := flag.Bool("trim", true, "advertise and handle TRIM (requires hole punching: Linux)")
 	writeZeroes := flag.Bool("write-zeroes", true, "advertise and handle WRITE_ZEROES")
+	storeMode := flag.Bool("store", false, "treat export paths as object-store directories (phase-1 data path) instead of sparse files")
+	direct := flag.Bool("direct", false, "with -store: request O_DIRECT on object files")
+	prealloc := flag.Bool("preallocate", false, "with -store: fallocate each new object to full size")
 	maxConns := flag.Int("max-conns", 0, "max concurrent client connections (0 = unlimited)")
 	flag.Var(&exports, "export", "export spec name=path[:size], repeatable")
 	flag.Parse()
@@ -89,11 +93,11 @@ func main() {
 				logger.Fatalf("bad size in -export %q: %v", spec, err)
 			}
 		}
-		b, err := nbd.NewFileBackend(path, size)
+		b, err := newBackend(*storeMode, path, size, *direct, *prealloc)
 		if err != nil {
 			logger.Fatalf("export %s: %v", name, err)
 		}
-		logger.Printf("export %q -> %s (%s)", name, path, humanSize(b.Size()))
+		logger.Printf("export %q -> %s (%s, store=%v)", name, path, humanSize(b.Size()), *storeMode)
 		es = append(es, &nbd.Export{Name: name, Backend: b})
 	}
 
@@ -123,6 +127,21 @@ func main() {
 		logger.Fatalf("serve: %v", err)
 	}
 	logger.Printf("bye")
+}
+
+// newBackend builds the export backend: a plain sparse file (MVP
+// default) or, with -store, the phase-1 object-store data path.
+func newBackend(storeMode bool, path string, size uint64, direct, prealloc bool) (nbd.Backend, error) {
+	if !storeMode {
+		return nbd.NewFileBackend(path, size)
+	}
+	if size == 0 {
+		return nil, fmt.Errorf("-store exports require an explicit :size")
+	}
+	return nbd.NewStoreBackend(path, size, store.Options{
+		Direct:      direct,
+		Preallocate: prealloc,
+	})
 }
 
 // parseExportSpec parses "name=path[:size]". The size may be omitted for a

@@ -624,7 +624,7 @@ func (s *Server) transmission(cs *connState) error {
 		case CmdFlush:
 			// Flush takes no payload; length/offset are ignored.
 			if err := cs.backend.Flush(); err != nil {
-				if err2 := s.replyErr(cs, req.handle, errnoToNBD(err), "request failed"); err2 != nil {
+				if err2 := s.replyErr(cs, req.handle, errnoToNBD(err), err.Error()); err2 != nil {
 					return err2
 				}
 				continue
@@ -652,7 +652,7 @@ func (s *Server) transmission(cs *connState) error {
 				continue
 			}
 			if err := cs.backend.Trim(int64(req.offset), req.length); err != nil {
-				if err2 := s.replyErr(cs, req.handle, errnoToNBD(err), "request failed"); err2 != nil {
+				if err2 := s.replyErr(cs, req.handle, errnoToNBD(err), err.Error()); err2 != nil {
 					return err2
 				}
 				continue
@@ -681,7 +681,7 @@ func (s *Server) transmission(cs *connState) error {
 			}
 			punch := req.flags&cmdFlagNoHole == 0
 			if err := cs.backend.WriteZeroes(int64(req.offset), req.length, punch); err != nil {
-				if err2 := s.replyErr(cs, req.handle, errnoToNBD(err), "request failed"); err2 != nil {
+				if err2 := s.replyErr(cs, req.handle, errnoToNBD(err), err.Error()); err2 != nil {
 					return err2
 				}
 				continue
@@ -775,6 +775,7 @@ func (s *Server) replyOK(cs *connState, handle uint64) error {
 
 // replyErr replies a transmission failure in the negotiated reply format.
 func (s *Server) replyErr(cs *connState, handle uint64, code uint32, msg string) error {
+	s.logf("nbd: %s request error handle=%d code=%d: %s", cs.conn.RemoteAddr(), handle, code, msg)
 	if cs.structured {
 		return s.replyStructuredError(cs, handle, code, msg)
 	}
@@ -828,7 +829,7 @@ func (s *Server) handleWrite(cs *connState, req reqHdr) error {
 	}
 	if req.flags&cmdFlagFUA != 0 {
 		if err := cs.backend.Flush(); err != nil {
-			return s.replyErr(cs, req.handle, errnoToNBD(err), "request failed")
+			return s.replyErr(cs, req.handle, errnoToNBD(err), err.Error())
 		}
 	}
 	return s.replyOK(cs, req.handle)
