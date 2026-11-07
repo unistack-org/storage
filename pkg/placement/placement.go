@@ -214,8 +214,28 @@ func (s *Snapshot) buildTable() error {
 	defer w.Free()
 	res := make([]int32, s.Replicas)
 	s.pg = make([]int32, s.PGNum*uint32(s.Replicas))
+	// Devices absent from the registry are out: zero weight makes every
+	// crush algorithm reject them (mapper.c treats weight 0 as out, and
+	// chooseleaf re-picks the whole host when its only device is out).
+	weights := s.weights
+	out := false
+	for id := range s.weights {
+		if _, ok := s.refs[int32(id)]; !ok {
+			out = true
+			break
+		}
+	}
+	if out {
+		weights = make([]uint32, len(s.weights))
+		copy(weights, s.weights)
+		for j := range weights {
+			if _, ok := s.refs[int32(j)]; !ok {
+				weights[j] = 0
+			}
+		}
+	}
 	for pg := uint32(0); pg < s.PGNum; pg++ {
-		n := s.cm.DoRule(w, s.ruleNo, int32(pg), res, s.weights)
+		n := s.cm.DoRule(w, s.ruleNo, int32(pg), res, weights)
 		row := s.pg[pg*uint32(s.Replicas) : (pg+1)*uint32(s.Replicas)]
 		for i := range row {
 			if i < n {

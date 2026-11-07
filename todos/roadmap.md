@@ -111,8 +111,17 @@
       авто-рефреш placement по `StatusStale`, fallback на живую реплику
 - [x] Интеграция crushkv в storage: парсинг epoch-карт (text/json/binary),
       кэш снапшота placement в клиенте (троттлинг 5 мс на всплески stale)
-  - [ ] Reweight-валидатор, `rule`-валидатор под наши volume-class (SSD/HDD),
-        эмуляция отказов (chi-square равномерность на больших x) — поверх crushkv.
+  - [x] Эмуляция отказов + chi-square равномерность на больших картах —
+        `pkg/placement/uniformity_test.go`: 10 host × 3 OSD, 65536 pg →
+        chi2 osd=25.1 / host=8.8 (порог 200); отказ 1 OSD из 30 двигает
+        ровно pg с ним (минимальность CRUSH), доля затронутых pg 3/30,
+        пост-отказ chi2 ≤ 250; reweight(0) ≡ удаление из реестра;
+        равномерное удвоение весов двигает 0% слотов (инвариантность
+        масштабирования straw2). Попутно найден и исправлен баг:
+        `buildTable` игнорировал реестр — устройства вне Registry теперь
+        получают вес 0 (is_out), как и документировано.
+  - [ ] Reweight-валидатор, `rule`-валидатор под наши volume-class (SSD/HDD) —
+        поверх crushkv (CLI-команда `map check`).
 - [x] sds-nbd: бэкенд `VolumeBackend` (том → NBD-экспорт) и режим `sdsd
       -cluster <meta-каталог>`: OSD в процессе (`-osd id@dir[@addr]`),
       публикация карты (`-crushmap -epoch`), `-create имя:размер`,
@@ -144,8 +153,9 @@
         690–940 нс у `make()`. GC на пути размещения отсутствует полностью.
   - [x] Тесты: воспроизводимость (golden Ceph), reweight in/out (вес 0),
         movement-свойства CRUSH — в `crush/*_test.go`.
-  - [ ] Reweight-валидатор, `rule`-валидатор под наши volume-class (SSD/HDD),
-        эмуляция отказов (chi-square равномерность на больших x) — поверх crushkv.
+  - [ ] Reweight-валидатор, `rule`-валидатор под наши volume-class (SSD/HDD) —
+        CLI-команда поверх crushkv (эмуляция отказов и chi-square равномерность
+        уже покрыты тестами: `storage/pkg/placement/uniformity_test.go`).
 - [ ] CLI `unistorage`: node add/ls/out, volume create/ls/rm, map dump/check,
       reweight, recovery status
 
@@ -159,11 +169,21 @@
       проверено: `qemu-img info/convert` туда-обратно по md5, Alpine-гость с
       `-device nvme` видит `/dev/nvme0n1` (1 GiB), mkfs.ext4 + mount + запись
       файла, байты видны в backing-файле на хосте. Детали: `sds-nbd/README.md`
+      **E2E кластерного пути (Phase 3) проверен:** 3 OSD в процессе + том 2 GiB
+      rep3 pg64 → NBD :10809 → Alpine ВМ: `/dev/nvme0n1` = 2147483648,
+      mkfs.ext4 OK, запись 64 MiB blob + secret, md5 стабильны после
+      umount/mount (данные через кворум-репликацию на месте), корректный
+      shutdown/autofsck. fio в госте не поставился (aarch64-пакет вне зеркала
+      ISO) — IOPS-числа сняты sdsbench на хосте: seqwrite 64K qd16 ~46 МБ/с,
+      randread 4K qd32 ~2.3k IOPS (loopback, отладочная сборка)
 - [ ] **4b Целевой: Go vhost-user-blk server (`pkg/vub`)** — unix-сокет,
       handshake (GET/SET_FEATURES, SET_MEM_TABLE, SET_VRING_*), mmap гостевой
       памяти (hugepages), разбор desc/avail/used rings, multi-queue; QSD как
       мост `--export type=vfio-user` → QEMU `-device vfio-user-pci`
       (в госте virtio-blk) + вариант NVMe через QSD NBD-экспорт + QEMU NVMe
+      ⚠ Проверено: домашний хост (macOS, homebrew QEMU 11.1.3) НЕ имеет
+      `vhost-user-blk-pci`/`vfio-pci`/vhost-объектов — 4b валидируется только
+      на Linux+KVM (x86_64 или aarch64 Linux-хост с QEMU ≥ 8)
 - [ ] Интеграция с `unistack/pkg/storage` (Provider-драйвер `unistorage`:
       CreateVolume/DeleteVolume/Attach) и `pkg/qemu` (`Drive.VfioUser`)
 - [ ] Отказоустойчивость экспорта: смерть Go-бэкенда → QSD reconnect,
