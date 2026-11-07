@@ -8,6 +8,7 @@ import (
 	"io"
 	"net"
 	"sync"
+	"sync/atomic"
 )
 
 // Backend is the storage a Server exposes over the wire. store.Backend
@@ -26,14 +27,22 @@ type Backend interface {
 	Sync(ctx context.Context) error
 }
 
-// Server serves one Backend over accepted connections. Every connection
-// is bound to a single export name by the handshake.
+// Server serves Backends over accepted connections. Every connection is
+// bound to a single export name by the handshake. Exactly one of
+// Backend (single anonymous export: any requested name maps to it) or
+// Exports (name-routed) should be set.
 type Server struct {
+	// Backend serves every export name when Exports is nil.
 	Backend Backend
+	// Exports routes handshake names to backends; an unknown name is
+	// rejected with StatusUnknown.
+	Exports map[string]Backend
 	// ReadOnly rejects all mutating operations (status read-only).
 	ReadOnly bool
 	// Logf receives connection lifecycle and request errors (may be nil).
 	Logf func(format string, args ...any)
+
+	minEpoch atomic.Uint32
 
 	mu       sync.Mutex
 	listener net.Listener
@@ -41,6 +50,24 @@ type Server struct {
 	closedF  bool
 	conns    map[net.Conn]struct{}
 	wg       sync.WaitGroup
+}
+
+// SetMinEpoch enables placement-epoch fencing: requests carrying an
+// epoch below min are rejected with StatusStale (response value = min),
+// so clients learn to refresh their cluster map. min == 0 disables
+// fencing (requests are accepted at any epoch).
+func (s *Server) SetMinEpoch(min uint32) { s.minEpoch.Store(min) }
+
+// MinEpoch returns the current fencing floor.
+func (s *Server) MinEpoch() uint32 { return s.minEpoch.Load() }
+
+// lookup resolves an export name to its backend.
+func (s *Server) lookup(name string) (Backend, bool) {
+	if s.Exports != nil {
+		b, ok := s.Exports[name]
+		return b, ok
+	}
+	return s.Backend, s.Backend != nil
 }
 
 // Serve listens on addr ("host:port") and serves until Close. It returns
@@ -159,6 +186,12 @@ func (s *Server) handle(c net.Conn) {
 		}
 	}
 	s.logf("sdsnet: %s connected export=%q", c.RemoteAddr(), string(name))
+	backend, ok := s.lookup(string(name))
+	if !ok {
+		s.logf("sdsnet: %s unknown export %q", c.RemoteAddr(), string(name))
+		s.reply(c, &RespHeader{Status: StatusUnknown})
+		return
+	}
 	if err := s.reply(c, &RespHeader{Status: StatusOK}); err != nil {
 		return
 	}
@@ -193,7 +226,7 @@ func (s *Server) handle(c net.Conn) {
 				return
 			}
 		}
-		resp, out := s.dispatch(ctx, &h, payload)
+		resp, out := s.dispatch(ctx, backend, &h, payload)
 		if err := s.replyW(wr, &resp, out); err != nil {
 			return
 		}
@@ -205,7 +238,7 @@ func (s *Server) handle(c net.Conn) {
 
 // dispatch executes one request. The returned out slice (read payload)
 // is streamed by the caller right after the response header.
-func (s *Server) dispatch(ctx context.Context, h *ReqHeader, payload []byte) (RespHeader, []byte) {
+func (s *Server) dispatch(ctx context.Context, backend Backend, h *ReqHeader, payload []byte) (RespHeader, []byte) {
 	if h.Length > MaxPayload {
 		return RespHeader{Seq: h.Seq, Status: StatusTooBig}, nil
 	}
@@ -215,13 +248,23 @@ func (s *Server) dispatch(ctx context.Context, h *ReqHeader, payload []byte) (Re
 			return RespHeader{Seq: h.Seq, Status: StatusReadOnly}, nil
 		}
 	}
+	// Epoch fencing: a node that has been replaced (its epoch is below
+	// the cluster's floor) must not mutate; the reply tells the client
+	// the epoch it needs to advance to.
+	if min := s.minEpoch.Load(); min != 0 && h.Epoch < min {
+		switch h.Op {
+		case OpWrite, OpWriteZeroes, OpTrim, OpSync:
+			s.logf("sdsnet: stale request epoch %d < %d (op %s oid %d)", h.Epoch, min, h.Op, h.OID)
+			return RespHeader{Seq: h.Seq, Status: StatusStale, Value: uint64(min)}, nil
+		}
+	}
 	switch h.Op {
 	case OpPing:
 		return RespHeader{Seq: h.Seq, Status: StatusOK}, nil
 
 	case OpRead:
 		buf := make([]byte, h.Length)
-		n, err := s.Backend.ReadAt(ctx, h.OID, h.Offset, buf)
+		n, err := backend.ReadAt(ctx, h.OID, h.Offset, buf)
 		if err != nil {
 			return RespHeader{Seq: h.Seq, Status: statusFromErr(err)}, nil
 		}
@@ -231,25 +274,25 @@ func (s *Server) dispatch(ctx context.Context, h *ReqHeader, payload []byte) (Re
 		if len(payload) != int(h.Length) {
 			return RespHeader{Seq: h.Seq, Status: StatusInvalid}, nil
 		}
-		if err := s.Backend.WriteAt(ctx, h.OID, h.Offset, payload); err != nil {
+		if err := backend.WriteAt(ctx, h.OID, h.Offset, payload); err != nil {
 			return RespHeader{Seq: h.Seq, Status: statusFromErr(err)}, nil
 		}
 		return RespHeader{Seq: h.Seq, Status: StatusOK, Value: uint64(h.Length)}, nil
 
 	case OpWriteZeroes:
-		if err := s.Backend.WriteZeroes(ctx, h.OID, h.Offset, uint64(h.Length), h.Flags&FlagsHole != 0); err != nil {
+		if err := backend.WriteZeroes(ctx, h.OID, h.Offset, uint64(h.Length), h.Flags&FlagsHole != 0); err != nil {
 			return RespHeader{Seq: h.Seq, Status: statusFromErr(err)}, nil
 		}
 		return RespHeader{Seq: h.Seq, Status: StatusOK, Value: uint64(h.Length)}, nil
 
 	case OpTrim:
-		if err := s.Backend.WriteZeroes(ctx, h.OID, h.Offset, uint64(h.Length), true); err != nil {
+		if err := backend.WriteZeroes(ctx, h.OID, h.Offset, uint64(h.Length), true); err != nil {
 			return RespHeader{Seq: h.Seq, Status: statusFromErr(err)}, nil
 		}
 		return RespHeader{Seq: h.Seq, Status: StatusOK, Value: uint64(h.Length)}, nil
 
 	case OpSync:
-		if err := s.Backend.Sync(ctx); err != nil {
+		if err := backend.Sync(ctx); err != nil {
 			return RespHeader{Seq: h.Seq, Status: statusFromErr(err)}, nil
 		}
 		return RespHeader{Seq: h.Seq, Status: StatusOK}, nil

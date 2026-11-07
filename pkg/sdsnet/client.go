@@ -6,6 +6,7 @@ import (
 	"io"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -21,7 +22,15 @@ type Conn struct {
 	wr   *bufio.Writer
 	seq  uint32
 	dead bool // transport error: the stream state is unknown
+	ep   atomic.Uint32
 }
+
+// SetEpoch stamps every subsequent request with the given placement
+// epoch (0 disables fencing for this connection).
+func (cc *Conn) SetEpoch(epoch uint32) { cc.ep.Store(epoch) }
+
+// Epoch returns the epoch stamped on outgoing requests.
+func (cc *Conn) Epoch() uint32 { return cc.ep.Load() }
 
 // Dead reports whether the connection saw a transport error and must
 // not be reused: the request/response stream may be desynchronised.
@@ -84,6 +93,7 @@ func (cc *Conn) do(ctx context.Context, h *ReqHeader, payload, p []byte) (int, e
 		cc.seq = 1
 	}
 	h.Seq = cc.seq
+	h.Epoch = cc.ep.Load()
 	cc.seq++
 
 	fail := func(err error) (int, error) {
@@ -122,7 +132,7 @@ func (cc *Conn) do(ctx context.Context, h *ReqHeader, payload, p []byte) (int, e
 		return 0, ErrProtocol // stream desync: connection is unusable
 	}
 	if rh.Status != StatusOK {
-		return 0, &Error{Seq: h.Seq, Op: h.Op, Status: rh.Status}
+		return 0, &Error{Seq: h.Seq, Op: h.Op, Status: rh.Status, Value: rh.Value}
 	}
 	if h.Op == OpRead && rh.Value > 0 {
 		n := int(rh.Value)
@@ -197,6 +207,8 @@ type Pool struct {
 	Export string
 	Limit  int // max connections (0 = unlimited)
 
+	epoch atomic.Uint32 // stamped onto connections at Get
+
 	mu     sync.Mutex
 	idle   []*Conn
 	opened int
@@ -215,6 +227,13 @@ func NewPool(addr, export string) *Pool {
 	}
 }
 
+// SetEpoch stamps every connection checked out of the pool with the
+// given placement epoch (see Conn.SetEpoch).
+func (pp *Pool) SetEpoch(epoch uint32) { pp.epoch.Store(epoch) }
+
+// Epoch returns the pool's placement epoch.
+func (pp *Pool) Epoch() uint32 { return pp.epoch.Load() }
+
 // Get returns a connection, dialing a new one if none is idle. When the
 // pool is at Limit it blocks until a connection is returned, ctx is
 // cancelled, or the pool is closed.
@@ -228,6 +247,7 @@ func (pp *Pool) Get(ctx context.Context) (*Conn, error) {
 		if n := len(pp.idle); n > 0 {
 			cc := pp.idle[n-1]
 			pp.idle = pp.idle[:n-1]
+			ep := pp.epoch.Load()
 			pp.mu.Unlock()
 			if cc.Dead() {
 				cc.Close()
@@ -236,6 +256,7 @@ func (pp *Pool) Get(ctx context.Context) (*Conn, error) {
 				pp.mu.Unlock()
 				continue // try the next idle conn
 			}
+			cc.SetEpoch(ep)
 			return cc, nil
 		}
 		if pp.Limit > 0 && pp.opened >= pp.Limit {
@@ -259,6 +280,7 @@ func (pp *Pool) Get(ctx context.Context) (*Conn, error) {
 			pp.mu.Unlock()
 			return nil, err
 		}
+		cc.SetEpoch(pp.epoch.Load())
 		pp.mu.Lock()
 		if pp.closed {
 			pp.opened--

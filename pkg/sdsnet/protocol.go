@@ -79,6 +79,8 @@ const (
 	StatusNotSupp         // operation not supported by this server
 	StatusIO              // backend I/O failure
 	StatusTooBig          // payload exceeds MaxPayload
+	StatusStale           // request epoch below the server's minimum epoch
+	StatusUnknown         // export name not served by this server
 )
 
 func (s Status) String() string {
@@ -97,20 +99,30 @@ func (s Status) String() string {
 		return "i/o"
 	case StatusTooBig:
 		return "too big"
+	case StatusStale:
+		return "stale epoch"
+	case StatusUnknown:
+		return "unknown export"
 	}
 	return fmt.Sprintf("status(%d)", uint32(s))
 }
 
 // Error is a remote failure: the server's status for one request.
+// Value mirrors the response header's value field: for StatusStale it
+// carries the server's current minimum epoch.
 type Error struct {
 	Seq    uint32
 	Op     Op
 	Status Status
+	Value  uint64
 }
 
 func (e *Error) Error() string {
 	return fmt.Sprintf("sdsnet: %s (seq %d) failed: %s", e.Op, e.Seq, e.Status)
 }
+
+// StaleEpoch reports the epoch the server demanded (StatusStale only).
+func (e *Error) StaleEpoch() uint32 { return uint32(e.Value) }
 
 // ReqHeader is one protocol request.
 //
