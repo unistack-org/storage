@@ -27,11 +27,12 @@ func New(entries int) (Ring, error) {
 }
 
 type fallbackRing struct {
-	mu     sync.Mutex
-	files  map[int32]*os.File
-	work   chan Op
-	wg     sync.WaitGroup
-	closed bool
+	mu      sync.Mutex // guards closed + work sends (never held while a worker needs it)
+	filesMu sync.Mutex
+	files   map[int32]*os.File
+	work    chan Op
+	wg      sync.WaitGroup
+	closed  bool
 }
 
 // registerFile maps an fd to an *os.File so the workers can use Go's
@@ -39,15 +40,15 @@ type fallbackRing struct {
 // before submitting (the Linux implementation registers via
 // IORING_REGISTER_FILES automatically from Submit).
 func (r *fallbackRing) RegisterFile(fd int32, f *os.File) {
-	r.mu.Lock()
+	r.filesMu.Lock()
 	r.files[fd] = f
-	r.mu.Unlock()
+	r.filesMu.Unlock()
 }
 
 func (r *fallbackRing) file(fd int32) (*os.File, bool) {
-	r.mu.Lock()
+	r.filesMu.Lock()
 	f, ok := r.files[fd]
-	r.mu.Unlock()
+	r.filesMu.Unlock()
 	return f, ok
 }
 

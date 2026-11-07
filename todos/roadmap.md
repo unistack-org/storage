@@ -66,15 +66,28 @@
 
 ## Фаза 2 — Сеть и репликация (3–5 недель)
 
-- [ ] `pkg/net`: свой бинарный протокол (фикс. заголовок 16–32 B: OID, offset,
-      len, epoch, flags; без grpc/protobuf на data path)
-- [ ] Клиентские пулы соединений, pipeline/batch запросов, `MSG_ZEROCOPY`
-      (отправка), приём через io_uring (`SO_ZEROCOPY` позже)
-- [ ] Репликация: N-копий, запись у всех реплик (quorum-запись, read-any),
-      версии объекта (epoch+generation), flush/fsync-семантика для FUA
-- [ ] Отказы: heartbeat, таймауты, деградация при потере реплики;
-      recovery-трафик отдельным приоритетом
-- [ ] Тесты: chaos (обрывы, задержки, partial write), `go test -race`
+- [x] `pkg/sdsnet`: бинарный протокол (запрос 32 B: op/flags/seq/OID/offset/len/epoch;
+      ответ 16 B: seq/status/value; handshake на 16 B + имя экспорта; без grpc/protobuf)
+      — сервер `Server` (1 экспорт на соединение, ReadOnly-режим), клиент `Conn`
+      (seq-валидация ответов, dead-conn детект), статусы OK/EOF/IO/Invalid/TooBig,
+      raw-seq echo при битых заголовках (защита от desync конвейера)
+- [x] Пулы соединений `sdsnet.Pool`: ленивый диал, Limit = пер-таргет троттлинг
+      (Get блокируется до возврата соединения/ctx/Close), выброс dead-conn,
+      reconnect после смерти сервера; тесты recovery/chaos зелёные под `-race`
+- [x] Репликация `pkg/replication`: без primary, fan-out на N таргетов, commit по
+      W из N (RF=3 W=2), stragglers дренируются окно grace=2 c, `ErrQuorumLost`
+      при fails > N−W; epoch в заголовке зарезервирован под fencing (серверный
+      fencing — Фаза 3); WriteZeroes/Trim/Sync фан-аутятся так же
+- [x] Отказы: таймауты диала 5 c, ctx-отмена веерного запроса, замороженная
+      реплика не блокирует commit по кворуму, восстановление реплики (redial),
+      серверный `Close` рвёт живые соединения (нет висящих handler-ов)
+- [x] Бенчмарк: `BenchmarkClientWrite4K` (loopback, mem-backend): 41.4 µs/op
+      ≈ 98.9 MB/s, 5 allocs/op — запас под zero-copy/pipe-lining есть
+- [ ] pipeline/batch запросов, `MSG_ZEROCOPY` (Linux), приём через io_uring
+- [ ] heartbeat, деградация при потере реплики, recovery-трафик приоритетом
+- [x] Тесты: chaos (смерть сервера, frozen replica, пул-давление, обрывы), `-race`
+- Примечание: исправлен дедлок `iouring.fallbackRing.Submit` (mutex держался при
+  отправке в unbuffered канал; файлы вынесены под отдельный filesMu)
 
 ## Фаза 3 — Кластер, метаданные, CRUSH (4–6 недель) — «как Ceph»
 
