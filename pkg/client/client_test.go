@@ -495,7 +495,7 @@ func TestClusterOutTimeEvict(t *testing.T) {
 	// Fast dwell: evict 40ms after the first transport failure, probe
 	// every 10ms.
 	c.cl.SetOutTime(40 * time.Millisecond)
-	c.cl.probeEvery = 10 * time.Millisecond
+	c.cl.setProbeEvery(10 * time.Millisecond)
 
 	// Kill OSD 1 and drop its pool so the client redials and fails
 	// fast (connection refused) — a transport error, not a reply.
@@ -551,7 +551,7 @@ func TestClusterOutTimeFlapNoEvict(t *testing.T) {
 	c := newCluster(t, 3)
 	c.publishMap(1)
 	c.cl.SetOutTime(60 * time.Second) // generous dwell
-	c.cl.probeEvery = 10 * time.Millisecond
+	c.cl.setProbeEvery(10 * time.Millisecond)
 
 	// A transport failure the OSD recovers from within the dwell.
 	c.cl.noteFailure(1)
@@ -609,7 +609,7 @@ func TestClusterOutTimeRestore(t *testing.T) {
 	})
 
 	cl := NewCluster(m)
-	cl.probeEvery = 10 * time.Millisecond
+	cl.setProbeEvery(10 * time.Millisecond)
 	t.Cleanup(func() { _ = cl.Close() })
 	if !waitFor(t, 5*time.Second, func() bool {
 		ls, err := meta.ListOSDs(ctx, m)

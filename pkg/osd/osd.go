@@ -99,10 +99,13 @@ func (d *Daemon) Run(ctx context.Context) error {
 	d.addr = addr
 	d.mu.Unlock()
 
-	d.srv = &sdsnet.Server{
+	srv := &sdsnet.Server{
 		Backend: &objectBackend{st: st},
 		Logf:    d.opts.Logf,
 	}
+	d.mu.Lock()
+	d.srv = srv
+	d.mu.Unlock()
 
 	// Stable per-OSD uuid.
 	if err := d.loadOrCreateUUID(); err != nil {
@@ -122,7 +125,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	defer mapW.Stop()
 
 	serveErr := make(chan error, 1)
-	go func() { serveErr <- d.srv.ServeListener(probe) }()
+	go func() { serveErr <- srv.ServeListener(probe) }()
 
 	if err := d.applyLatestEpoch(ctx); err != nil {
 		d.opts.Logf("osd: initial epoch: %v", err)
@@ -157,8 +160,14 @@ func (d *Daemon) applyLatestEpoch(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	if rec.Epoch > d.srv.MinEpoch() {
-		d.srv.SetMinEpoch(rec.Epoch)
+	d.mu.Lock()
+	srv := d.srv
+	d.mu.Unlock()
+	if srv == nil {
+		return nil
+	}
+	if rec.Epoch > srv.MinEpoch() {
+		srv.SetMinEpoch(rec.Epoch)
 		d.opts.Logf("osd: fence raised to epoch %d", rec.Epoch)
 	}
 	return nil
@@ -244,18 +253,18 @@ func (d *Daemon) Fence() uint32 {
 	return d.srv.MinEpoch()
 }
 
-// Close stops the daemon.
+// Close stops the daemon. Safe to call repeatedly and concurrently.
 func (d *Daemon) Close() error {
 	d.mu.Lock()
 	if d.srv != nil {
 		d.srv.Close()
 	}
-	d.mu.Unlock()
 	select {
 	case <-d.quit:
 	default:
 		close(d.quit)
 	}
+	d.mu.Unlock()
 	return nil
 }
 

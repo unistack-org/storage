@@ -77,13 +77,15 @@ type Cluster struct {
 	// answer keeps its weight for outTime; only if it stays down that
 	// long is it set weight 0 (out of placement, triggering rebalance).
 	// An OSD that flaps back within the dwell never triggers churn.
-	outTime     time.Duration
-	probeEvery  time.Duration // prober tick (tests shrink it)
-	failMu      sync.Mutex
-	failures    map[int32]time.Time // transport failures, first-seen
-	outs        map[int32]bool      // evicted, awaiting recovery
-	proberOn    bool
-	probeStopCh chan struct{}
+	// Stored as nanos so the hot path (noteFailure) and prober read
+	// them lock-free while SetOutTime / tests may write at any time.
+	outTimeNs    atomic.Int64
+	probeEveryNs atomic.Int64 // prober tick (tests shrink it)
+	failMu       sync.Mutex
+	failures     map[int32]time.Time // transport failures, first-seen
+	outs         map[int32]bool      // evicted, awaiting recovery
+	proberOn     bool
+	probeStopCh  chan struct{}
 }
 
 // SetRefreshInterval overrides the placement refresh interval. The
@@ -99,26 +101,36 @@ func (c *Cluster) SetRefreshInterval(d time.Duration) {
 // NewCluster wires a client to the cluster metadata. Placement is built
 // on first use (Refresh/OpenVolume).
 func NewCluster(s meta.Store) *Cluster {
-	return &Cluster{
+	c := &Cluster{
 		meta:       s,
 		pools:      map[int32]*sdsnet.Pool{},
 		refreshMin: 5 * time.Millisecond,
-		outTime:    600 * time.Second,
-		probeEvery: 15 * time.Second,
 		failures:   map[int32]time.Time{},
 		outs:       map[int32]bool{},
 	}
+	c.outTimeNs.Store(int64(600 * time.Second))
+	c.probeEveryNs.Store(int64(15 * time.Second))
+	return c
 }
 
 // SetOutTime sets the dwell (osd_out_time analogue): an OSD whose
 // requests fail transport-wise stays in placement for this long before
 // being marked out (weight 0). 0 disables auto-eviction entirely
-// (noout). Must be called before use. The dwell prevents rebalance
-// churn when an OSD flaps: it returns to service unseen if it answers
-// a probe before the dwell elapses.
+// (noout). Safe to call at any time; takes effect from the next
+// failure. The dwell prevents rebalance churn when an OSD flaps: it
+// returns to service unseen if it answers a probe before the dwell
+// elapses.
 func (c *Cluster) SetOutTime(d time.Duration) {
 	if d >= 0 {
-		c.outTime = d
+		c.outTimeNs.Store(int64(d))
+	}
+}
+
+// setProbeEvery tunes the prober tick (tests shrink it; production
+// keeps the 15s default).
+func (c *Cluster) setProbeEvery(d time.Duration) {
+	if d > 0 {
+		c.probeEveryNs.Store(int64(d))
 	}
 }
 
@@ -143,7 +155,8 @@ func (c *Cluster) dropPool(id int32) {
 // connection-level failures (dial/IO), never protocol replies: a
 // StatusStale answer proves the OSD is alive.
 func (c *Cluster) noteFailure(id int32) {
-	if c.outTime <= 0 {
+	outTime := time.Duration(c.outTimeNs.Load())
+	if outTime <= 0 {
 		return // noout
 	}
 	now := time.Now()
@@ -159,7 +172,7 @@ func (c *Cluster) noteFailure(id int32) {
 		c.failMu.Unlock()
 		return
 	}
-	if now.Sub(first) < c.outTime {
+	if now.Sub(first) < outTime {
 		c.failMu.Unlock()
 		return // still inside the dwell
 	}
@@ -204,7 +217,7 @@ func (c *Cluster) ensureProber() {
 // placement builds from the registry, so the rebalance target is the
 // current map, not the pre-out one).
 func (c *Cluster) probeLoop(stop <-chan struct{}) {
-	tick := time.NewTicker(c.probeEvery)
+	tick := time.NewTicker(time.Duration(c.probeEveryNs.Load()))
 	defer tick.Stop()
 	for {
 		select {
@@ -273,7 +286,7 @@ func (c *Cluster) probeOnce(stop <-chan struct{}) {
 			}
 			delete(c.failures, it.id)
 		} else if !it.evict {
-			if first, seen := c.failures[it.id]; seen && time.Since(first) >= c.outTime {
+			if first, seen := c.failures[it.id]; seen && time.Since(first) >= time.Duration(c.outTimeNs.Load()) {
 				// Dwell elapsed between data-path failures: evict now.
 				c.outs[it.id] = true
 				delete(c.failures, it.id)
