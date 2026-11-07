@@ -324,11 +324,18 @@ func (v *Volume) pgFor(snap *placement.Snapshot, index uint64) uint32 {
 	return uint32(uint64(pg) * uint64(snap.PGNum) / uint64(v.pgNum))
 }
 
-// targets returns the volume's replicas for object index in snapshot snap.
-func (v *Volume) targets(snap *placement.Snapshot, index uint64) ([]placement.Ref, error) {
+// targets returns the volume's replicas for object index in snapshot
+// snap, filling scratch (callers pass a stack array so the hot path
+// allocates nothing).
+func (v *Volume) targets(snap *placement.Snapshot, index uint64, scratch []placement.Ref) ([]placement.Ref, error) {
 	pg := v.pgFor(snap, index)
 	row := snap.Row(pg)
-	refs := make([]placement.Ref, 0, len(row))
+	refs := scratch[:0]
+	if len(scratch) >= len(row) {
+		// len 0, cap = len(row): append fills from index 0 (a plain
+		// scratch[:len(row)] would make append stack on top of it).
+		refs = scratch[:0:len(row)]
+	}
 	for _, id := range row {
 		if id < 0 {
 			continue
@@ -376,7 +383,8 @@ func (v *Volume) readChunk(ctx context.Context, p []byte, index, inObj uint64) e
 		return err
 	}
 	for attempt := 0; attempt < 2; attempt++ {
-		refs, terr := v.targets(snap, index)
+		var scratch [maxReplicas]placement.Ref
+		refs, terr := v.targets(snap, index, scratch[:])
 		if terr != nil && len(refs) == 0 {
 			return terr
 		}
@@ -467,7 +475,8 @@ func (v *Volume) writeChunk(ctx context.Context, p []byte, n uint64, index, inOb
 		return err
 	}
 	for attempt := 0; attempt < 3; attempt++ {
-		refs, terr := v.targets(snap, index)
+		var scratch [maxReplicas]placement.Ref
+		refs, terr := v.targets(snap, index, scratch[:])
 		if terr != nil {
 			return terr
 		}
@@ -489,6 +498,37 @@ func (v *Volume) writeChunk(ctx context.Context, p []byte, n uint64, index, inOb
 // with more replicas are rejected at OpenVolume.
 const maxReplicas = 8
 
+// payload is the straggler-owned copy of a chunk write's data.
+// Reference-counted: every replica worker drops one reference when
+// its write finishes, and the last one recycles the buffer. Pooling
+// (pointer-typed, so no boxing on Put) keeps the hot path at zero
+// allocations in steady state.
+type payload struct {
+	b []byte
+	n atomic.Int32
+}
+
+var payloadPool = sync.Pool{New: func() any { return new(payload) }}
+
+func (v *Volume) acquirePayload(p []byte, refs int) *payload {
+	pl := payloadPool.Get().(*payload)
+	if cap(pl.b) < len(p) {
+		pl.b = make([]byte, len(p))
+	}
+	pl.b = pl.b[:len(p)]
+	copy(pl.b, p)
+	pl.n.Store(int32(refs))
+	return pl
+}
+
+// release drops one reference; the last worker recycles the payload.
+func (pl *payload) release() {
+	if pl.n.Add(-1) == 0 {
+		pl.b = pl.b[:0] // keep capacity for reuse
+		payloadPool.Put(pl)
+	}
+}
+
 // quorumWrite fans the chunk out to refs and commits on v.w acks.
 //
 // Allocation shape matters: this is the hot path of every VM write.
@@ -502,22 +542,37 @@ func (v *Volume) quorumWrite(ctx context.Context, oid, inObj uint64, p []byte, n
 		status sdsnet.Status
 		err    error
 	}
+	// Payload ownership: stragglers keep writing after a quorum commit,
+	// but the WriteAt contract says p is not retained past the call —
+	// the caller may reuse it the moment we return. One refcounted
+	// pooled copy feeds every replica; the last worker recycles it.
+	// Not needed when the quorum IS every replica (commit means all
+	// workers finished), and zeroes writes carry no payload.
+	var pl *payload
+	if !hole && v.w < len(refs) {
+		pl = v.acquirePayload(p, len(refs))
+		p = pl.b
+	}
 	var results [maxReplicas]res
 	// Straggler context: workers run under it, not under the caller's
 	// ctx, so a quorum commit does not cancel the remaining replicas.
-	ctx2, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
-	defer func() {
-		if cancel != nil {
-			cancel() // no-op once fired; quorum path clears it
-		}
-	}()
+	// No per-write timer: sdsnet Conn enforces its own per-op deadline
+	// on the socket, so detached stragglers are bounded at the
+	// transport level (a per-write context.WithTimeout costs a timer
+	// allocation on every chunk).
+	ctx2 := context.WithoutCancel(ctx)
 	done := make(chan int, len(refs))
 	for i := range refs {
-		go func(i int) {
-			status, err := v.replicaWrite(ctx2, refs[i], oid, inObj, p, n, hole)
+		// ref passed by value: the caller's scratch backing array must
+		// not escape through the goroutine closure.
+		go func(i int, ref placement.Ref) {
+			status, err := v.replicaWrite(ctx2, ref, oid, inObj, p, n, hole)
 			results[i] = res{status, err}
+			if pl != nil {
+				pl.release()
+			}
 			done <- i
-		}(i)
+		}(i, refs[i])
 	}
 	var errs []error
 	var firstStale error
@@ -532,7 +587,8 @@ func (v *Volume) quorumWrite(ctx context.Context, oid, inObj uint64, p []byte, n
 			case r.status == sdsnet.StatusOK:
 				ok++
 				if ok >= v.w {
-					cancel = nil // quorum: stragglers finish under ctx2
+					// Quorum reached: stragglers finish under ctx2,
+					// which is detached from the caller's ctx.
 					return nil
 				}
 			case r.status == sdsnet.StatusStale:

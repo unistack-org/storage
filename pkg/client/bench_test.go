@@ -100,7 +100,10 @@ func TestClientZeroAllocGate(t *testing.T) {
 	runtime.ReadMemStats(&after)
 	perPair := after.TotalAlloc - before.TotalAlloc
 	pairs := uint64(ops)
-	if perPair > 4096*pairs {
+	// Budget per 4K write+read pair: one payload copy per write (the
+	// straggler payload-ownership copy in quorumWrite, len(p) = 4096 B)
+	// plus bookkeeping. Read must stay allocation-free.
+	if perPair > 6144*pairs {
 		t.Fatalf("data path allocating %d B/op (%d allocs/op): regression",
 			perPair/pairs, (after.Mallocs-before.Mallocs)/pairs)
 	}

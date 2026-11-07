@@ -105,6 +105,16 @@ func (cc *Conn) do(ctx context.Context, h *ReqHeader, payload, p []byte) (int, e
 	h.Epoch = cc.ep.Load()
 	cc.seq++
 
+	// Every op is bounded: the caller's deadline if it has one, else a
+	// generous default so a detached straggler (context.WithoutCancel)
+	// can never hang on a wedged peer forever.
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		deadline = time.Now().Add(opTimeout)
+	}
+	cc.c.SetDeadline(deadline)
+	defer cc.c.SetDeadline(time.Time{})
+
 	fail := func(err error) (int, error) {
 		if _, ok := err.(*Error); !ok {
 			cc.dead = true // protocol errors carry a valid frame; transport ones don't
@@ -122,10 +132,6 @@ func (cc *Conn) do(ctx context.Context, h *ReqHeader, payload, p []byte) (int, e
 	}
 	if err := cc.wr.Flush(); err != nil {
 		return fail(err)
-	}
-	if d, ok := ctx.Deadline(); ok {
-		cc.c.SetDeadline(d)
-		defer cc.c.SetDeadline(time.Time{})
 	}
 
 	if _, err := io.ReadFull(cc.rd, cc.sresp[:]); err != nil {
@@ -414,3 +420,8 @@ func (pp *Pool) Sync(ctx context.Context) error {
 }
 
 const dialTimeout = 5 * time.Second
+
+// opTimeout bounds an operation whose context carries no deadline
+// (detached stragglers), so a wedged peer can never hang a Conn
+// forever. Generous: a healthy OSD answers in milliseconds.
+const opTimeout = 30 * time.Second

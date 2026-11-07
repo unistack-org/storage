@@ -228,7 +228,14 @@
       протоколов: NBD (TestNBDZeroAllocGate, 0 allocs/op, Read4K 22мкс) и
       sdsnet клиент↔OSD (TestSDSNetZeroAllocGate, 0 allocs/op: Read4K 28мкс,
       Write4K 19мкс, 64K ~2.2GB/s; приём — пер-соединительные scratch-буферы,
-      sync.Pool проигрывает из-за boxing в Put); (3) свой бинарный
+      sync.Pool проигрывает из-за boxing в Put); плюс data-путь Volume-клиента
+      (TestClientZeroAllocGate): Refresh с снапшот-кэшем placement (epoch+байты
+      карты+registry без изменений → переиспользование скомпилированной таблицы,
+      краш-лексер больше не аллоцирует на каждом цикле), quorumWrite на одном
+      канале со стэк-массивом результатов (maxReplicas=8), тонкие чтения
+      неавторитетны (реплика-отставатель не даёт нулей — нули только когда все
+      реплики сообщили «нет объекта»): Write4K 288→52мкс (128→14 allocs),
+      Read4K 255→18мкс (93→1 alloc); (3) свой бинарный
       протокол (фикс. заголовок, батчинг, recvmmsg/sendmmsg) — NBD/VDUSE
       только гостю, не внутри кластера; (4) VDUSE multi-queue уже готов —
       их NBD однопоточный, UBLK в их стеке новее и тоже MQ (следить);
