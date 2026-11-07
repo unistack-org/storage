@@ -6,6 +6,7 @@
 // Usage:
 //
 //	sdsd -listen :10809 -export vol0=/var/lib/sdsd/vol0.img:10G [-readonly vol0] [-trim] [-write-zeroes]
+//	sdsd ... -export vol0 -vduse vol0=sds-vol0   # VDUSE virtio-blk device (Linux)
 package main
 
 import (
@@ -89,6 +90,8 @@ func main() {
 	var creates exportFlag
 	flag.Var(&creates, "create", "with -cluster: create volume name:size if absent, repeatable")
 	flag.Var(&exports, "export", "export spec name=path[:size] (file/-store) or name (cluster), repeatable")
+	var vduseSpecs exportFlag
+	flag.Var(&vduseSpecs, "vduse", "export a -export as a VDUSE virtio-blk device (Linux): spec export or export=devname, repeatable")
 	flag.Parse()
 
 	logger := log.New(os.Stderr, "sdsd: ", log.LstdFlags|log.Lmsgprefix)
@@ -113,6 +116,11 @@ func main() {
 		})
 		if err != nil {
 			logger.Fatalf("cluster: %v", err)
+		}
+		if len(vduseSpecs) > 0 {
+			if _, err := startVDUSE(ctx, logger, es, vduseSpecs, *trim, *writeZeroes); err != nil {
+				logger.Fatalf("vduse: %v", err)
+			}
 		}
 		serve(ctx, logger, *listen, *maxConns, *trim, *writeZeroes, es)
 		return
@@ -149,6 +157,12 @@ func main() {
 		}
 		logger.Printf("export %q -> %s (%s, store=%v)", name, path, humanSize(b.Size()), *storeMode)
 		es = append(es, &nbd.Export{Name: name, Backend: b})
+	}
+
+	if len(vduseSpecs) > 0 {
+		if _, err := startVDUSE(ctx, logger, es, vduseSpecs, *trim, *writeZeroes); err != nil {
+			logger.Fatalf("vduse: %v", err)
+		}
 	}
 
 	serve(ctx, logger, *listen, *maxConns, *trim, *writeZeroes, es)

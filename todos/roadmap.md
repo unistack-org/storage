@@ -186,10 +186,18 @@
       на Linux+KVM (x86_64 или aarch64 Linux-хост с QEMU ≥ 8)
 - [ ] Интеграция с `unistack/pkg/storage` (Provider-драйвер `unistorage`:
       CreateVolume/DeleteVolume/Attach) и `pkg/qemu` (`Drive.VfioUser`)
-- [ ] **4c VDUSE-экспорт (Linux, после 4a на Linux-хосте)**: `/dev/vduse` —
-      userspace-блочное устройство без QEMU; Vitastor прямо называет NBD
-      «устаревшим» и продвигает VDUSE для блочных устройств в хосте
-      (нужен для CSI-сценариев и монтирования тома как диска вне ВМ)
+- [x] **4c VDUSE-экспорт (код готов; e2e — на Linux-хосте)**: `storage/pkg/vduse` —
+      userspace-блочное устройство через `/dev/vduse` (VDUSE), без QEMU и без
+      «устаревшего» vhost-user: гость цепляет устройство стандартно
+      (`vdpa mgmtdev add vduse <имя>` → `vdpa dev add ... type block` →
+      `/dev/vdX` как virtio-blk; в госте — родной драйвер, ядро-гость не трогается).
+      Реализовано: control-протокол (CREATE_DEV/VQ_SETUP/SET_STATUS/GET_VQ_STATE/
+      UPDATE_IOTLB, все офсеты сверены с kernel uapi), IOTLB (mmap гостевой памяти,
+      zero-copy ReadAt/WriteAt по гостевым буферам), split-ring (desc/avail/used,
+      indirect, event_idx, IRQ-инъекции), multi-queue. Бэкенд = тот же
+      nbd.Backend: `sdsd -export vol0 ... -vduse vol0=sds-vol0` отдаёт кластерный
+      том как диск. 8 тестов логики зелёные; кросс-компиляция linux/amd64+arm64
+      чистая; Linux-runtime e2e требует хост с CONFIG_VDUSE (на macOS невозможен)
 - [ ] Отказоустойчивость экспорта: смерть Go-бэкенда → QSD reconnect,
       без висячих сокетов/hugepages
 - [ ] e2e-тест: Linux+KVM, гость пишет/читает, fio внутри гостя
