@@ -21,6 +21,7 @@
 package client
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"encoding/json"
@@ -61,10 +62,26 @@ type Cluster struct {
 	refreshMin time.Duration
 	lastRef    atomic.Int64 // unix nanos
 
-	mu     sync.RWMutex
-	snap   *placement.Snapshot
-	epoch  uint32
-	closed bool
+	mu    sync.RWMutex
+	snap  *placement.Snapshot
+	epoch uint32
+	// Refresh cache: compiled-state inputs. A refresh that finds the
+	// same map bytes and the same registry reuses the snapshot, so a
+	// periodic refresh of a static cluster costs two meta reads and
+	// nothing else (no map recompile, no pg table rebuild).
+	mapSrc   []byte
+	regCache placement.Registry
+	closed   bool
+}
+
+// SetRefreshInterval overrides the placement refresh interval. The
+// default (5ms) targets fast failure detection on a live meta watcher;
+// benchmarks and static clusters can raise it to cut meta traffic
+// (every interval costs a couple of meta reads on the dir backend).
+func (c *Cluster) SetRefreshInterval(d time.Duration) {
+	if d > 0 {
+		c.refreshMin = d
+	}
 }
 
 // NewCluster wires a client to the cluster metadata. Placement is built
@@ -168,6 +185,12 @@ func (c *Cluster) Refresh(ctx context.Context) (*placement.Snapshot, error) {
 	if len(reg) == 0 {
 		return nil, ErrNotEnoughOSDs
 	}
+	c.mu.RLock()
+	snap, epoch, mapSrc, regCache := c.snap, c.epoch, c.mapSrc, c.regCache
+	c.mu.RUnlock()
+	if snap != nil && epoch == rec.Epoch && bytes.Equal(mapSrc, rec.Map) && regEqual(regCache, reg) {
+		return snap, nil // nothing moved: keep the compiled snapshot
+	}
 	ns, err := c.compile(rec, reg, snap)
 	if err != nil {
 		if snap != nil {
@@ -177,6 +200,8 @@ func (c *Cluster) Refresh(ctx context.Context) (*placement.Snapshot, error) {
 	}
 	c.mu.Lock()
 	c.snap, c.epoch = ns, rec.Epoch
+	c.mapSrc = append(c.mapSrc[:0], rec.Map...)
+	c.regCache = reg
 	c.mu.Unlock()
 	// Raise the fence on every pool so new connections carry the epoch.
 	c.poolsMu.Lock()
@@ -260,6 +285,9 @@ func (c *Cluster) OpenVolume(ctx context.Context, name string) (*Volume, error) 
 	pgNum := uint32(spec.PGNum)
 	if pgNum == 0 || pgNum > snap.PGNum {
 		pgNum = snap.PGNum
+	}
+	if spec.Replicas > maxReplicas {
+		return nil, fmt.Errorf("client: volume %q: replicas %d > %d", name, spec.Replicas, maxReplicas)
 	}
 	return &Volume{
 		cluster: c,
@@ -353,6 +381,7 @@ func (v *Volume) readChunk(ctx context.Context, p []byte, index, inObj uint64) e
 			return terr
 		}
 		lastErr := error(terr)
+		var sawMissing bool
 	refresh:
 		for _, ref := range refs {
 			pp, err := v.cluster.pool(ref.OSD, ref.Addr)
@@ -369,18 +398,16 @@ func (v *Volume) readChunk(ctx context.Context, p []byte, index, inObj uint64) e
 					}
 				}
 				return nil
-			case sdsnet.IsObjectMissing(err):
-				// Thin object: authoritative zeros.
-				for i := range p {
-					p[i] = 0
-				}
-				return nil
-			case isStatus(err, sdsnet.StatusEOF):
-				// Sparse tail of the object: zeros beyond the stored extent.
-				for i := range p {
-					p[i] = 0
-				}
-				return nil
+			case sdsnet.IsObjectMissing(err), isStatus(err, sdsnet.StatusEOF):
+				// Thin/sparse on THIS replica: not authoritative. A
+				// quorum write commits on W replicas and stragglers
+				// finish in the background, so a lagging replica can
+				// report an object missing that the quorum already
+				// stored. Fall through to the next replica; only if
+				// every replica says missing is the region zeros.
+				sawMissing = true
+				lastErr = nil
+				continue
 			case isStale(err):
 				lastErr = err
 				break refresh // refresh placement, try the fresh map
@@ -388,6 +415,14 @@ func (v *Volume) readChunk(ctx context.Context, p []byte, index, inObj uint64) e
 				lastErr = err
 				continue // next replica
 			}
+		}
+		if sawMissing {
+			// All replicas report the region absent: authoritative
+			// zeros (thin provisioning).
+			for i := range p {
+				p[i] = 0
+			}
+			return nil
 		}
 		if !isStale(lastErr) {
 			return lastErr
@@ -450,102 +485,97 @@ func (v *Volume) writeChunk(ctx context.Context, p []byte, n uint64, index, inOb
 	return fmt.Errorf("client: write oid %d: %w", oid, err)
 }
 
+// maxReplicas bounds the fan-out scratch of a chunk write; volumes
+// with more replicas are rejected at OpenVolume.
+const maxReplicas = 8
+
 // quorumWrite fans the chunk out to refs and commits on v.w acks.
+//
+// Allocation shape matters: this is the hot path of every VM write.
+// One completion channel carrying worker indices plus one shared
+// result array replaces the per-replica channels of the first
+// implementation. Stragglers keep working after a quorum commit,
+// detached from the caller's context (bounded by a grace deadline),
+// so a caller cancel never abandons an in-flight replica write.
 func (v *Volume) quorumWrite(ctx context.Context, oid, inObj uint64, p []byte, n uint64, hole bool, refs []placement.Ref) error {
 	type res struct {
-		osd int32
-		err error
+		status sdsnet.Status
+		err    error
 	}
-	var (
-		wg      sync.WaitGroup
-		ackCh   = make(chan struct{}, len(refs))
-		staleCh = make(chan res, len(refs))
-		failCh  = make(chan res, len(refs))
-		// Stragglers keep working after a quorum commit, detached from
-		// the caller's context, but bounded by a grace deadline.
-		ctx2, cancel = context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
-	)
-	// Cancel the stragglers when the write fails; on a quorum commit
-	// they run on (bounded by the grace deadline above).
-	committed := false
+	var results [maxReplicas]res
+	// Straggler context: workers run under it, not under the caller's
+	// ctx, so a quorum commit does not cancel the remaining replicas.
+	ctx2, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
 	defer func() {
-		if !committed {
-			cancel()
+		if cancel != nil {
+			cancel() // no-op once fired; quorum path clears it
 		}
 	}()
-
-	for _, ref := range refs {
-		wg.Add(1)
-		go func(ref placement.Ref) {
-			defer wg.Done()
-			pp, err := v.cluster.pool(ref.OSD, ref.Addr)
-			if err != nil {
-				failCh <- res{ref.OSD, err}
-				return
-			}
-			var werr error
-			if hole {
-				werr = pp.Do(ctx2, func(cc *sdsnet.Conn) error {
-					return cc.WriteZeroes(ctx2, oid, inObj, n, true, false)
-				})
-			} else {
-				werr = pp.Write(ctx2, oid, inObj, p, false)
-			}
-			switch {
-			case werr == nil:
-				ackCh <- struct{}{}
-			case isStale(werr):
-				staleCh <- res{ref.OSD, werr}
-			default:
-				failCh <- res{ref.OSD, werr}
-			}
-		}(ref)
+	done := make(chan int, len(refs))
+	for i := range refs {
+		go func(i int) {
+			status, err := v.replicaWrite(ctx2, refs[i], oid, inObj, p, n, hole)
+			results[i] = res{status, err}
+			done <- i
+		}(i)
 	}
-
-	// Close the collectors once every replica settles.
-	go func() { wg.Wait(); close(ackCh); close(staleCh); close(failCh) }()
-
-	acks := 0
-	var firstFail, firstStale error
-	for acks < v.w {
+	var errs []error
+	var firstStale error
+	ok := 0
+	for i := 0; i < len(refs); i++ {
 		select {
-		case _, ok := <-ackCh:
-			if !ok {
-				ackCh = nil
-			} else {
-				acks++
-			}
-		case r := <-staleCh:
-			if firstStale == nil {
-				firstStale = r.err
-			}
-		case r := <-failCh:
-			if firstFail == nil {
-				firstFail = r.err
+		case idx := <-done:
+			r := results[idx]
+			switch {
+			case r.err != nil:
+				errs = append(errs, r.err)
+			case r.status == sdsnet.StatusOK:
+				ok++
+				if ok >= v.w {
+					cancel = nil // quorum: stragglers finish under ctx2
+					return nil
+				}
+			case r.status == sdsnet.StatusStale:
+				// Synthetic StatusStale error keeps the retry loop in
+				// writeChunk (isStale -> forceRefresh) working.
+				if firstStale == nil {
+					firstStale = &sdsnet.Error{Op: sdsnet.OpWrite, Status: sdsnet.StatusStale}
+				}
+			default:
+				errs = append(errs, fmt.Errorf("client: write oid %d: replica status %d", oid, r.status))
 			}
 		case <-ctx.Done():
-			// Parent context cancelled: drain to the quorum check.
-			ackCh, staleCh, failCh = nil, nil, nil
+			return ctx.Err()
 		}
-		if ackCh == nil && staleCh == nil && failCh == nil {
-			break
-		}
-	}
-	if acks >= v.w {
-		committed = true
-		return nil // quorum; stragglers finish under ctx2
-	}
-	// Quorum lost.
-	if ctx.Err() != nil {
-		return ctx.Err()
 	}
 	if firstStale != nil {
 		return firstStale
 	}
-	if firstFail != nil {
-		return firstFail
+	if len(errs) == 0 {
+		return fmt.Errorf("client: quorum lost on oid %d: %d/%d acks", oid, ok, len(refs))
 	}
-	return fmt.Errorf("client: quorum lost on oid %d: %d/%d acks", oid, acks, len(refs))
+	return fmt.Errorf("client: quorum failed for oid %d: %w", oid, errors.Join(errs...))
+}
+
+// replicaWrite performs one replica's write (data or zeroes mode) and
+// maps the reply status.
+func (v *Volume) replicaWrite(ctx context.Context, ref placement.Ref, oid, inObj uint64, p []byte, n uint64, hole bool) (sdsnet.Status, error) {
+	pp, err := v.cluster.pool(ref.OSD, ref.Addr)
+	if err != nil {
+		return 0, err
+	}
+	if hole {
+		err = pp.WriteZeroes(ctx, oid, inObj, n, true, false)
+	} else {
+		err = pp.Write(ctx, oid, inObj, p, false)
+	}
+	if err != nil {
+		if e, ok := sdsnet.AsError(err); ok {
+			return e.Status, nil
+		}
+		return 0, err
+	}
+	return sdsnet.StatusOK, nil
 }
 
 // WriteZeroes punches n zero bytes (sparse where supported) at off.
@@ -593,6 +623,20 @@ func (v *Volume) Flush(ctx context.Context) error {
 func (c *Cluster) forceRefresh(ctx context.Context) (*placement.Snapshot, error) {
 	c.lastRef.Store(0)
 	return c.Refresh(ctx)
+}
+
+// regEqual compares two placement registries.
+func regEqual(a, b placement.Registry) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for k, v := range a {
+		w, ok := b[k]
+		if !ok || w != v {
+			return false
+		}
+	}
+	return true
 }
 
 // isStale reports a StatusStale reply from a fenced OSD replica.

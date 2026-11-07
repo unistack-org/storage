@@ -39,3 +39,6 @@ jobs:
       - name: zero-alloc cluster protocol gate (Phase 5)
         if: matrix.module == '.'
         run: go test -run TestSDSNetZeroAllocGate -count=1 -v ./pkg/sdsnet/
+      - name: zero-alloc volume data-path gate (Phase 5)
+        if: matrix.module == '.'
+        run: go test -run TestClientZeroAllocGate -count=1 -v ./pkg/client/

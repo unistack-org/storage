@@ -71,7 +71,7 @@ step emit
 
 // cluster is a running in-process test cluster.
 type cluster struct {
-	t     *testing.T
+	t     testing.TB
 	meta  meta.Store
 	daems []*osd.Daemon
 	cl    *Cluster
@@ -79,8 +79,9 @@ type cluster struct {
 
 // newCluster starts n OSD daemons over a shared dir meta store and
 // returns a cluster client (no map published yet).
-func newCluster(t *testing.T, n int) *cluster {
-	t.Helper()
+func newCluster(tb testing.TB, n int) *cluster {
+	tb.Helper()
+	t := tb
 	dir := t.TempDir()
 	m, err := meta.OpenDir(filepath.Join(dir, "meta"))
 	if err != nil {
