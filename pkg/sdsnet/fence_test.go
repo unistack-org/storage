@@ -78,9 +78,13 @@ func TestEpochFencing(t *testing.T) {
 		t.Fatalf("stale reply should carry demanded epoch 7, got %d", re.StaleEpoch())
 	}
 
-	// Reads are not fenced (a stale client may still drain data).
-	if _, err := cc.Read(ctx, 1, 0, make([]byte, 5)); err != nil {
-		t.Fatalf("read at stale epoch should pass: %v", err)
+	// Reads are fenced too: after a placement change an old target may
+	// no longer be authoritative, and the StatusStale reply is what
+	// drives the client to refresh its map.
+	if _, err := cc.Read(ctx, 1, 0, make([]byte, 5)); err == nil {
+		t.Fatal("read at stale epoch should be refused")
+	} else if re := (*Error)(nil); !errors.As(err, &re) || re.Status != StatusStale {
+		t.Fatalf("read at stale epoch: want StatusStale, got %v", err)
 	}
 	// Ping too.
 	if err := cc.Ping(ctx); err != nil {

@@ -86,15 +86,14 @@ func (d *Daemon) Run(ctx context.Context) error {
 	}
 	defer st.Close()
 
-	// Resolve the listen address up front (opts.Addr may use port 0) so
-	// the meta registration advertises the real address; sdsnet.Server
-	// opens the listening socket itself.
+	// Bind the listen socket up front (opts.Addr may use port 0) so the
+	// meta registration advertises the exact address we will serve on.
 	probe, err := net.Listen("tcp", d.opts.Addr)
 	if err != nil {
 		return fmt.Errorf("osd: listen: %w", err)
 	}
+	defer probe.Close()
 	addr := probe.Addr().String()
-	probe.Close()
 
 	d.mu.Lock()
 	d.addr = addr
@@ -123,7 +122,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	defer mapW.Stop()
 
 	serveErr := make(chan error, 1)
-	go func() { serveErr <- d.srv.Serve(d.opts.Addr) }()
+	go func() { serveErr <- d.srv.ServeListener(probe) }()
 
 	if err := d.applyLatestEpoch(ctx); err != nil {
 		d.opts.Logf("osd: initial epoch: %v", err)
@@ -168,7 +167,10 @@ func (d *Daemon) applyLatestEpoch(ctx context.Context) error {
 // register writes this OSD's OSDInfo into meta.
 func (d *Daemon) register() error {
 	d.mu.Lock()
-	addr := d.Addr()
+	addr := d.addr
+	if addr == "" {
+		addr = d.opts.Addr
+	}
 	uuid := d.uuid
 	d.mu.Unlock()
 	_, err := meta.PutOSD(context.Background(), d.opts.Meta, meta.OSDInfo{
@@ -216,6 +218,16 @@ func (d *Daemon) Addr() string {
 		return d.addr
 	}
 	return d.opts.Addr
+}
+
+// Fence returns the daemon's current epoch fence (0 = fencing off).
+func (d *Daemon) Fence() uint32 {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.srv == nil {
+		return 0
+	}
+	return d.srv.MinEpoch()
 }
 
 // Close stops the daemon.

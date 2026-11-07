@@ -91,9 +91,40 @@
 
 ## Фаза 3 — Кластер, метаданные, CRUSH (4–6 недель) — «как Ceph»
 
-- [ ] `pkg/mds`: метаданные кластера поверх **etcd** (external; embedded
-      `cluster/etcdint` — опция для all-in-one): список OSD, epoch карты,
-      inventory объектов (OID → OSDs), VDI/volume-таблица
+- [x] `pkg/meta`: метаданные кластера — интерфейс `Store` (Get/Put CAS/List/Watch)
+      + `DirStore` (файловый бэкенд: каталог на все роли, watch поллингом 250 мс;
+      для продакшена — реализация поверх **etcd**, тот же интерфейс): записи
+      `osd/<id>` (адрес, uuid, вес), `maps/<epoch>` (crushmap), `volumes/<name>`
+      (спека тома: размер, oid_shift, реплики, pg_num, rule)
+- [x] `pkg/placement`: снапшот размещения — компиляция crushmap + реестра OSD
+      в таблицу `pg → []OSD` (DoRule на всю сетку pg один раз за epoch,
+      ~мс на 1024 pg); клиент считает placement сам и шлёт данные напрямую
+      OSD — без прокси, как Vitastor/Ceph
+- [x] `pkg/osd`: демон OSD = store + sdsnet-сервер + регистрация в meta +
+      epoch-fencing (watch `maps/`: закрываем fence — запросы со старым
+      epoch отбиваются `StatusStale` с требуемым epoch; фенсятся и чтения —
+      только так клиент узнает, что карту пора пересобрать)
+- [x] `pkg/client`: клиент кластерного тома — `Cluster` (Refresh/MapEpoch/
+      CreateVolume/OpenVolume) + `Volume` (ReadAt/WriteAt/WriteZeroes/Flush):
+      тонкие чтения (нет объекта → нули), веер writes на реплики с коммитом
+      по кворуму W=R/2+1 (опоздавшие реплики дописываются detached-записью),
+      авто-рефреш placement по `StatusStale`, fallback на живую реплику
+- [x] Интеграция crushkv в storage: парсинг epoch-карт (text/json/binary),
+      кэш снапшота placement в клиенте (троттлинг 5 мс на всплески stale)
+  - [ ] Reweight-валидатор, `rule`-валидатор под наши volume-class (SSD/HDD),
+        эмуляция отказов (chi-square равномерность на больших x) — поверх crushkv.
+- [x] sds-nbd: бэкенд `VolumeBackend` (том → NBD-экспорт) и режим `sdsd
+      -cluster <meta-каталог>`: OSD в процессе (`-osd id@dir[@addr]`),
+      публикация карты (`-crushmap -epoch`), `-create имя:размер`,
+      `-export имя` — том как NVMe-диск в госте
+  - [x] Смоук: 3 OSD, том 1G rep3 pg64, sdsbench поверх NBD (write 64K ~79 МБ/с,
+        randread 4K ~2.7k IOPS loopback — потолок отладочной сборки, не цель),
+        рестарт sdsd данные на месте; тесты: roundtrip, кворум с мёртвым OSD,
+        stale-epoch рефреш — `pkg/client/client_test.go`
+- [ ] `pkg/mds` поверх **etcd** (внешний; embedded `cluster/etcdint` для
+      all-in-one): замена DirStore в production; inventory объектов
+- [ ] CLI `unistorage`: node add/ls/out, volume create/ls/rm, map dump/check,
+      reweight, recovery status
 - [x] **CRUSH — ключевой deliverable: вынесен в отдельный репозиторий
       [`crushkv`](https://github.com/unistack-org/crushkv) (`../crushkv`), ГОТОВО:**
   - [x] Движок `crushkv/crush` на Go — **byte-exact порт C-ядра Ceph**
@@ -113,13 +144,8 @@
         690–940 нс у `make()`. GC на пути размещения отсутствует полностью.
   - [x] Тесты: воспроизводимость (golden Ceph), reweight in/out (вес 0),
         movement-свойства CRUSH — в `crush/*_test.go`.
-  - [ ] Интеграция в storage: `pkg/crush` — тонкая обёртка: карта в etcd
-        (epoch-ами), кэш `pg/объект → OSD`, отправка карты клиентам.
   - [ ] Reweight-валидатор, `rule`-валидатор под наши volume-class (SSD/HDD),
         эмуляция отказов (chi-square равномерность на больших x) — поверх crushkv.
-- [ ] `pkg/cluster`: вступление узла, epoch-карты, отправка карты клиентам
-      (клиент считает placement сам и шлёт данные напрямую OSD — без прокси,
-      как Vitastor/Ceph)
 - [ ] CLI `unistorage`: node add/ls/out, volume create/ls/rm, map dump/check,
       reweight, recovery status
 

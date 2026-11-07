@@ -15,7 +15,9 @@ package sdsnet
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
+	"os"
 )
 
 // Protocol version. Bumped only for incompatible framing changes.
@@ -81,6 +83,7 @@ const (
 	StatusTooBig          // payload exceeds MaxPayload
 	StatusStale           // request epoch below the server's minimum epoch
 	StatusUnknown         // export name not served by this server
+	StatusNotFound        // object does not exist (thin provisioning)
 )
 
 func (s Status) String() string {
@@ -103,6 +106,8 @@ func (s Status) String() string {
 		return "stale epoch"
 	case StatusUnknown:
 		return "unknown export"
+	case StatusNotFound:
+		return "object missing"
 	}
 	return fmt.Sprintf("status(%d)", uint32(s))
 }
@@ -123,6 +128,26 @@ func (e *Error) Error() string {
 
 // StaleEpoch reports the epoch the server demanded (StatusStale only).
 func (e *Error) StaleEpoch() uint32 { return uint32(e.Value) }
+
+// AsError unwraps a remote *Error from err.
+func AsError(err error) (*Error, bool) {
+	var e *Error
+	ok := errors.As(err, &e)
+	return e, ok
+}
+
+// ErrObjectMissing is returned by reads of objects the target never
+// stored (thin provisioning). Callers typically substitute zeroes.
+var ErrObjectMissing = errors.New("sdsnet: object missing")
+
+// IsObjectMissing reports err (locally or remotely) as "object missing".
+func IsObjectMissing(err error) bool {
+	if errors.Is(err, ErrObjectMissing) || errors.Is(err, os.ErrNotExist) {
+		return true
+	}
+	e, ok := AsError(err)
+	return ok && e.Status == StatusNotFound
+}
 
 // ReqHeader is one protocol request.
 //

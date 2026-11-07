@@ -7,6 +7,7 @@ import (
 	"errors"
 	"io"
 	"net"
+	"os"
 	"sync"
 	"sync/atomic"
 )
@@ -77,6 +78,14 @@ func (s *Server) Serve(addr string) error {
 	if err != nil {
 		return err
 	}
+	return s.ServeListener(ln)
+}
+
+// ServeListener serves on an already-bound listener. Callers that must
+// know the resolved address (port 0) before serving — to advertise it in
+// cluster metadata, say — bind it themselves and use this, so the
+// advertised address is the one actually served.
+func (s *Server) ServeListener(ln net.Listener) error {
 	s.mu.Lock()
 	s.listener = ln
 	if s.closed == nil {
@@ -249,11 +258,14 @@ func (s *Server) dispatch(ctx context.Context, backend Backend, h *ReqHeader, pa
 		}
 	}
 	// Epoch fencing: a node that has been replaced (its epoch is below
-	// the cluster's floor) must not mutate; the reply tells the client
-	// the epoch it needs to advance to.
+	// the cluster's floor) must not be used; the reply tells the client
+	// the epoch it needs to advance to. Reads are fenced too: after a
+	// placement change an old target may no longer hold the
+	// authoritative replica, and the StatusStale reply is what drives
+	// clients to rebuild their map.
 	if min := s.minEpoch.Load(); min != 0 && h.Epoch < min {
 		switch h.Op {
-		case OpWrite, OpWriteZeroes, OpTrim, OpSync:
+		case OpRead, OpWrite, OpWriteZeroes, OpTrim, OpSync:
 			s.logf("sdsnet: stale request epoch %d < %d (op %s oid %d)", h.Epoch, min, h.Op, h.OID)
 			return RespHeader{Seq: h.Seq, Status: StatusStale, Value: uint64(min)}, nil
 		}
@@ -265,10 +277,19 @@ func (s *Server) dispatch(ctx context.Context, backend Backend, h *ReqHeader, pa
 	case OpRead:
 		buf := make([]byte, h.Length)
 		n, err := backend.ReadAt(ctx, h.OID, h.Offset, buf)
-		if err != nil {
+		switch {
+		case err == nil:
+			return RespHeader{Seq: h.Seq, Status: StatusOK, Value: uint64(n)}, buf[:n]
+		case errors.Is(err, os.ErrNotExist):
+			return RespHeader{Seq: h.Seq, Status: StatusNotFound}, nil
+		case errors.Is(err, io.EOF) && n > 0:
+			// Partial read up to the (sparse) end of the object.
+			return RespHeader{Seq: h.Seq, Status: StatusOK, Value: uint64(n)}, buf[:n]
+		case errors.Is(err, io.EOF):
+			return RespHeader{Seq: h.Seq, Status: StatusEOF}, nil
+		default:
 			return RespHeader{Seq: h.Seq, Status: statusFromErr(err)}, nil
 		}
-		return RespHeader{Seq: h.Seq, Status: StatusOK, Value: uint64(n)}, buf[:n]
 
 	case OpWrite:
 		if len(payload) != int(h.Length) {
@@ -332,6 +353,8 @@ func statusFromErr(err error) Status {
 		return StatusInvalid
 	case errors.Is(err, io.EOF), errors.Is(err, io.ErrUnexpectedEOF):
 		return StatusEOF
+	case errors.Is(err, os.ErrNotExist):
+		return StatusNotFound
 	default:
 		return StatusIO
 	}

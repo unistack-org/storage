@@ -199,6 +199,15 @@ func (s *Snapshot) Row(pg uint32) []int32 {
 	return s.pg[pg*uint32(s.Replicas) : (pg+1)*uint32(s.Replicas)]
 }
 
+// LookupRef resolves a device id to its location.
+func (s *Snapshot) LookupRef(id int32) (Ref, bool) {
+	ref, ok := s.refs[id]
+	return ref, ok
+}
+
+// Refs returns the device registry backing this snapshot.
+func (s *Snapshot) Refs() Registry { return s.refs }
+
 // buildTable runs the rule for every pg and stores the device rows.
 func (s *Snapshot) buildTable() error {
 	w := crush.NewWork(s.cm, s.Replicas, nil)

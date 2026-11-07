@@ -28,8 +28,10 @@ import (
 // ErrObjectTooSmall is returned when an I/O runs past the object size.
 var ErrObjectTooSmall = errors.New("store: io beyond object size")
 
-// ErrNoSuchObject is returned when an object does not exist.
-var ErrNoSuchObject = errors.New("store: no such object")
+// ErrNoSuchObject is returned when an object does not exist. It wraps
+// fs.ErrNotExist so callers (and the network layer's status mapping) can
+// classify it with errors.Is(err, os.ErrNotExist).
+var ErrNoSuchObject = fmt.Errorf("store: no such object: %w", fs.ErrNotExist)
 
 // Options configures a Store.
 type Options struct {

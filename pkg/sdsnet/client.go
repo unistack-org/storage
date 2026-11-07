@@ -389,4 +389,14 @@ func (pp *Pool) Read(ctx context.Context, oid, off uint64, p []byte) (int, error
 	return n, err
 }
 
+// WriteZeroes runs a pooled write-zeroes.
+func (pp *Pool) WriteZeroes(ctx context.Context, oid, off, n uint64, hole, fua bool) error {
+	return pp.Do(ctx, func(cc *Conn) error { return cc.WriteZeroes(ctx, oid, off, n, hole, fua) })
+}
+
+// Sync runs a pooled sync.
+func (pp *Pool) Sync(ctx context.Context) error {
+	return pp.Do(ctx, func(cc *Conn) error { return cc.Sync(ctx) })
+}
+
 const dialTimeout = 5 * time.Second
