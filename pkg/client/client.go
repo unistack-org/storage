@@ -72,6 +72,18 @@ type Cluster struct {
 	mapSrc   []byte
 	regCache placement.Registry
 	closed   bool
+
+	// out_time dwell (osd_out_time analogue): an OSD that fails to
+	// answer keeps its weight for outTime; only if it stays down that
+	// long is it set weight 0 (out of placement, triggering rebalance).
+	// An OSD that flaps back within the dwell never triggers churn.
+	outTime     time.Duration
+	probeEvery  time.Duration // prober tick (tests shrink it)
+	failMu      sync.Mutex
+	failures    map[int32]time.Time // transport failures, first-seen
+	outs        map[int32]bool      // evicted, awaiting recovery
+	proberOn    bool
+	probeStopCh chan struct{}
 }
 
 // SetRefreshInterval overrides the placement refresh interval. The
@@ -87,11 +99,227 @@ func (c *Cluster) SetRefreshInterval(d time.Duration) {
 // NewCluster wires a client to the cluster metadata. Placement is built
 // on first use (Refresh/OpenVolume).
 func NewCluster(s meta.Store) *Cluster {
-	return &Cluster{meta: s, pools: map[int32]*sdsnet.Pool{}, refreshMin: 5 * time.Millisecond}
+	return &Cluster{
+		meta:       s,
+		pools:      map[int32]*sdsnet.Pool{},
+		refreshMin: 5 * time.Millisecond,
+		outTime:    600 * time.Second,
+		probeEvery: 15 * time.Second,
+		failures:   map[int32]time.Time{},
+		outs:       map[int32]bool{},
+	}
+}
+
+// SetOutTime sets the dwell (osd_out_time analogue): an OSD whose
+// requests fail transport-wise stays in placement for this long before
+// being marked out (weight 0). 0 disables auto-eviction entirely
+// (noout). Must be called before use. The dwell prevents rebalance
+// churn when an OSD flaps: it returns to service unseen if it answers
+// a probe before the dwell elapses.
+func (c *Cluster) SetOutTime(d time.Duration) {
+	if d >= 0 {
+		c.outTime = d
+	}
 }
 
 // Meta exposes the metadata store (for volume creation, map epochs).
 func (c *Cluster) Meta() meta.Store { return c.meta }
+
+// dropPool closes and forgets the cached pool for an OSD so the next
+// use redials (a restarted OSD listens on a new address; a dead one
+// must not keep a poisoned connection).
+func (c *Cluster) dropPool(id int32) {
+	c.poolsMu.Lock()
+	if pp, ok := c.pools[id]; ok {
+		pp.Close()
+		delete(c.pools, id)
+	}
+	c.poolsMu.Unlock()
+}
+
+// noteFailure records a transport-level failure against an OSD and,
+// once the failure has persisted past the out_time dwell, marks the
+// OSD out (weight 0) so placement drops it. Callers must only report
+// connection-level failures (dial/IO), never protocol replies: a
+// StatusStale answer proves the OSD is alive.
+func (c *Cluster) noteFailure(id int32) {
+	if c.outTime <= 0 {
+		return // noout
+	}
+	now := time.Now()
+	c.failMu.Lock()
+	if c.outs[id] {
+		c.failMu.Unlock()
+		return // already evicted
+	}
+	first, seen := c.failures[id]
+	if !seen {
+		c.failures[id] = now
+		c.ensureProber()
+		c.failMu.Unlock()
+		return
+	}
+	if now.Sub(first) < c.outTime {
+		c.failMu.Unlock()
+		return // still inside the dwell
+	}
+	c.outs[id] = true
+	delete(c.failures, id)
+	c.failMu.Unlock()
+	c.dropPool(id)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := meta.SetOSDWeight(ctx, c.meta, id, 0); err != nil {
+		c.failMu.Lock()
+		delete(c.outs, id) // meta write failed: retry next failure
+		c.failMu.Unlock()
+	}
+}
+
+// noteSuccess clears a pending (in-dwell) failure clock for an OSD that
+// answered. Evicted OSDs are handled by the prober, not the data path.
+func (c *Cluster) noteSuccess(id int32) {
+	c.failMu.Lock()
+	if _, seen := c.failures[id]; seen && !c.outs[id] {
+		delete(c.failures, id)
+	}
+	c.failMu.Unlock()
+}
+
+// ensureProber starts the background prober if any OSD is in the dwell
+// queue. Call with failMu held.
+func (c *Cluster) ensureProber() {
+	if c.proberOn || c.closed {
+		return
+	}
+	c.proberOn = true
+	c.probeStopCh = make(chan struct{})
+	stop := c.probeStopCh
+	go c.probeLoop(stop)
+}
+
+// probeLoop watches in-dwell failures and evicted OSDs: an in-dwell
+// failure whose probe answers is cleared; an evicted OSD whose probe
+// answers gets its weight restored (the map it returns to is the one
+// placement builds from the registry, so the rebalance target is the
+// current map, not the pre-out one).
+func (c *Cluster) probeLoop(stop <-chan struct{}) {
+	tick := time.NewTicker(c.probeEvery)
+	defer tick.Stop()
+	for {
+		select {
+		case <-stop:
+			c.failMu.Lock()
+			c.proberOn = false
+			c.failMu.Unlock()
+			return
+		case <-tick.C:
+			c.probeOnce(stop)
+		}
+	}
+}
+
+// probeOnce probes every OSD with outstanding failures/evictions once.
+func (c *Cluster) probeOnce(stop <-chan struct{}) {
+	c.failMu.Lock()
+	type item struct {
+		id    int32
+		evict bool // in-dwell vs already evicted
+	}
+	var todo []item
+	for id := range c.failures {
+		if !c.outs[id] {
+			todo = append(todo, item{id, false})
+		}
+	}
+	for id := range c.outs {
+		todo = append(todo, item{id, true})
+	}
+	c.failMu.Unlock()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	osds, err := meta.ListOSDs(ctx, c.meta)
+	if err != nil {
+		return
+	}
+	addr := map[int32]string{}
+	for _, o := range osds {
+		addr[o.ID] = o.Addr
+	}
+	for _, it := range todo {
+		select {
+		case <-stop:
+			return
+		default:
+		}
+		a, ok := addr[it.id]
+		if !ok {
+			continue
+		}
+		// Fresh connection: the cached pool for a dead OSD is stale,
+		// and a restarted OSD listens on a new address.
+		pingErr := func() error {
+			pp := sdsnet.NewPool(a, "vol")
+			defer pp.Close()
+			pctx, pcancel := context.WithTimeout(context.Background(), 3*time.Second)
+			defer pcancel()
+			return pp.Ping(pctx)
+		}()
+		c.failMu.Lock()
+		if pingErr == nil {
+			if it.evict {
+				delete(c.outs, it.id)
+			}
+			delete(c.failures, it.id)
+		} else if !it.evict {
+			if first, seen := c.failures[it.id]; seen && time.Since(first) >= c.outTime {
+				// Dwell elapsed between data-path failures: evict now.
+				c.outs[it.id] = true
+				delete(c.failures, it.id)
+			}
+		}
+		restore := pingErr == nil && it.evict
+		evict := pingErr != nil && !it.evict && c.outs[it.id]
+		c.failMu.Unlock()
+		if evict {
+			ectx, ecancel := context.WithTimeout(context.Background(), 5*time.Second)
+			if err := meta.SetOSDWeight(ectx, c.meta, it.id, 0); err != nil {
+				c.failMu.Lock()
+				delete(c.outs, it.id)
+				c.failures[it.id] = time.Now()
+				c.failMu.Unlock()
+			}
+			ecancel()
+		}
+		if restore {
+			c.dropPool(it.id)
+			rctx, rcancel := context.WithTimeout(context.Background(), 5*time.Second)
+			// Restoring into the registry the OSD re-registered with:
+			// re-read current weight first; only flip a 0 back to 1.
+			if info, err := meta.GetOSD(rctx, c.meta, it.id); err == nil && info.Weight <= 0 {
+				_ = meta.SetOSDWeight(rctx, c.meta, it.id, 1)
+			}
+			rcancel()
+		}
+	}
+}
+
+// hasOut reports whether the prober has evicted an OSD.
+func (c *Cluster) hasOut(id int32) bool {
+	c.failMu.Lock()
+	defer c.failMu.Unlock()
+	return c.outs[id]
+}
+
+// failing reports whether an OSD has an in-dwell (not yet evicted)
+// failure clock running.
+func (c *Cluster) failing(id int32) bool {
+	c.failMu.Lock()
+	defer c.failMu.Unlock()
+	_, ok := c.failures[id]
+	return ok
+}
 
 // Close shuts every pool down.
 func (c *Cluster) Close() error {
@@ -102,6 +330,13 @@ func (c *Cluster) Close() error {
 	}
 	c.closed = true
 	c.mu.Unlock()
+	c.failMu.Lock()
+	if c.proberOn {
+		close(c.probeStopCh)
+		c.probeStopCh = nil
+		c.proberOn = false
+	}
+	c.failMu.Unlock()
 	c.poolsMu.Lock()
 	for _, pp := range c.pools {
 		pp.Close()
@@ -424,6 +659,7 @@ func (v *Volume) readChunk(ctx context.Context, p []byte, index, inObj uint64) e
 			n, err := pp.Read(ctx, oid, inObj, p)
 			switch {
 			case err == nil:
+				v.cluster.noteSuccess(ref.OSD)
 				if n < len(p) {
 					// Short read = sparse tail inside the object.
 					for i := n; i < len(p); i++ {
@@ -445,6 +681,11 @@ func (v *Volume) readChunk(ctx context.Context, p []byte, index, inObj uint64) e
 				lastErr = err
 				break refresh // refresh placement, try the fresh map
 			default:
+				if _, isStatus := sdsnet.AsError(err); isStatus {
+					v.cluster.noteSuccess(ref.OSD) // it answered
+				} else {
+					v.cluster.noteFailure(ref.OSD)
+				}
 				lastErr = err
 				continue // next replica
 			}
@@ -716,10 +957,14 @@ func (v *Volume) replicaWrite(ctx context.Context, ref placement.Ref, oid, inObj
 	}
 	if err != nil {
 		if e, ok := sdsnet.AsError(err); ok {
+			// A protocol reply: the OSD answered, so it is alive.
+			v.cluster.noteSuccess(ref.OSD)
 			return e.Status, nil
 		}
+		v.cluster.noteFailure(ref.OSD)
 		return 0, err
 	}
+	v.cluster.noteSuccess(ref.OSD)
 	return sdsnet.StatusOK, nil
 }
 

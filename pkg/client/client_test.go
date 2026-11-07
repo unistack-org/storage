@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -452,5 +453,218 @@ func TestClusterMinSizeDegraded(t *testing.T) {
 	}
 	if !bytes.Equal(got, data) {
 		t.Fatal("degraded read data mismatch")
+	}
+}
+
+// --- out_time (Vitastor osd_out_time analogue) --------------------------
+
+// waitFor polls cond until it holds or the deadline passes.
+func waitFor(tb testing.TB, d time.Duration, cond func() bool) bool {
+	tb.Helper()
+	deadline := time.Now().Add(d)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return true
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	return cond()
+}
+
+func TestClusterOutTimeEvict(t *testing.T) {
+	c := newCluster(t, 3)
+	c.publishMap(1)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	if _, err := c.cl.CreateVolume(ctx, "vm0", 64<<20, 3, 0, 64, "data"); err != nil {
+		t.Fatalf("CreateVolume: %v", err)
+	}
+	v, err := c.cl.OpenVolume(ctx, "vm0")
+	if err != nil {
+		t.Fatalf("OpenVolume: %v", err)
+	}
+	// Healthy traffic first (registry-wide weight changes degrade
+	// placement for every volume, so exercise full replication now).
+	data := make([]byte, 64<<10)
+	fill(data, 0x5a, 1)
+	if _, err := v.WriteAt(ctx, data, 0); err != nil {
+		t.Fatalf("healthy write: %v", err)
+	}
+
+	// Fast dwell: evict 40ms after the first transport failure, probe
+	// every 10ms.
+	c.cl.SetOutTime(40 * time.Millisecond)
+	c.cl.probeEvery = 10 * time.Millisecond
+
+	// Kill OSD 1 and drop its pool so the client redials and fails
+	// fast (connection refused) — a transport error, not a reply.
+	if err := c.daems[1].Close(); err != nil {
+		t.Fatalf("kill osd 1: %v", err)
+	}
+	c.cl.dropPool(1)
+
+	// Under map3 every write spans all three OSDs, so this degraded
+	// write records the failure against OSD 1 while the 2/3 quorum
+	// commits it.
+	if _, err := v.WriteAt(ctx, data, 1<<20); err != nil {
+		t.Fatalf("degraded write: %v", err)
+	}
+
+	if !waitFor(t, 5*time.Second, func() bool {
+		wd, err := meta.GetOSD(ctx, c.meta, 1)
+		return err == nil && wd.Weight <= 0
+	}) {
+		wd, _ := meta.GetOSD(ctx, c.meta, 1)
+		t.Fatalf("osd 1 was not evicted: weight=%v", wd.Weight)
+	}
+
+	// Placement must exclude the out OSD everywhere.
+	c.forceRefresh()
+	snap, err := c.cl.Refresh(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := snap.Refs()[1]; ok {
+		t.Fatal("evicted OSD 1 still in registry snapshot")
+	}
+	for pg := uint32(0); pg < 64; pg++ {
+		for _, id := range snap.Row(pg) {
+			if id == 1 {
+				t.Fatalf("out OSD 1 in placement row at pg %d", pg)
+			}
+		}
+	}
+
+	// Data written before the eviction stays readable through the
+	// surviving replicas.
+	got := make([]byte, len(data))
+	if n, err := v.ReadAt(ctx, got, 0); err != nil || n != len(data) {
+		t.Fatalf("degraded read after eviction: n=%d err=%v", n, err)
+	}
+	if !bytes.Equal(got, data) {
+		t.Fatal("data mismatch after eviction")
+	}
+}
+
+func TestClusterOutTimeFlapNoEvict(t *testing.T) {
+	c := newCluster(t, 3)
+	c.publishMap(1)
+	c.cl.SetOutTime(60 * time.Second) // generous dwell
+	c.cl.probeEvery = 10 * time.Millisecond
+
+	// A transport failure the OSD recovers from within the dwell.
+	c.cl.noteFailure(1)
+	if !c.cl.failing(1) {
+		t.Fatal("failure not tracked")
+	}
+	if c.cl.hasOut(1) {
+		t.Fatal("evicted before the dwell elapsed")
+	}
+	// Any protocol answer proves liveness: the clock resets.
+	c.cl.noteSuccess(1)
+	if c.cl.failing(1) {
+		t.Fatal("failure clock not cleared by success")
+	}
+	time.Sleep(100 * time.Millisecond)
+	if c.cl.hasOut(1) {
+		t.Fatal("flapping OSD was evicted")
+	}
+	wd, err := meta.GetOSD(context.Background(), c.meta, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if wd.Weight <= 0 {
+		t.Fatal("flapping OSD weight was zeroed")
+	}
+}
+
+func TestClusterOutTimeRestore(t *testing.T) {
+	dir := t.TempDir()
+	m, err := meta.OpenDir(filepath.Join(dir, "meta"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	daem := func(id int32, addr string) *osd.Daemon {
+		d, err := osd.New(osd.Options{
+			ID: id, Addr: addr, DataDir: filepath.Join(dir, fmt.Sprintf("osd%d", id)), Meta: m,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return d
+	}
+	d0, d1, d2 := daem(0, "127.0.0.1:0"), daem(1, "127.0.0.1:0"), daem(2, "127.0.0.1:0")
+	var wg sync.WaitGroup
+	for _, d := range []*osd.Daemon{d0, d1, d2} {
+		wg.Add(1)
+		go func() { defer wg.Done(); _ = d.Run(ctx) }()
+	}
+	t.Cleanup(func() {
+		for _, d := range []*osd.Daemon{d0, d1, d2} {
+			_ = d.Close()
+		}
+		wg.Wait()
+	})
+
+	cl := NewCluster(m)
+	cl.probeEvery = 10 * time.Millisecond
+	t.Cleanup(func() { _ = cl.Close() })
+	if !waitFor(t, 5*time.Second, func() bool {
+		ls, err := meta.ListOSDs(ctx, m)
+		return err == nil && len(ls) == 3
+	}) {
+		t.Fatal("OSDs did not register")
+	}
+	// Publish map3 (the daemons fence; the prober does not need maps).
+	if err := cl.MapEpoch(ctx, 1, []byte(map3)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := cl.Refresh(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	// Evict OSD 1: it must stop answering (probes use fresh
+	// connections), so kill the daemon first, then record failures
+	// past the dwell.
+	if err := d1.Close(); err != nil {
+		t.Fatalf("close osd 1: %v", err)
+	}
+	cl.SetOutTime(40 * time.Millisecond)
+	cl.noteFailure(1)
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		cl.noteFailure(1)
+		time.Sleep(20 * time.Millisecond)
+	}
+	if !waitFor(t, 5*time.Second, func() bool {
+		wd, err := meta.GetOSD(ctx, m, 1)
+		return err == nil && wd.Weight <= 0
+	}) {
+		t.Fatal("osd 1 was not evicted")
+	}
+
+	// Start a replacement that registers at the same id: the prober
+	// pings the address from meta, the replacement answers, and the
+	// weight returns to 1.
+	addr := d1.Addr()
+	repl := daem(1, addr)
+	rwg := sync.WaitGroup{}
+	rwg.Add(1)
+	go func() { defer rwg.Done(); _ = repl.Run(ctx) }()
+	t.Cleanup(func() {
+		_ = repl.Close()
+		rwg.Wait()
+	})
+	if !waitFor(t, 10*time.Second, func() bool {
+		wd, err := meta.GetOSD(ctx, m, 1)
+		return err == nil && wd.Weight > 0
+	}) {
+		wd, _ := meta.GetOSD(ctx, m, 1)
+		t.Fatalf("evicted OSD was not restored: weight=%v", wd.Weight)
+	}
+	if cl.hasOut(1) {
+		t.Fatal("OSD still marked out after restore")
 	}
 }

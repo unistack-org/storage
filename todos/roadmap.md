@@ -257,8 +257,12 @@
       взять из Vitastor три вещи: (1) DONE `min_size` тома = их pg_minsize — поле
       VolumeSpec.MinSize, кворум записи W=min_size, ниже — write fast-fail ErrDegraded,
       чтения толерантны (любая живая реплика); флаг sdsd `-min-size`; тесты
-      TestClusterMinSize*; (2) `out_time`-выдержка (default 600 с) перед вытеснением
-      упавшего OSD из placement — защита от ребаланса на «мигающих» OSD; (3) пресеты правил
+      TestClusterMinSize*; (2) DONE `out_time`-выдержка (default 600 с) перед вытеснением
+      упавшего OSD из placement — защита от ребаланса на «мигающих» OSD: клиентский
+      детектор (только транспортные ошибки; любой протокольный ответ = жив), prober
+      пингует по свежим соединениям, evict => meta weight 0 (placement исключает),
+      восстановление => weight 1; SetOutTime(0) = noout; тесты TestClusterOutTime*;
+      (3) пресеты правил
       поверх crush-билдера (`rack-aware rep3`, `EC 2+2 по ДЦ` = их level_placement dc=112233,
       `dc preferred` = их `dc ?= "x"`), чтобы не писать CRUSH-rule руками.
       Справочник Vitastor: docs/config/pool.ru.md (failure_domain, level_placement,

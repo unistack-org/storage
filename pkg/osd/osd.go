@@ -164,7 +164,10 @@ func (d *Daemon) applyLatestEpoch(ctx context.Context) error {
 	return nil
 }
 
-// register writes this OSD's OSDInfo into meta.
+// register writes this OSD's OSDInfo into meta. A restart must not undo
+// an "out" marking: if a record already exists we keep its weight and
+// UUID and only refresh the address/boot time. A brand-new OSD boots at
+// weight 1 (in).
 func (d *Daemon) register() error {
 	d.mu.Lock()
 	addr := d.addr
@@ -173,14 +176,25 @@ func (d *Daemon) register() error {
 	}
 	uuid := d.uuid
 	d.mu.Unlock()
-	_, err := meta.PutOSD(context.Background(), d.opts.Meta, meta.OSDInfo{
+	info := meta.OSDInfo{
 		ID:       d.opts.ID,
 		Addr:     addr,
 		UUID:     uuid,
 		DataPath: d.opts.DataDir,
 		Weight:   1,
 		BootedAt: time.Now().Unix(),
-	})
+	}
+	if prev, err := meta.GetOSD(context.Background(), d.opts.Meta, d.opts.ID); err == nil {
+		// Preserve the operator's weight (an out=0 OSD stays out across
+		// restarts) and the stable UUID; refresh the rest.
+		info.Weight = prev.Weight
+		if prev.UUID != "" {
+			info.UUID = prev.UUID
+		}
+	} else if !errors.Is(err, meta.ErrNotFound) {
+		return err
+	}
+	_, err := meta.PutOSD(context.Background(), d.opts.Meta, info)
 	return err
 }
 

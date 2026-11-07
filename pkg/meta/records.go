@@ -67,6 +67,17 @@ func GetOSD(ctx context.Context, s Store, id int32) (OSDInfo, error) {
 	return info, json.Unmarshal(b, &info)
 }
 
+// SetOSDWeight changes one OSD's CRUSH weight (0 = out of placement).
+func SetOSDWeight(ctx context.Context, s Store, id int32, w float64) error {
+	info, err := GetOSD(ctx, s, id)
+	if err != nil {
+		return err
+	}
+	info.Weight = w
+	_, err = PutOSD(ctx, s, info)
+	return err
+}
+
 // ListOSDs reads every registered OSD, sorted by id.
 func ListOSDs(ctx context.Context, s Store) ([]OSDInfo, error) {
 	keys, err := s.List(ctx, PrefixOSDs)
