@@ -17,14 +17,22 @@
 
 ---
 
-## Фаза 0 — Гигиена репозитория (1–2 дня)
+## Фаза 0 — Гигиена репозитория (1–2 дня) — ✅ сделано
 
-- [ ] `go.mod` (`module github.com/unistack-org/storage`, Go 1.23+), `go work` совместимость с `../go.work`
-- [ ] Удалить: `proxy/sheepdog/`, `sds-storage/cmd/*` (заглушки), `api/` (закомментирован),
-      `cache/block`, `cache/filesystem` (пустые), `journal/leveldb`, `kv/` (в текущем виде)
-- [ ] Зафиксировать скелет: `pkg/backend`, `pkg/cache`, `pkg/cluster` (registry), остальное — новые пакеты
-- [ ] CI: build + vet + race-tests (GitHub Actions, gofmt)
-- [ ] README: назначение, статус, ссылки на AUDIT/roadmap
+- [x] `go.mod` (`module github.com/unistack-org/storage`, Go 1.23); сборка
+      с `GOWORK=off` (рядом лежит внешний `../go.work` — он не наш)
+- [x] Удалено: `proxy/sheepdog/`, `sds-storage/` (CLI-заглушки sheepdog-dog),
+      `api/`, `kv/`, `cache/block`, `cache/filesystem`, `journal/leveldb`,
+      `cluster/etcdint` (зависимости от мёртвых пакетов/leveldb/etcd-embedded),
+      `backend/block`, `backend/filesystem` (импортировали несуществующий
+      `ring`), `bench/` (битые внешние хэши с bitbucket)
+- [x] Скелет зафиксирован: `backend/`, `cache/` (+`cache/memory` LRU),
+      `cluster/` (registry), `hash/` (+xxhash), `journal/`, `transport/`;
+      import-пути переписаны `sdstack` → `unistack-org`; build/vet/gofmt чистые
+- [x] CI: `.github/workflows/ci.yml` — build + vet + race-tests + gofmt
+      для обоих модулей (`.` и `sds-nbd`)
+- [x] README: назначение, статус (MVP sds-nbd, crushkv), ссылки на
+      AUDIT/roadmap
 
 ## Фаза 1 — Локальное ядро: быстрый single-node data path (2–4 недели)
 

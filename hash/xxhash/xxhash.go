@@ -3,7 +3,7 @@ package xxhash
 import (
 	"github.com/OneOfOne/xxhash"
 
-	"github.com/sdstack/storage/hash"
+	"github.com/unistack-org/storage/hash"
 )
 
 func init() {
