@@ -21,11 +21,14 @@ type vduseDevice struct {
 // startVDUSE creates and serves a VDUSE virtio-blk device for each
 // -vduse spec (export name, optionally "export=devname").
 //
-// Inside the VM the device is attached with:
+// On the host the device is attached with:
 //
-//	modprobe vdpa
-//	vdpa mgmtdev add vduse <devname>
-//	vdpa dev add vdpa0 type block   -> /dev/vdX
+//	modprobe vdpa virtio_vdpa
+//	vdpa dev add name <devname> mgmtdev vduse   -> /dev/vdX
+//
+// (the vduse bus auto-registers the "vduse" mgmtdev; a VM uses the
+// device via `-chardev vdpa,name=<devname>,id=vdpa0 -device
+// vhost-vdpa-pci,chardev=vdpa0`).
 func startVDUSE(ctx context.Context, logger *log.Logger, es []*nbd.Export, specs []string, trim, writeZeroes bool) ([]*vduseDevice, error) {
 	byName := map[string]*nbd.Export{}
 	for _, e := range es {
@@ -52,7 +55,7 @@ func startVDUSE(ctx context.Context, logger *log.Logger, es []*nbd.Export, specs
 			return nil, fmt.Errorf("-vduse %q: %w", spec, err)
 		}
 		go dev.Serve()
-		logger.Printf("vduse %q -> export %q (%s): attach in VM with `vdpa mgmtdev add vduse %s && vdpa dev add vdpa0 type block`",
+		logger.Printf("vduse %q -> export %q (%s): attach with `vdpa dev add name %s mgmtdev vduse`",
 			devName, e.Name, humanSize(e.Backend.Size()), devName)
 		devs = append(devs, &vduseDevice{name: devName, dev: dev})
 	}
