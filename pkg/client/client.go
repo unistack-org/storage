@@ -584,9 +584,18 @@ func (c *Cluster) CreateVolume(ctx context.Context, name string, size uint64, re
 	if minSize < 1 || minSize > replicas {
 		return meta.VolumeSpec{}, fmt.Errorf("client: volume %q: min_size %d out of range 1..%d", name, minSize, replicas)
 	}
+	// Every volume gets a private, cluster-wide-unique object-id range, so
+	// two volumes placed on the same OSD can never address the same
+	// object. The range is [OIDBase+1, OIDBase+NumObjects]; one extra id is
+	// reserved to keep the OIDBase+N arithmetic inside it.
+	base, err := meta.NextOIDBase(ctx, c.meta, object.NumObjects(size)+1)
+	if err != nil {
+		return meta.VolumeSpec{}, fmt.Errorf("client: create volume %q: %w", name, err)
+	}
 	spec := meta.VolumeSpec{
 		Name:     name,
 		Size:     size,
+		OIDBase:  base,
 		OIDShift: object.SizeShift,
 		Replicas: replicas,
 		MinSize:  minSize,
@@ -599,6 +608,25 @@ func (c *Cluster) CreateVolume(ctx context.Context, name string, size uint64, re
 	return spec, nil
 }
 
+// ListVolumes returns the volume specs registered in the cluster.
+func (c *Cluster) ListVolumes(ctx context.Context) ([]meta.VolumeSpec, error) {
+	return meta.ListVolumes(ctx, c.meta)
+}
+
+// DeleteVolume removes a volume's registration. It does not delete the
+// volume's objects: they stay on the OSDs (garbage) until a reclaim pass
+// is implemented. Callers must close open handles first; an in-flight
+// writer keeps writing to objects it can no longer register.
+func (c *Cluster) DeleteVolume(ctx context.Context, name string) error {
+	if name == "" {
+		return errors.New("client: volume name required")
+	}
+	if err := meta.DeleteVolume(ctx, c.meta, name); err != nil {
+		return fmt.Errorf("client: delete volume %q: %w", name, err)
+	}
+	return nil
+}
+
 // OpenVolume opens a registered volume. The cluster placement must
 // already exist (call Refresh first); the volume's PG layout is clamped
 // to the cluster snapshot's (a shared table serves all volumes).
@@ -609,6 +637,9 @@ func (c *Cluster) OpenVolume(ctx context.Context, name string) (*Volume, error) 
 	}
 	if spec.OIDShift != object.SizeShift {
 		return nil, fmt.Errorf("client: volume %q oid_shift %d unsupported (want %d)", name, spec.OIDShift, object.SizeShift)
+	}
+	if spec.OIDBase == 0 {
+		return nil, fmt.Errorf("client: volume %q has no object-id range (created by an older version; recreate it)", name)
 	}
 	snap, err := c.Refresh(ctx)
 	if err != nil {
@@ -654,7 +685,11 @@ func (v *Volume) Spec() meta.VolumeSpec { return v.spec }
 // Size is the logical volume size.
 func (v *Volume) Size() uint64 { return v.spec.Size }
 
-func (v *Volume) oid(index uint64) uint64 { return index + 1 } // OID 0 reserved
+// oid maps an object index to the volume's private OID range:
+// OIDBase+1 .. OIDBase+NumObjects (OIDBase itself is unused, mirroring the
+// reserved NilOID). Because bases are allocated cluster-wide, no two
+// volumes ever share an object id on a shared OSD.
+func (v *Volume) oid(index uint64) uint64 { return v.spec.OIDBase + index + 1 }
 
 // pgFor maps an object index to its placement group, scaled into the
 // cluster table's pg space.
@@ -860,7 +895,7 @@ func (v *Volume) WriteAt(ctx context.Context, p []byte, off uint64) (int, error)
 		if uint64(n) > object.Size-inObj {
 			n = int(object.Size - inObj)
 		}
-		if err := v.writeChunk(ctx, p[total:total+n], uint64(n), index, inObj, false); err != nil {
+		if err := v.writeChunk(ctx, p[total:total+n], uint64(n), index, inObj, false, false); err != nil {
 			return total, err
 		}
 		total += n
@@ -868,7 +903,10 @@ func (v *Volume) WriteAt(ctx context.Context, p []byte, off uint64) (int, error)
 	return total, nil
 }
 
-func (v *Volume) writeChunk(ctx context.Context, p []byte, n uint64, index, inObj uint64, hole bool) error {
+// writeChunk writes (or zeroes) one object-sized chunk. hole selects the
+// zeroes mode (no payload on the wire); sparse asks the replicas to punch a
+// real hole so guest TRIM reclaims space (it implies hole).
+func (v *Volume) writeChunk(ctx context.Context, p []byte, n uint64, index, inObj uint64, hole, sparse bool) error {
 	oid := v.oid(index)
 	snap, err := v.cluster.Refresh(ctx)
 	if err != nil {
@@ -908,7 +946,7 @@ func (v *Volume) writeChunk(ctx context.Context, p []byte, n uint64, index, inOb
 			}
 			continue
 		}
-		err = v.quorumWrite(ctx, oid, inObj, p, n, hole, refs)
+		err = v.quorumWrite(ctx, oid, inObj, p, n, hole, sparse, refs)
 		if err == nil {
 			return nil
 		}
@@ -1064,7 +1102,7 @@ func (deadlineCtx) Value(any) any                 { return nil }
 // implementation. Stragglers keep working after a quorum commit,
 // detached from the caller's context (bounded by a grace deadline),
 // so a caller cancel never abandons an in-flight replica write.
-func (v *Volume) quorumWrite(ctx context.Context, oid, inObj uint64, p []byte, n uint64, hole bool, refs []placement.Ref) error {
+func (v *Volume) quorumWrite(ctx context.Context, oid, inObj uint64, p []byte, n uint64, hole, sparse bool, refs []placement.Ref) error {
 	type res struct {
 		status sdsnet.Status
 		err    error
@@ -1084,7 +1122,7 @@ func (v *Volume) quorumWrite(ctx context.Context, oid, inObj uint64, p []byte, n
 	// all — one synchronous write, no goroutine, channel, detached
 	// context, or payload copy.
 	if len(refs) == 1 && v.w == 1 {
-		status, err := v.replicaWrite(ctx, refs[0], oid, inObj, p, n, hole)
+		status, err := v.replicaWrite(ctx, refs[0], oid, inObj, p, n, hole, sparse)
 		switch {
 		case err != nil:
 			return err
@@ -1115,7 +1153,7 @@ func (v *Volume) quorumWrite(ctx context.Context, oid, inObj uint64, p []byte, n
 		// ref passed by value: the caller's scratch backing array must
 		// not escape through the goroutine closure.
 		go func(i int, ref placement.Ref) {
-			status, err := v.replicaWrite(ctx2, ref, oid, inObj, p, n, hole)
+			status, err := v.replicaWrite(ctx2, ref, oid, inObj, p, n, hole, sparse)
 			results[i] = res{status, err}
 			if pl != nil {
 				pl.release()
@@ -1176,13 +1214,13 @@ func (v *Volume) quorumWrite(ctx context.Context, oid, inObj uint64, p []byte, n
 
 // replicaWrite performs one replica's write (data or zeroes mode) and
 // maps the reply status.
-func (v *Volume) replicaWrite(ctx context.Context, ref placement.Ref, oid, inObj uint64, p []byte, n uint64, hole bool) (sdsnet.Status, error) {
+func (v *Volume) replicaWrite(ctx context.Context, ref placement.Ref, oid, inObj uint64, p []byte, n uint64, hole, sparse bool) (sdsnet.Status, error) {
 	pp, err := v.cluster.pool(ref.OSD, ref.Addr)
 	if err != nil {
 		return 0, err
 	}
 	if hole {
-		err = pp.WriteZeroes(ctx, oid, inObj, n, true, false)
+		err = pp.WriteZeroes(ctx, oid, inObj, n, sparse, false)
 	} else {
 		err = pp.Write(ctx, oid, inObj, p, false)
 	}
@@ -1199,8 +1237,12 @@ func (v *Volume) replicaWrite(ctx context.Context, ref placement.Ref, oid, inObj
 	return sdsnet.StatusOK, nil
 }
 
-// WriteZeroes punches n zero bytes (sparse where supported) at off.
-func (v *Volume) WriteZeroes(ctx context.Context, off, n uint64) error {
+// WriteZeroes makes [off, off+n) read as zeroes on every replica. When
+// sparse is set the replicas punch a hole (blocks return to the NVMe),
+// which is what a guest TRIM/DISCARD wants; with sparse=false the replicas
+// store literal zeroes (NBD Write_Zeroes with the NO_HOLE flag), which is
+// the byte-exact, allocation-keeping variant.
+func (v *Volume) WriteZeroes(ctx context.Context, off, n uint64, sparse bool) error {
 	if off+n > v.spec.Size {
 		return fmt.Errorf("client: write zeroes at %d len %d past volume end %d", off, n, v.spec.Size)
 	}
@@ -1211,7 +1253,7 @@ func (v *Volume) WriteZeroes(ctx context.Context, off, n uint64) error {
 		if ch > object.Size-inObj {
 			ch = object.Size - inObj
 		}
-		if err := v.writeChunk(ctx, nil, ch, index, inObj, true); err != nil {
+		if err := v.writeChunk(ctx, nil, ch, index, inObj, true, sparse); err != nil {
 			return err
 		}
 		done += ch

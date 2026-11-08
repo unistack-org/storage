@@ -287,28 +287,10 @@ func (b *objectBackend) WriteAt(_ context.Context, oid uint64, off uint64, p []b
 }
 
 func (b *objectBackend) WriteZeroes(_ context.Context, oid uint64, off uint64, n uint64, sparse bool) error {
-	// MVP: zero-fill writes. Punch-hole support lands with the raw
-	// store; the object store keeps fixed-size files.
-	buf := make([]byte, zeroChunk(n))
-	for written := uint64(0); written < n; {
-		ch := uint64(len(buf))
-		if n-written < ch {
-			ch = n - written
-		}
-		if _, err := b.st.WriteAt(object.OID(oid), buf[:ch], int64(off+written)); err != nil {
-			return err
-		}
-		written += ch
-	}
-	return nil
+	// sparse = the request came from a guest TRIM/DISCARD (or a
+	// Write_Zeroes without NO_HOLE): the store punches a real hole so the
+	// NVMe gets its blocks back. Otherwise the store zero-fills.
+	return b.st.WriteZeroes(object.OID(oid), off, n, sparse)
 }
 
 func (b *objectBackend) Sync(_ context.Context) error { return b.st.Sync() }
-
-func zeroChunk(n uint64) int {
-	const max = 1 << 20
-	if n < max {
-		return int(n)
-	}
-	return max
-}

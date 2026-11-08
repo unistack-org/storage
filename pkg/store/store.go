@@ -33,6 +33,14 @@ var ErrObjectTooSmall = errors.New("store: io beyond object size")
 // classify it with errors.Is(err, os.ErrNotExist).
 var ErrNoSuchObject = fmt.Errorf("store: no such object: %w", fs.ErrNotExist)
 
+// punchAlign is the granularity we punch at. The kernel requires
+// FALLOC_FL_PUNCH_HOLE ranges to be aligned to the filesystem block size;
+// 4096 is the largest block size we expect to meet (and the common one), so
+// we align to it and zero-fill any remainder instead of failing. Guest
+// discard requests are at least 512 B aligned and object boundaries are
+// 4 MiB, so in practice the aligned region covers the whole request.
+const punchAlign = 4096
+
 // Options configures a Store.
 type Options struct {
 	// Direct requests O_DIRECT (Linux) / F_NOCACHE (darwin) on object
@@ -153,6 +161,93 @@ func (s *Store) WriteAt(oid object.OID, p []byte, off int64) (int, error) {
 	}
 	s.mu.Unlock()
 	return n, err
+}
+
+// WriteZeroes makes [off, off+n) read as zeroes. When sparse is set and the
+// platform supports hole punching, the block-aligned interior of the range
+// is punched (fallocate(FALLOC_FL_PUNCH_HOLE|KEEP_SIZE)) so the blocks are
+// genuinely returned to the filesystem — this is what makes guest
+// TRIM/DISCARD reclaim space on the NVMe. The sub-block head and tail
+// (possible when a guest discards at 512 B granularity) are zero-filled, and
+// so is the whole range on platforms without punch support (darwin) or when
+// the punch syscall fails (a filesystem without FALLOC_FL_PUNCH_HOLE,
+// EPERM, ...): the store degrades to a zero-fill, which is always correct.
+//
+// The object keeps its full logical size in every mode: the file's apparent
+// size never shrinks, so a later write into a punched region behaves exactly
+// like a write into a hole. Usage accounting stays logical (sum of object
+// sizes) and is deliberately not decremented — punched bytes free
+// *physical* blocks, which is a filesystem property reported by Free, not a
+// change in how much of the volume is addressed.
+func (s *Store) WriteZeroes(oid object.OID, off, n uint64, sparse bool) error {
+	if off+n > uint64(object.Size) {
+		return ErrObjectTooSmall
+	}
+	if n == 0 {
+		return nil
+	}
+	e, err := s.open(oid, true)
+	if err != nil {
+		return err
+	}
+	if sparse && punchSupported {
+		if head, tail, ok := alignRange(off, n, punchAlign); ok {
+			if perr := punchHole(e.f, int64(off+head), int64(tail-head)); perr == nil {
+				// Zero the unaligned head/tail edges around the hole.
+				if err := s.zeroFill(e, off, head); err != nil {
+					return err
+				}
+				return s.zeroFill(e, off+tail, n-tail)
+			}
+			// Punch failed: fall through to a zero-fill. Correctness
+			// first, reclaim is a bonus.
+		}
+	}
+	return s.zeroFill(e, off, n)
+}
+
+// zeroFill writes n zeroes at off through the cached handle. It never
+// touches usage: a zero-fill over existing blocks changes no allocation
+// (the object is fixed-size), and over a hole it allocates exactly the
+// bytes the kernel zeroes.
+func (s *Store) zeroFill(e *entry, off, n uint64) error {
+	if n == 0 {
+		return nil
+	}
+	buf := zeroBuf()
+	for written := uint64(0); written < n; {
+		ch := uint64(len(buf))
+		if n-written < ch {
+			ch = n - written
+		}
+		if _, err := e.f.WriteAt(buf[:ch], int64(off+written)); err != nil {
+			return err
+		}
+		written += ch
+	}
+	return nil
+}
+
+// alignRange splits [off, off+n) into the length of the unaligned head and
+// the end of the aligned interior (both offsets relative to off); ok=false
+// when nothing is block-aligned. The interior is [off+head, off+tail).
+func alignRange(off, n, align uint64) (head, tail uint64, ok bool) {
+	start := (off + align - 1) &^ (align - 1)
+	end := (off + n) &^ (align - 1)
+	if start >= end {
+		return 0, 0, false
+	}
+	return start - off, end - off, true
+}
+
+var (
+	zeroOnce sync.Once
+	zeros    []byte
+)
+
+func zeroBuf() []byte {
+	zeroOnce.Do(func() { zeros = make([]byte, 1<<20) })
+	return zeros
 }
 
 // Remove deletes an object.

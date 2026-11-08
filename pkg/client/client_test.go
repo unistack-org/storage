@@ -228,7 +228,7 @@ func TestClusterVolumeRoundTrip(t *testing.T) {
 	}
 
 	// WriteZeroes punches the head back to zeros.
-	if err := v.WriteZeroes(ctx, 0, 1<<20); err != nil {
+	if err := v.WriteZeroes(ctx, 0, 1<<20, true); err != nil {
 		t.Fatalf("WriteZeroes: %v", err)
 	}
 	zeros := make([]byte, 1<<20)

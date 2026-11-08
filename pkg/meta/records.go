@@ -12,7 +12,13 @@ const (
 	PrefixOSDs    = "osds"    // key: OSD id decimal, value: OSDInfo
 	PrefixVolumes = "volumes" // key: volume name, value: VolumeSpec
 	PrefixMaps    = "maps"    // key: epoch decimal, value: MapRecord
+	// PrefixAlloc holds cluster-wide allocators; the "oids" key is the
+	// next free object id (see NextOIDBase).
+	PrefixAlloc = "alloc"
 )
+
+// AllocOIDs is the allocator key for volume object-id ranges.
+const AllocOIDs = "oids"
 
 // OSDInfo is one OSD's registration.
 type OSDInfo struct {
@@ -26,8 +32,14 @@ type OSDInfo struct {
 
 // VolumeSpec describes a volume (thin-provisioned object-backed image).
 type VolumeSpec struct {
-	Name     string `json:"name"`
-	Size     uint64 `json:"size"`      // logical bytes
+	Name string `json:"name"`
+	Size uint64 `json:"size"` // logical bytes
+	// OIDBase is the first object id of the volume's private OID range.
+	// Objects of a volume are OIDBase+1 .. OIDBase+NumObjects(Size); OID
+	// OIDBase itself is reserved (mirrors the NilOID = 0 convention). The
+	// base comes from the cluster-wide allocator (NextOIDBase), so two
+	// volumes never address the same object on a shared OSD.
+	OIDBase  uint64 `json:"oid_base"`
 	OIDShift uint32 `json:"oid_shift"` // object size = 1<<OIDShift
 	Replicas int    `json:"replicas"`
 	// MinSize is the minimum number of live replicas a volume stays
@@ -99,6 +111,54 @@ func ListOSDs(ctx context.Context, s Store) ([]OSDInfo, error) {
 	return out, nil
 }
 
+// NextOIDBase reserves the next count object ids from the cluster-wide
+// allocator and returns the first one. It compare-and-swaps the allocator
+// record, so concurrent creators never hand out overlapping ranges; the
+// reservation is durable (a restarted cluster continues after the
+// highest base ever handed out). Zero is never returned: the reserved 0
+// value is the first free id and it is skipped, keeping the NilOID
+// convention intact for the first volume's first object.
+func NextOIDBase(ctx context.Context, s Store, count uint64) (uint64, error) {
+	if count == 0 {
+		return 0, fmt.Errorf("meta: oid reservation for zero objects")
+	}
+	for {
+		cur, rev, err := s.Get(ctx, PrefixAlloc, AllocOIDs)
+		var next uint64
+		have := false
+		if err == nil {
+			if err := json.Unmarshal(cur, &next); err != nil {
+				return 0, fmt.Errorf("meta: corrupt alloc record: %w", err)
+			}
+			have = true
+		} else if err != ErrNotFound {
+			return 0, err
+		}
+		base := next
+		if base == 0 {
+			base = 1 // NilOID is reserved; ranges start at 1
+		}
+		if base > ^uint64(0)-count {
+			return 0, fmt.Errorf("meta: oid space exhausted")
+		}
+		b, err := json.Marshal(base + count)
+		if err != nil {
+			return 0, err
+		}
+		cas := int64(-1)
+		if have {
+			cas = rev
+		}
+		if _, err := s.Put(ctx, PrefixAlloc, AllocOIDs, b, cas); err != nil {
+			if err == ErrConflict {
+				continue // racing creator: re-read and retry
+			}
+			return 0, err
+		}
+		return base, nil
+	}
+}
+
 // PutVolume stores a volume spec.
 func PutVolume(ctx context.Context, s Store, spec VolumeSpec) (int64, error) {
 	b, err := json.Marshal(spec)
@@ -106,6 +166,35 @@ func PutVolume(ctx context.Context, s Store, spec VolumeSpec) (int64, error) {
 		return 0, err
 	}
 	return s.Put(ctx, PrefixVolumes, spec.Name, b, -1)
+}
+
+// ListVolumes returns all registered volume specs, sorted by name.
+func ListVolumes(ctx context.Context, s Store) ([]VolumeSpec, error) {
+	keys, err := s.List(ctx, PrefixVolumes)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]VolumeSpec, 0, len(keys))
+	for _, k := range keys {
+		b, _, err := s.Get(ctx, PrefixVolumes, k)
+		if err != nil {
+			if err == ErrNotFound {
+				continue // deleted concurrently
+			}
+			return nil, fmt.Errorf("meta: volume %s: %w", k, err)
+		}
+		var spec VolumeSpec
+		if err := json.Unmarshal(b, &spec); err != nil {
+			return nil, fmt.Errorf("meta: volume %s: %w", k, err)
+		}
+		out = append(out, spec)
+	}
+	return out, nil
+}
+
+// DeleteVolume removes a volume record.
+func DeleteVolume(ctx context.Context, s Store, name string) error {
+	return s.Delete(ctx, PrefixVolumes, name, -1)
 }
 
 // GetVolume reads a volume spec.
