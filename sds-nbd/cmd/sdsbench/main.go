@@ -23,6 +23,7 @@ import (
 	"os"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -48,6 +49,7 @@ const (
 	chunkTypeNone       = 0
 	chunkTypeOffsetData = 1
 	chunkErrorFlag      = 1 << 15
+	chunkFlagDone       = 1 << 0
 
 	cmdRead  = 0
 	cmdWrite = 1
@@ -61,7 +63,8 @@ func main() {
 	rw := flag.String("rw", "randread", "read | seqread | randread | write | seqwrite | randwrite")
 	bs := flag.String("bs", "4K", "block size (e.g. 4K, 1M)")
 	size := flag.String("size", "64M", "address range to exercise")
-	qd := flag.Int("qd", 32, "queue depth (in-flight requests)")
+	qd := flag.Int("qd", 32, "queue depth (in-flight requests) per connection")
+	conns := flag.Int("conns", 1, "number of parallel connections (total QD = qd*conns)")
 	runDur := flag.Duration("runtime", 10*time.Second, "duration (0 = one pass over size)")
 	flag.Parse()
 
@@ -76,17 +79,37 @@ func main() {
 	if bsBytes <= 0 || bsBytes&(bsBytes-1) != 0 {
 		fatalf("-bs must be a positive power of two")
 	}
-
-	cl, exportSize, err := dial(*addr, *export)
-	if err != nil {
-		fatalf("connect: %v", err)
+	if *conns < 1 {
+		*conns = 1
 	}
-	defer cl.Close()
+
+	type connWork struct {
+		cl *client
+	}
+	work := make([]connWork, *conns)
+	exportSize := int64(0)
+	for i := range work {
+		cl, es, err := dial(*addr, *export)
+		if err != nil {
+			fatalf("connect %d: %v", i, err)
+		}
+		work[i] = connWork{cl: cl}
+		if i == 0 {
+			exportSize = es
+		} else if es != exportSize {
+			fatalf("export size mismatch across connections")
+		}
+	}
+	defer func() {
+		for _, w := range work {
+			w.cl.Close()
+		}
+	}()
 	if sizeBytes > exportSize {
 		fatalf("-size %d exceeds export size %d", sizeBytes, exportSize)
 	}
 
-	b := &bench{cl: cl}
+	b := &bench{}
 	switch *rw {
 	case "read", "seqread", "randread":
 		b.read = true
@@ -102,30 +125,51 @@ func main() {
 		fatalf("-size smaller than -bs")
 	}
 
-	fmt.Printf("sdsbench: export=%q size=%d rw=%s bs=%d range=%d qd=%d runtime=%v\n",
-		*export, exportSize, *rw, bsBytes, sizeBytes, *qd, *runDur)
+	fmt.Printf("sdsbench: export=%q size=%d rw=%s bs=%d range=%d qd=%d conns=%d runtime=%v\n",
+		*export, exportSize, *rw, bsBytes, sizeBytes, *qd, *conns, *runDur)
 
+	type res struct {
+		ops, bytes int64
+		lats       []time.Duration
+		err        error
+	}
+	results := make([]res, len(work))
 	start := time.Now()
-	ops, bytes, lats, err := b.run(*qd, *runDur)
+	var wgC sync.WaitGroup
+	for i := range work {
+		wgC.Add(1)
+		go func(i int) {
+			defer wgC.Done()
+			results[i].ops, results[i].bytes, results[i].lats, results[i].err =
+				b.run(work[i].cl, *qd, *runDur, int64(i)+1)
+		}(i)
+	}
+	wgC.Wait()
 	elapsed := time.Since(start)
-	if err != nil {
-		fatalf("bench: %v", err)
+	var ops, bytes int64
+	var lats []time.Duration
+	for _, r := range results {
+		if r.err != nil {
+			fatalf("bench: %v", r.err)
+		}
+		ops += r.ops
+		bytes += r.bytes
+		lats = append(lats, r.lats...)
 	}
 	report(*rw, ops, bytes, elapsed, lats)
 }
 
-// bench issues pipelined NBD requests on a single connection. Replies come
-// back in request order (the server serialises per connection), so a
-// ring-buffer of send timestamps indexed by handle%cap is enough.
+// bench issues pipelined NBD requests on a connection. Structured-reply
+// servers may answer out of order, so send timestamps are tracked per
+// outstanding handle and replies are matched by handle.
 type bench struct {
-	cl     *client
 	read   bool
 	random bool
 	bs     int
 	nslots int
 }
 
-func (b *bench) run(qd int, dur time.Duration) (int64, int64, []time.Duration, error) {
+func (b *bench) run(cl *client, qd int, dur time.Duration, seed int64) (int64, int64, []time.Duration, error) {
 	if qd < 1 {
 		qd = 1
 	}
@@ -134,13 +178,13 @@ func (b *bench) run(qd int, dur time.Duration) (int64, int64, []time.Duration, e
 		buf[i] = 0xA5
 	}
 	lats := make([]time.Duration, 0, 1<<16)
-	sendAt := make([]time.Time, qd)
+	sendAt := make(map[uint64]time.Time, qd)
 
-	rng := rand.New(rand.NewSource(1))
+	rng := rand.New(rand.NewSource(seed))
 	deadline := time.Now().Add(dur)
 
 	var ops, bytes int64
-	var nextSend, nextRecv uint64 // request handles
+	var nextSend uint64 // request handles
 	inflight := 0
 
 	off := func(h uint64) uint64 {
@@ -162,92 +206,102 @@ func (b *bench) run(qd int, dur time.Duration) (int64, int64, []time.Duration, e
 		binary.BigEndian.PutUint64(req[8:16], h)
 		binary.BigEndian.PutUint64(req[16:24], off(h))
 		binary.BigEndian.PutUint32(req[24:28], uint32(b.bs))
-		sendAt[h%uint64(qd)] = time.Now()
+		sendAt[h] = time.Now()
 		if b.read {
-			_, err := b.cl.conn.Write(req[:])
+			_, err := cl.conn.Write(req[:])
 			return err
 		}
 		vec := net.Buffers{req[:], buf}
-		_, err := vec.WriteTo(b.cl.conn)
+		_, err := vec.WriteTo(cl.conn)
 		return err
 	}
 
-	recv := func(h uint64) error {
+	// recv reads one complete reply (any handle) and reports its handle.
+	recv := func() (uint64, error) {
 		var hdr [20]byte
-		if _, err := io.ReadFull(b.cl.br, hdr[:16]); err != nil {
-			return err
+		if _, err := io.ReadFull(cl.br, hdr[:16]); err != nil {
+			return 0, err
 		}
 		switch binary.BigEndian.Uint32(hdr[0:4]) {
 		case simpleReplyMagic:
 			errCode := binary.BigEndian.Uint32(hdr[4:8])
 			got := binary.BigEndian.Uint64(hdr[8:16])
-			if got != h {
-				return fmt.Errorf("reply handle %d want %d", got, h)
+			if _, ok := sendAt[got]; !ok {
+				return 0, fmt.Errorf("reply handle %d not outstanding", got)
 			}
 			if errCode != 0 {
-				return fmt.Errorf("server NBD error %d", errCode)
+				return 0, fmt.Errorf("server NBD error %d", errCode)
 			}
 			if b.read {
-				if _, err := io.CopyN(io.Discard, b.cl.br, int64(b.bs)); err != nil {
-					return err
+				if _, err := io.CopyN(io.Discard, cl.br, int64(b.bs)); err != nil {
+					return 0, err
 				}
 			}
-			return nil
+			return got, nil
 		case structuredReplyMag:
-			if _, err := io.ReadFull(b.cl.br, hdr[16:20]); err != nil {
-				return err
+			if _, err := io.ReadFull(cl.br, hdr[16:20]); err != nil {
+				return 0, err
 			}
+			var got uint64
 			for {
 				flags := binary.BigEndian.Uint16(hdr[4:6])
 				typ := binary.BigEndian.Uint16(hdr[6:8])
-				got := binary.BigEndian.Uint64(hdr[8:16])
+				h := binary.BigEndian.Uint64(hdr[8:16])
 				length := binary.BigEndian.Uint32(hdr[16:20])
-				if got != h {
-					return fmt.Errorf("chunk handle %d want %d", got, h)
+				if got == 0 {
+					got = h
+				} else if h != got {
+					return 0, fmt.Errorf("chunk handle %d continues reply %d", h, got)
 				}
-				if flags&chunkErrorFlag != 0 {
+				if flags&chunkFlagDone != 0 {
+					// payload first, then finish
 					payload := make([]byte, length)
-					if _, err := io.ReadFull(b.cl.br, payload); err != nil {
-						return err
-					}
-					code := uint32(5) // EIO
-					if len(payload) >= 4 {
-						code = binary.BigEndian.Uint32(payload[:4])
-					}
-					return fmt.Errorf("server NBD error %d", code)
-				}
-				switch typ {
-				case chunkTypeOffsetData:
-					// payload = 8B offset + data; consume and await next chunk
-					if _, err := io.CopyN(io.Discard, b.cl.br, int64(length)); err != nil {
-						return err
-					}
-				case chunkTypeNone:
-					if length != 0 {
-						if _, err := io.CopyN(io.Discard, b.cl.br, int64(length)); err != nil {
-							return err
+					if length > 0 {
+						if _, err := io.ReadFull(cl.br, payload); err != nil {
+							return 0, err
 						}
 					}
-					return nil
-				default:
-					if _, err := io.CopyN(io.Discard, b.cl.br, int64(length)); err != nil {
-						return err
+					if flags&chunkErrorFlag != 0 {
+						code := uint32(5) // EIO
+						if len(payload) >= 4 {
+							code = binary.BigEndian.Uint32(payload[:4])
+						}
+						return 0, fmt.Errorf("server NBD error %d", code)
 					}
-					return fmt.Errorf("unknown chunk type %d", typ)
+					return got, nil
+				}
+				if flags&chunkErrorFlag != 0 {
+					if _, err := io.CopyN(io.Discard, cl.br, int64(length)); err != nil {
+						return 0, err
+					}
+					return 0, fmt.Errorf("server NBD error (non-final error chunk)")
+				}
+				switch typ {
+				case chunkTypeOffsetData, chunkTypeNone:
+					if length > 0 {
+						if _, err := io.CopyN(io.Discard, cl.br, int64(length)); err != nil {
+							return 0, err
+						}
+					}
+				default:
+					if _, err := io.CopyN(io.Discard, cl.br, int64(length)); err != nil {
+						return 0, err
+					}
+					return 0, fmt.Errorf("unknown chunk type %d", typ)
 				}
 				// next chunk header
-				if _, err := io.ReadFull(b.cl.br, hdr[:16]); err != nil {
-					return err
+				if _, err := io.ReadFull(cl.br, hdr[:16]); err != nil {
+					return 0, err
 				}
 				if binary.BigEndian.Uint32(hdr[0:4]) != structuredReplyMag {
-					return fmt.Errorf("bad chunk magic 0x%x", binary.BigEndian.Uint32(hdr[0:4]))
+					return 0, fmt.Errorf("bad chunk magic 0x%x", binary.BigEndian.Uint32(hdr[0:4]))
 				}
-				if _, err := io.ReadFull(b.cl.br, hdr[16:20]); err != nil {
-					return err
+				if _, err := io.ReadFull(cl.br, hdr[16:20]); err != nil {
+					return 0, err
 				}
 			}
 		default:
-			return fmt.Errorf("bad reply magic 0x%x", binary.BigEndian.Uint32(hdr[0:4]))
+			return 0, fmt.Errorf("bad reply magic 0x%x", binary.BigEndian.Uint32(hdr[0:4]))
 		}
 	}
 	for {
@@ -269,12 +323,12 @@ func (b *bench) run(qd int, dur time.Duration) (int64, int64, []time.Duration, e
 			break // one-pass mode finished
 		}
 		// Collect one reply (bufio batches the rest).
-		if err := recv(nextRecv); err != nil {
+		h, err := recv()
+		if err != nil {
 			return ops, bytes, lats, err
 		}
-		lat := time.Since(sendAt[nextRecv%uint64(qd)])
-		lats = append(lats, lat)
-		nextRecv++
+		lats = append(lats, time.Since(sendAt[h]))
+		delete(sendAt, h)
 		inflight--
 		ops++
 		bytes += int64(b.bs)
@@ -284,11 +338,12 @@ func (b *bench) run(qd int, dur time.Duration) (int64, int64, []time.Duration, e
 	}
 	// Drain any stragglers after the deadline.
 	for inflight > 0 {
-		if err := recv(nextRecv); err != nil {
+		h, err := recv()
+		if err != nil {
 			return ops, bytes, lats, err
 		}
-		lats = append(lats, time.Since(sendAt[nextRecv%uint64(qd)]))
-		nextRecv++
+		lats = append(lats, time.Since(sendAt[h]))
+		delete(sendAt, h)
 		inflight--
 		ops++
 		bytes += int64(b.bs)

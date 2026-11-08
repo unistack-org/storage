@@ -11,6 +11,7 @@ import (
 	"os"
 	"sync"
 	"syscall"
+	"time"
 )
 
 // Export is one named NBD export: a backend plus its access flags.
@@ -32,6 +33,12 @@ type ServerOptions struct {
 	// (e.g. the darwin dev host) so clients never send those commands.
 	EnableTrim        bool
 	EnableWriteZeroes bool
+	// MaxReadWorkers bounds how many backend operations (reads, writes,
+	// trims, zeroes) may run concurrently per connection when structured
+	// replies are negotiated. Structured replies let the server answer
+	// requests out of order, so a slow read no longer blocks the next
+	// request on the same connection. Zero means the default (32).
+	MaxReadWorkers int
 }
 
 // Server is a concurrent NBD server serving a set of named exports over
@@ -184,6 +191,20 @@ type connState struct {
 	// allocated once per connection and reused on the hot path.
 	reqHdrBuf [28]byte
 	scratch   [32]byte // largest header we emit: 20B chunk hdr + 8B offset
+
+	// --- pipelined mode (structured replies only) ---
+	// With structured replies the spec allows replying out of order
+	// (replies are matched by handle), so requests are dispatched to
+	// worker goroutines bounded by sem. The transmission loop keeps
+	// exclusive use of br (it owns the read side of the wire, incl.
+	// write payloads); workers only touch backend and, under replyMu, bw.
+	sem      chan struct{}  // worker slots (backpressure)
+	wg2      sync.WaitGroup // in-flight workers
+	replyMu  sync.Mutex     // serialises bw writes from workers
+	outstand int            // dispatched replies not yet written; guarded by replyMu
+	wErr     error          // first wire write error; guarded by replyMu
+	bufPool  sync.Pool      // per-request payload buffers (*[]byte)
+	workers  int            // MaxReadWorkers for this connection
 }
 
 func (cs *connState) getBuf(n int) []byte {
@@ -195,6 +216,31 @@ func (cs *connState) getBuf(n int) []byte {
 }
 
 func (cs *connState) putBuf([]byte) {}
+
+// defaultReadWorkers bounds per-connection backend concurrency when
+// structured replies are negotiated and MaxReadWorkers is unset.
+const defaultReadWorkers = 32
+
+// getReqBuf takes an n-byte buffer from the connection pool. Pipelined
+// workers each need their own buffer (the single ioBuf serves the
+// sequential loop only). Pooling *[]byte keeps steady-state allocation
+// near zero: boxing a []byte in an interface allocates, boxing a pointer
+// to a reused slice header does not.
+func (cs *connState) getReqBuf(n int) []byte {
+	bp, _ := cs.bufPool.Get().(*[]byte)
+	if bp == nil {
+		bp = new([]byte)
+	}
+	if cap(*bp) < n {
+		*bp = make([]byte, n)
+	}
+	return (*bp)[:n]
+}
+
+func (cs *connState) putReqBuf(b []byte) {
+	b = b[:cap(b)]
+	cs.bufPool.Put(&b)
+}
 
 // traceConn wraps a net.Conn with hex logging (SDS_NBD_TRACE=1).
 type traceConn struct {
@@ -240,7 +286,24 @@ func (s *Server) handleConn(conn net.Conn) {
 		return
 	}
 	s.logf("nbd: %s transmitting export (size=%d)", conn.RemoteAddr(), cs.size)
-	err := s.transmission(cs)
+	var err error
+	if cs.structured {
+		// Structured replies allow replying out of order, so use the
+		// pipelined transmission loop: backend work runs on worker
+		// goroutines instead of serialising behind each request.
+		cs.workers = s.opts.MaxReadWorkers
+		if cs.workers <= 0 {
+			cs.workers = defaultReadWorkers
+		}
+		cs.sem = make(chan struct{}, cs.workers)
+		err = s.transmissionPipelined(cs)
+		cs.wg2.Wait()
+		if err == nil {
+			err = cs.wErr
+		}
+	} else {
+		err = s.transmission(cs)
+	}
 	if err != nil && !errors.Is(err, io.EOF) && !errors.Is(err, net.ErrClosed) {
 		s.logf("nbd: %s transmission ended: %v", conn.RemoteAddr(), err)
 	}
@@ -704,6 +767,372 @@ func (s *Server) transmission(cs *connState) error {
 			}
 		}
 	}
+}
+
+// transmissionPipelined is the transmission loop used when structured
+// replies are negotiated. Decoding stays sequential (the wire is a byte
+// stream and WRITE payloads must be consumed in order), but backend work
+// is dispatched to worker goroutines: structured replies are matched by
+// handle, so replying out of order is legal. A per-connection semaphore
+// bounds concurrency and provides backpressure to the decode loop.
+func (s *Server) transmissionPipelined(cs *connState) error {
+	for {
+		hdr := cs.reqHdrBuf[:]
+		if err := cs.readn(hdr); err != nil {
+			return err
+		}
+		if m := binary.BigEndian.Uint32(hdr[:4]); m != requestMagic {
+			return fmt.Errorf("bad request magic 0x%x", m)
+		}
+		cs.replyMu.Lock()
+		werr := cs.wErr
+		cs.replyMu.Unlock()
+		if werr != nil {
+			return werr
+		}
+		req := reqHdr{
+			flags:  binary.BigEndian.Uint16(hdr[4:6]),
+			typ:    binary.BigEndian.Uint16(hdr[6:8]),
+			handle: binary.BigEndian.Uint64(hdr[8:16]),
+			offset: binary.BigEndian.Uint64(hdr[16:24]),
+			length: binary.BigEndian.Uint32(hdr[24:28]),
+		}
+		s.mu.RLock()
+		shutdown := s.closing
+		s.mu.RUnlock()
+		if shutdown {
+			if req.typ == CmdDisc {
+				return nil
+			}
+			// Drain WRITE payloads to keep framing before replying.
+			if req.typ == CmdWrite && req.length > 0 {
+				if _, err := io.CopyN(io.Discard, cs.br, int64(req.length)); err != nil {
+					return err
+				}
+			}
+			if err := s.replyPipelinedErr(cs, req.handle, ErrESHUTDOWN, "request failed"); err != nil {
+				return err
+			}
+			continue
+		}
+		switch req.typ {
+		case CmdDisc:
+			s.logf("nbd: %s disconnect", cs.conn.RemoteAddr())
+			return nil
+		case CmdRead:
+			if req.length == 0 {
+				if err := s.replyPipelinedDone(cs, req.handle); err != nil {
+					return err
+				}
+				continue
+			}
+			if req.length > MaxPayload {
+				if err := s.replyPipelinedErr(cs, req.handle, ErrEINVAL, fmt.Sprintf("read length %d exceeds max payload %d", req.length, MaxPayload)); err != nil {
+					return err
+				}
+				continue
+			}
+			if err := validRange(cs.size, req.offset, req.length); err != nil {
+				if err2 := s.replyPipelinedErr(cs, req.handle, ErrEINVAL, "read failed"); err2 != nil {
+					return err2
+				}
+				continue
+			}
+			s.dispatch(cs, func(cs *connState) error { return s.readWorker(cs, req) })
+		case CmdWrite:
+			// Payload must be consumed from the wire here; the backend
+			// write itself runs on a worker.
+			if req.length > MaxPayload {
+				if _, err := io.CopyN(io.Discard, cs.br, int64(req.length)); err != nil {
+					return err
+				}
+				if err2 := s.replyPipelinedErr(cs, req.handle, ErrEINVAL, "request failed"); err2 != nil {
+					return err2
+				}
+				continue
+			}
+			buf := cs.getReqBuf(int(req.length))
+			if err := cs.readn(buf); err != nil {
+				cs.putReqBuf(buf)
+				return err
+			}
+			if cs.readOnly {
+				s.dispatch(cs, func(cs *connState) error {
+					return cs.writeStructuredReply(req.handle, ErrEPERM, "request failed", 0, nil)
+				})
+				continue
+			}
+			if err := validRange(cs.size, req.offset, req.length); err != nil {
+				s.dispatch(cs, func(cs *connState) error {
+					return cs.writeStructuredReply(req.handle, ErrEINVAL, "request failed", 0, nil)
+				})
+				continue
+			}
+			s.dispatch(cs, func(cs *connState) error { return s.writeWorker(cs, req, buf) })
+		case CmdFlush:
+			// FLUSH must cover all previously received WRITEs, so drain
+			// every in-flight worker before flushing.
+			if err := s.drainWorkers(cs); err != nil {
+				return err
+			}
+			err := cs.backend.Flush()
+			code := uint32(ErrOK)
+			msg := ""
+			if err != nil {
+				code, msg = errnoToNBD(err), err.Error()
+			}
+			if err2 := s.replyPipelinedReply(cs, req.handle, code, msg); err2 != nil {
+				return err2
+			}
+		case CmdTrim:
+			if cs.readOnly {
+				if err := s.replyPipelinedErr(cs, req.handle, ErrEPERM, "request failed"); err != nil {
+					return err
+				}
+				continue
+			}
+			if !s.opts.EnableTrim {
+				if err := s.replyPipelinedErr(cs, req.handle, ErrEOPNOTSUPP, "request failed"); err != nil {
+					return err
+				}
+				continue
+			}
+			if err := validRange(cs.size, req.offset, req.length); err != nil {
+				if err2 := s.replyPipelinedErr(cs, req.handle, ErrEINVAL, "request failed"); err2 != nil {
+					return err2
+				}
+				continue
+			}
+			s.dispatch(cs, func(cs *connState) error {
+				err := cs.backend.Trim(int64(req.offset), req.length)
+				code := uint32(ErrOK)
+				msg := ""
+				if err != nil {
+					code, msg = errnoToNBD(err), err.Error()
+				}
+				return cs.writeStructuredReply(req.handle, code, msg, 0, nil)
+			})
+		case CmdWriteZeroes:
+			if cs.readOnly {
+				if err := s.replyPipelinedErr(cs, req.handle, ErrEPERM, "request failed"); err != nil {
+					return err
+				}
+				continue
+			}
+			if !s.opts.EnableWriteZeroes {
+				if err := s.replyPipelinedErr(cs, req.handle, ErrEOPNOTSUPP, "request failed"); err != nil {
+					return err
+				}
+				continue
+			}
+			if err := validRange(cs.size, req.offset, req.length); err != nil {
+				if err2 := s.replyPipelinedErr(cs, req.handle, ErrEINVAL, "request failed"); err2 != nil {
+					return err2
+				}
+				continue
+			}
+			punch := req.flags&cmdFlagNoHole == 0
+			s.dispatch(cs, func(cs *connState) error {
+				err := cs.backend.WriteZeroes(int64(req.offset), req.length, punch)
+				code := uint32(ErrOK)
+				msg := ""
+				if err != nil {
+					code, msg = errnoToNBD(err), err.Error()
+				}
+				return cs.writeStructuredReply(req.handle, code, msg, 0, nil)
+			})
+		case CmdBlockStatus:
+			if err := s.replyPipelinedErr(cs, req.handle, ErrEOPNOTSUPP, "no meta contexts"); err != nil {
+				return err
+			}
+		default:
+			s.logf("nbd: %s unsupported command %d", cs.conn.RemoteAddr(), req.typ)
+			if err := s.replyPipelinedErr(cs, req.handle, ErrEOPNOTSUPP, "request failed"); err != nil {
+				return err
+			}
+		}
+	}
+}
+
+// dispatch runs fn on a worker goroutine, blocking until a slot frees so
+// at most cs.workers backend operations are in flight per connection.
+func (s *Server) dispatch(cs *connState, fn func(cs *connState) error) {
+	cs.sem <- struct{}{}
+	cs.replyMu.Lock()
+	cs.outstand++
+	cs.replyMu.Unlock()
+	cs.wg2.Add(1)
+	go func() {
+		defer cs.wg2.Done()
+		defer func() { <-cs.sem }()
+		if err := fn(cs); err != nil {
+			cs.replyMu.Lock()
+			if cs.wErr == nil {
+				cs.wErr = err
+			}
+			cs.replyMu.Unlock()
+		}
+	}()
+}
+
+// drainWorkers acquires every worker slot, runs the queued work to
+// completion, then releases. Used by FLUSH, which must cover all prior
+// writes on the connection.
+func (s *Server) drainWorkers(cs *connState) error {
+	for i := 0; i < cs.workers; i++ {
+		select {
+		case cs.sem <- struct{}{}:
+		case <-time.After(30 * time.Second):
+			return fmt.Errorf("timed out draining workers")
+		}
+	}
+	// Drain the reply queue too: FLUSH's reply must not overtake queued
+	// write replies, so flush any buffered bytes to the wire.
+	cs.replyMu.Lock()
+	err := cs.bw.Flush()
+	if err != nil && cs.wErr == nil {
+		cs.wErr = err
+	}
+	cs.replyMu.Unlock()
+	for i := 0; i < cs.workers; i++ {
+		<-cs.sem
+	}
+	return err
+}
+
+// readWorker performs a backend READ and writes the structured reply.
+func (s *Server) readWorker(cs *connState, req reqHdr) error {
+	buf := cs.getReqBuf(int(req.length))
+	defer cs.putReqBuf(buf)
+	n, err := cs.backend.ReadAt(buf, int64(req.offset))
+	if err != nil && (n != int(req.length) || err != io.EOF) {
+		return cs.writeStructuredReply(req.handle, errnoToNBD(err), "read failed", 0, nil)
+	}
+	return cs.writeStructuredReply(req.handle, ErrOK, "", req.offset, buf[:n])
+}
+
+// writeWorker performs a backend WRITE (payload already read) and replies.
+func (s *Server) writeWorker(cs *connState, req reqHdr, buf []byte) error {
+	defer cs.putReqBuf(buf)
+	var code uint32
+	var msg string
+	n, err := cs.backend.WriteAt(buf, int64(req.offset))
+	if err != nil || n != len(buf) {
+		if err == nil {
+			err = io.ErrShortWrite
+		}
+		code, msg = errnoToNBD(err), "request failed"
+	} else if req.flags&cmdFlagFUA != 0 {
+		if ferr := cs.backend.Flush(); ferr != nil {
+			code, msg = errnoToNBD(ferr), ferr.Error()
+		}
+	}
+	return cs.writeStructuredReply(req.handle, code, msg, 0, nil)
+}
+
+// replyPipelined* write replies from the decode loop; they take replyMu
+// because worker goroutines may write replies concurrently.
+
+func (s *Server) replyPipelinedErr(cs *connState, handle uint64, code uint32, msg string) error {
+	return s.replyPipelinedReply(cs, handle, code, msg)
+}
+
+func (s *Server) replyPipelinedDone(cs *connState, handle uint64) error {
+	return s.replyPipelinedReply(cs, handle, ErrOK, "")
+}
+
+func (s *Server) replyPipelinedReply(cs *connState, handle uint64, code uint32, msg string) error {
+	cs.replyMu.Lock()
+	defer cs.replyMu.Unlock()
+	if cs.wErr != nil {
+		return cs.wErr
+	}
+	var err error
+	if code == ErrOK {
+		err = s.replyStructuredDone(cs, handle)
+	} else {
+		err = s.replyStructuredError(cs, handle, code, msg)
+	}
+	if err != nil && cs.wErr == nil {
+		cs.wErr = err
+	}
+	return err
+}
+
+// writeStructuredReply serialises a worker's reply onto bw. It flushes
+// when no dispatched replies remain outstanding, batching writes under
+// load while guaranteeing an idle connection has everything on the wire.
+func (cs *connState) writeStructuredReply(handle uint64, code uint32, msg string, offset uint64, data []byte) error {
+	cs.replyMu.Lock()
+	defer cs.replyMu.Unlock()
+	if cs.wErr != nil {
+		return cs.wErr
+	}
+	var err error
+	switch {
+	case code != ErrOK:
+		err = writeStructuredErrorChunk(cs.bw, handle, code, msg)
+	case len(data) > 0:
+		var hdr [20]byte
+		binary.BigEndian.PutUint32(hdr[:4], structuredReplyMagic)
+		binary.BigEndian.PutUint16(hdr[4:6], 0)
+		binary.BigEndian.PutUint16(hdr[6:8], chunkTypeOffsetData)
+		binary.BigEndian.PutUint64(hdr[8:16], handle)
+		binary.BigEndian.PutUint32(hdr[16:20], uint32(len(data))+8)
+		if _, err = cs.bw.Write(hdr[:]); err == nil {
+			var off [8]byte
+			binary.BigEndian.PutUint64(off[:], offset)
+			_, err = cs.bw.Write(off[:])
+		}
+		if err == nil {
+			_, err = cs.bw.Write(data)
+		}
+		if err == nil {
+			err = writeStructuredDoneChunk(cs.bw, handle)
+		}
+	default:
+		err = writeStructuredDoneChunk(cs.bw, handle)
+	}
+	cs.outstand--
+	if cs.outstand <= 0 {
+		cs.outstand = 0
+		if ferr := cs.bw.Flush(); ferr != nil && err == nil {
+			err = ferr
+		}
+	}
+	if err != nil && cs.wErr == nil {
+		cs.wErr = err
+	}
+	return err
+}
+
+// writeStructuredDoneChunk / writeStructuredErrorChunk write reply chunks
+// without flushing; they use stack headers so they cost no allocations.
+func writeStructuredDoneChunk(w io.Writer, handle uint64) error {
+	var b [20]byte
+	binary.BigEndian.PutUint32(b[:4], structuredReplyMagic)
+	binary.BigEndian.PutUint16(b[4:6], chunkFlagDone)
+	binary.BigEndian.PutUint16(b[6:8], chunkTypeNone)
+	binary.BigEndian.PutUint64(b[8:16], handle)
+	_, err := w.Write(b[:])
+	return err
+}
+
+func writeStructuredErrorChunk(w io.Writer, handle uint64, code uint32, msg string) error {
+	p := make([]byte, 4+len(msg))
+	binary.BigEndian.PutUint32(p[:4], code)
+	copy(p[4:], msg)
+	var hdr [20]byte
+	binary.BigEndian.PutUint32(hdr[:4], structuredReplyMagic)
+	binary.BigEndian.PutUint16(hdr[4:6], chunkFlagDone)
+	binary.BigEndian.PutUint16(hdr[6:8], chunkTypeError)
+	binary.BigEndian.PutUint64(hdr[8:16], handle)
+	binary.BigEndian.PutUint32(hdr[16:20], uint32(len(p)))
+	if _, err := w.Write(hdr[:]); err != nil {
+		return err
+	}
+	_, err := w.Write(p)
+	return err
 }
 
 // validRange checks offset+length lies inside the export.

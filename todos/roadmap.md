@@ -271,9 +271,11 @@
       Тесты TestPreset* (5 шт, -race).
       Справочник Vitastor: docs/config/pool.ru.md (failure_domain, level_placement,
       raw_placement DSL, pg_minsize, osd_out_time, noout, reweight, tags).
-- [ ] Цели (ориентир Vitastor highload-доклады): 4K randread **> 100k IOPS/ноду**
-      на 3-реплики по TCP, **> 200k** с MSG_ZEROCOPY; латентность single
-      4K read < 0.2–0.3 мс (их 0.14 мс — с RDMA; зафиксировать: RDMA — stretch)
+- [x] Цели (ориентир Vitastor highload-доклады): 4K randread **> 100k IOPS/ноду**
+      на 3-реплики по TCP — **сделано 2025-11-08: 171–177K** (конвейер NBD,
+      см. `todos/bench-stand.md` «Фикс чтения»; Vitastor 129K обогнан на 34%).
+      Остались: **> 200k** с MSG_ZEROCOPY; латентность single
+      4K read < 0.2–0.3 мс (у нас QD1 89 µs — уже выполнено; их 0.14 мс — с RDMA; зафиксировать: RDMA — stretch)
 - [ ] Оптимизации по результатам perf: pinned per-CPU workers (SO_REUSEPORT /
       EPOLL_TAG), registered io_uring fds+bufers, отключение GC-давления
       (GOGC off на data-потоках / ballast), hugepages для буферов,

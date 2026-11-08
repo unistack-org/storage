@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 // client is a minimal in-process NBD client used by the tests. It is
@@ -666,6 +667,206 @@ func TestConcurrentClients(t *testing.T) {
 	for i := 0; i < n; i++ {
 		if err := <-done; err != nil {
 			t.Fatalf("client %d: %v", i, err)
+		}
+	}
+}
+
+// --- pipelined (structured-reply) concurrency tests ----------------------
+
+// delayBackend slows reads at a designated offset so out-of-order reply
+// behaviour is observable: with a pipelined server, fast reads issued
+// after the slow one finish (and reply) first.
+type delayBackend struct {
+	Backend
+	slowOffset int64
+	slowDelay  time.Duration
+}
+
+func (d *delayBackend) ReadAt(p []byte, off int64) (int, error) {
+	if off == d.slowOffset {
+		time.Sleep(d.slowDelay)
+	}
+	return d.Backend.ReadAt(p, off)
+}
+
+// readAnyStructuredReply reads one complete structured reply (any handle)
+// and returns its handle, assembled data and error code.
+func (cl *client) readAnyStructuredReply(t testing.TB) (uint64, []byte, uint32) {
+	t.Helper()
+	var handle uint64
+	var data []byte
+	var errCode uint32
+	for {
+		var hdr [20]byte
+		if err := cl.br.ReadFull(hdr[:]); err != nil {
+			t.Fatalf("structured reply: %v", err)
+		}
+		if got := binary.BigEndian.Uint32(hdr[:4]); got != structuredReplyMagic {
+			t.Fatalf("bad structured magic 0x%x", got)
+		}
+		flags := binary.BigEndian.Uint16(hdr[4:6])
+		typ := binary.BigEndian.Uint16(hdr[6:8])
+		h := binary.BigEndian.Uint64(hdr[8:16])
+		length := binary.BigEndian.Uint32(hdr[16:20])
+		if handle == 0 {
+			handle = h
+		} else if h != handle {
+			t.Fatalf("mixed handles in one reply: %d then %d", handle, h)
+		}
+		payload := make([]byte, length)
+		if length > 0 {
+			if err := cl.br.ReadFull(payload); err != nil {
+				t.Fatalf("chunk payload: %v", err)
+			}
+		}
+		switch {
+		case typ == chunkTypeOffsetData:
+			data = append(data, payload[8:]...)
+		case typ&chunkErrorFlag != 0:
+			if len(payload) >= 4 {
+				errCode = binary.BigEndian.Uint32(payload[:4])
+			} else {
+				errCode = ErrEIO
+			}
+		case typ == chunkTypeNone:
+		default:
+			t.Fatalf("unexpected chunk type %d", typ)
+		}
+		if flags&chunkFlagDone != 0 {
+			return handle, data, errCode
+		}
+	}
+}
+
+func TestPipelinedReadsReplyOutOfOrder(t *testing.T) {
+	dir := t.TempDir()
+	fb, err := NewFileBackend(filepath.Join(dir, "vol0.img"), 1<<20)
+	if err != nil {
+		t.Fatalf("backend: %v", err)
+	}
+	t.Cleanup(func() { fb.Close() })
+	b := &delayBackend{Backend: fb, slowOffset: 4096, slowDelay: 150 * time.Millisecond}
+	srv := NewServer([]*Export{{Name: "vol0", Backend: b}}, ServerOptions{})
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	go func() { _ = srv.Serve(ln) }()
+	t.Cleanup(func() { srv.Close() })
+	addr := ln.Addr().String()
+	cl := newClient(t, addr)
+	cl.goExport(t, "vol0")
+
+	// Populate: block i at offset i*4096 filled with byte i.
+	const n = 8
+	for i := 0; i < n; i++ {
+		data := make([]byte, 4096)
+		for j := range data {
+			data[j] = byte(i + 1)
+		}
+		if e := cl.write(t, uint64(i)*4096, data); e != 0 {
+			t.Fatalf("write %d: err %d", i, e)
+		}
+	}
+	if e := cl.flush(t); e != 0 {
+		t.Fatalf("flush: %d", e)
+	}
+
+	// Pipeline: slow read first, then fast reads. The server must answer
+	// the fast reads while the slow one is in flight.
+	slowHandle := cl.request(t, CmdRead, 0, 4096, 4096, nil) // slow: 150ms
+	fastHandles := []uint64{}
+	for _, i := range []int{0, 2, 3, 4, 5, 6, 7} {
+		fastHandles = append(fastHandles, cl.request(t, CmdRead, 0, uint64(i)*4096, 4096, nil))
+	}
+
+	seen := map[uint64]bool{}
+	gotFirst := uint64(0)
+	for k := 0; k < len(fastHandles)+1; k++ {
+		h, data, e := cl.readAnyStructuredReply(t)
+		if e != 0 {
+			t.Fatalf("read reply handle %d: err %d", h, e)
+		}
+		if len(data) != 4096 {
+			t.Fatalf("read reply handle %d: len %d", h, len(data))
+		}
+		if k == 0 {
+			gotFirst = h
+		}
+		if h == slowHandle {
+			if data[0] != 2 {
+				t.Fatalf("slow reply data[0]=%d want 2", data[0])
+			}
+		} else {
+			idx := -1
+			for i, fh := range fastHandles {
+				if fh == h {
+					idx = i
+					break
+				}
+			}
+			if idx < 0 {
+				t.Fatalf("unexpected handle %d", h)
+			}
+			want := byte([]int{1, 3, 4, 5, 6, 7, 8}[idx])
+			if data[0] != want {
+				t.Fatalf("fast reply %d: data[0]=%d want %d", h, data[0], want)
+			}
+		}
+		seen[h] = true
+	}
+	if len(seen) != len(fastHandles)+1 {
+		t.Fatalf("saw %d replies, want %d", len(seen), len(fastHandles)+1)
+	}
+	if gotFirst == slowHandle {
+		t.Fatalf("server serialised: slow reply arrived first")
+	}
+}
+
+func TestPipelinedWritesFlushBarrier(t *testing.T) {
+	addr, _ := testServer(t, 1<<20, ServerOptions{})
+	cl := newClient(t, addr)
+	cl.goExport(t, "vol0")
+
+	// Pipeline 16 writes with interleaved reads (reads may land before
+	// the matching write and are not checked), then FLUSH: by spec FLUSH
+	// must cover all previous writes, so the final reads must see all
+	// written data.
+	const n = 16
+	handles := make([]uint64, n)
+	for i := 0; i < n; i++ {
+		data := make([]byte, 1024)
+		for j := range data {
+			data[j] = byte(i)
+		}
+		handles[i] = cl.request(t, CmdWrite, 0, uint64(i)*1024, uint32(len(data)), data)
+	}
+	flushHandle := cl.request(t, CmdFlush, 0, 0, 0, nil)
+	for i := 0; i < n; i++ {
+		h, _, e := cl.readAnyStructuredReply(t)
+		if e != 0 {
+			t.Fatalf("write reply %d (handle %d): %d", i, h, e)
+		}
+	}
+	// The FLUSH reply is the n+1-th (may be interleaved: read exactly n replies first).
+	for {
+		h, _, e := cl.readAnyStructuredReply(t)
+		if e != 0 {
+			t.Fatalf("flush reply: %d", e)
+		}
+		if h == flushHandle {
+			break
+		}
+	}
+
+	// Verify all writes landed.
+	for i := 0; i < n; i++ {
+		data, e := cl.read(t, uint64(i)*1024, 1024)
+		if e != 0 {
+			t.Fatalf("read %d: %d", i, e)
+		}
+		if data[0] != byte(i) || data[1023] != byte(i) {
+			t.Fatalf("block %d: got [%d..%d]", i, data[0], data[1023])
 		}
 	}
 }

@@ -16,6 +16,8 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"net/http"
+	_ "net/http/pprof"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -100,6 +102,8 @@ func main() {
 	flag.Var(&vduseSpecs, "vduse", "export a -export as a VDUSE virtio-blk device (Linux): spec export or export=devname, repeatable")
 	gogc := flag.Int("gogc", 0, "GOGC heap-growth percent (0 = runtime default 100; higher = fewer GC cycles, more memory)")
 	ballastMB := flag.Int("ballast-mb", 0, "steady-state ballast in MiB: a retained allocation that raises the live-heap floor so the GC runs proportionally less often")
+	pprofAddr := flag.String("pprof", "", "serve net/http/pprof on this address (e.g. :6061; empty = disabled)")
+	readWorkers := flag.Int("read-workers", 0, "max concurrent in-flight requests per NBD connection in structured-reply mode (0 = default 32)")
 	flag.Parse()
 
 	if *gogc > 0 {
@@ -117,6 +121,15 @@ func main() {
 	}
 
 	logger := log.New(os.Stderr, "sdsd: ", log.LstdFlags|log.Lmsgprefix)
+
+	if *pprofAddr != "" {
+		go func() {
+			logger.Printf("pprof on %s", *pprofAddr)
+			if err := http.ListenAndServe(*pprofAddr, nil); err != nil {
+				logger.Printf("pprof: %v", err)
+			}
+		}()
+	}
 
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
@@ -145,7 +158,13 @@ func main() {
 				logger.Fatalf("vduse: %v", err)
 			}
 		}
-		serve(ctx, logger, *listen, *maxConns, *trim, *writeZeroes, es)
+		serve(ctx, logger, *listen, nbd.ServerOptions{
+			MaxConnections:    *maxConns,
+			MaxReadWorkers:    *readWorkers,
+			Logger:            logger,
+			EnableTrim:        *trim,
+			EnableWriteZeroes: *writeZeroes,
+		}, es)
 		return
 	}
 
@@ -188,17 +207,18 @@ func main() {
 		}
 	}
 
-	serve(ctx, logger, *listen, *maxConns, *trim, *writeZeroes, es)
+	serve(ctx, logger, *listen, nbd.ServerOptions{
+		MaxConnections:    *maxConns,
+		MaxReadWorkers:    *readWorkers,
+		Logger:            logger,
+		EnableTrim:        *trim,
+		EnableWriteZeroes: *writeZeroes,
+	}, es)
 }
 
 // serve runs the NBD server until ctx is cancelled.
-func serve(ctx context.Context, logger *log.Logger, listen string, maxConns int, trim, writeZeroes bool, es []*nbd.Export) {
-	srv := nbd.NewServer(es, nbd.ServerOptions{
-		MaxConnections:    maxConns,
-		Logger:            logger,
-		EnableTrim:        trim,
-		EnableWriteZeroes: writeZeroes,
-	})
+func serve(ctx context.Context, logger *log.Logger, listen string, opts nbd.ServerOptions, es []*nbd.Export) {
+	srv := nbd.NewServer(es, opts)
 
 	ln, err := net.Listen("tcp", listen)
 	if err != nil {
