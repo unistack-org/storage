@@ -177,6 +177,26 @@ func (r *SplitRing) State() (availIdx, usedIdx uint16) {
 	return r.lastAvail, r.lastUsed
 }
 
+// UsedIdx reads the driver-visible used ring index (the driver-side
+// consumer cursor is our lastUsed; the guest-written used.idx tells us
+// how far the device-side producer got before a daemon restart).
+func (r *SplitRing) UsedIdx() (uint16, error) {
+	var b [2]byte
+	if err := r.gm.Read(b[:], r.usedBase+usedIdxOff); err != nil {
+		return 0, err
+	}
+	return binary.LittleEndian.Uint16(b[:]), nil
+}
+
+// AvailIdx reads the driver-written avail ring index.
+func (r *SplitRing) AvailIdx() (uint16, error) {
+	var b [2]byte
+	if err := r.gm.Read(b[:], r.availBase+availIdxOff); err != nil {
+		return 0, err
+	}
+	return binary.LittleEndian.Uint16(b[:]), nil
+}
+
 // NextAvail returns the head of the next available descriptor chain, or
 // (-1, nil) when the queue is empty.
 func (r *SplitRing) NextAvail() (int, error) {

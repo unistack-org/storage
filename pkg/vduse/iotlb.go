@@ -32,19 +32,24 @@ type Region struct {
 // ErrNotMapped is returned when a range is not (fully) inside any region.
 var ErrNotMapped = errors.New("vduse: iova range not mapped")
 
-// Add registers a region, replacing any region overlapping the same range.
-func (t *IOTLB) Add(r Region) {
+// Add registers a region, replacing (and returning for removal) any
+// region overlapping the same range. The caller must munmap the
+// returned regions' Mem.
+func (t *IOTLB) Add(r Region) []Region {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	out := t.rs[:0]
+	var dropped []Region
 	for _, x := range t.rs {
 		if x.Start > r.Last || x.Last < r.Start {
 			out = append(out, x)
+		} else {
+			dropped = append(dropped, x)
 		}
-		// an overlapping old region is dropped (replaced)
 	}
 	t.rs = append(out, r)
 	sort.Slice(t.rs, func(i, j int) bool { return t.rs[i].Start < t.rs[j].Start })
+	return dropped
 }
 
 // RemoveRange removes and returns all regions fully covered by [start,last].
@@ -89,17 +94,87 @@ func (t *IOTLB) Snapshot() []Region {
 	return append([]Region(nil), t.rs...)
 }
 
+// Exact returns the region mapped exactly at [start,last], if any.
+func (t *IOTLB) Exact(start, last uint64) (Region, bool) {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	for _, r := range t.rs {
+		if r.Start == start && r.Last == last {
+			return r, true
+		}
+	}
+	return Region{}, false
+}
+
+// Replace drops every region not keyed by a Start present in keep and
+// returns the dropped regions; the caller munmaps their Mem. Regions in
+// keep stay registered untouched.
+func (t *IOTLB) Replace(keep map[uint64]Region) []Region {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	var removed, held []Region
+	for _, x := range t.rs {
+		if _, ok := keep[x.Start]; ok {
+			held = append(held, x)
+		} else {
+			removed = append(removed, x)
+		}
+	}
+	t.rs = held
+	return removed
+}
+
+// Evict removes the region containing addr, if any, and returns it; the
+// caller must munmap its Mem once no in-flight request can touch it.
+// Used after completing a request: the driver DMA-unmaps request buffers
+// as soon as it sees the used entry and recycles the IOVA, so keeping
+// the mapping would risk writing into detached pages.
+func (t *IOTLB) Evict(addr uint64) (Region, bool) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	i := sort.Search(len(t.rs), func(i int) bool { return t.rs[i].Start > addr }) - 1
+	if i < 0 {
+		return Region{}, false
+	}
+	r := t.rs[i]
+	if addr > r.Last {
+		return Region{}, false
+	}
+	t.rs = append(t.rs[:i], t.rs[i+1:]...)
+	return r, true
+}
+
 // iovaMem adapts an IOTLB to the GuestMem interface used by the ring
-// logic.
+// logic. pull (optional) is called on a mapping miss to (re)fetch the
+// range from the kernel, then the lookup is retried once: the
+// virtio-vDPA driver never notifies the daemon of new mappings (no
+// UPDATE_IOTLB in the DMA-ops path), so misses are how fresh per-request
+// IOVA mappings are discovered.
 type iovaMem struct {
-	t *IOTLB
+	t    *IOTLB
+	pull func(iova, length uint64) error
 }
 
 // NewGuestMem returns a GuestMem backed by the IOTLB mapping.
 func NewGuestMem(t *IOTLB) GuestMem { return &iovaMem{t: t} }
 
+// NewGuestMemWithPull is NewGuestMem plus a pull-on-miss hook.
+func NewGuestMemWithPull(t *IOTLB, pull func(iova, length uint64) error) SliceGuestMem {
+	return &iovaMem{t: t, pull: pull}
+}
+
+func (m *iovaMem) lookup(iova uint64, length uint64) ([]byte, error) {
+	b, err := m.t.Lookup(iova, length)
+	if err != nil && m.pull != nil {
+		if perr := m.pull(iova, length); perr == nil {
+			b, err = m.t.Lookup(iova, length)
+		}
+	}
+	return b, err
+}
+
 func (m *iovaMem) Read(dst []byte, iova uint64) error {
-	src, err := m.t.Lookup(iova, uint64(len(dst)))
+	src, err := m.lookup(iova, uint64(len(dst)))
 	if err != nil {
 		return err
 	}
@@ -108,7 +183,7 @@ func (m *iovaMem) Read(dst []byte, iova uint64) error {
 }
 
 func (m *iovaMem) Write(src []byte, iova uint64) error {
-	dst, err := m.t.Lookup(iova, uint64(len(src)))
+	dst, err := m.lookup(iova, uint64(len(src)))
 	if err != nil {
 		return err
 	}
@@ -125,7 +200,7 @@ type SliceGuestMem interface {
 }
 
 func (m *iovaMem) Slice(iova uint64, length int) ([]byte, error) {
-	return m.t.Lookup(iova, uint64(length))
+	return m.lookup(iova, uint64(length))
 }
 
 var _ SliceGuestMem = (*iovaMem)(nil)
