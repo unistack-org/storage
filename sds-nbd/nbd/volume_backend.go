@@ -54,11 +54,16 @@ func (b *VolumeBackend) Trim(off int64, length uint32) error {
 	return b.WriteZeroes(off, length, true)
 }
 
-func (b *VolumeBackend) WriteZeroes(off int64, length uint32, _ bool) error {
+// WriteZeroes implements the NBD Write_Zeroes request. punchHole is the
+// negation of the NBD_FLAG_SEND_WRITE_ZEROES NO_HOLE request flag: when the
+// guest asks for a sparse zeroing we forward it to the volume, which punches
+// a real hole on every replica; NO_HOLE keeps the allocation and stores
+// literal zeroes.
+func (b *VolumeBackend) WriteZeroes(off int64, length uint32, punchHole bool) error {
 	if off < 0 {
 		return errors.New("negative offset")
 	}
-	return b.vol.WriteZeroes(context.Background(), uint64(off), uint64(length))
+	return b.vol.WriteZeroes(context.Background(), uint64(off), uint64(length), punchHole)
 }
 
 func (b *VolumeBackend) Close() error { return nil }
