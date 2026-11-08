@@ -307,6 +307,21 @@ func (d *Device) msgLoop() {
 					}
 				}
 				d.mu.Unlock()
+				// The kernel clears vq->kickfd on device reset
+				// (virtio_dev_probe resets before driving the
+				// device), so (re)assign our kick eventfds now;
+				// the kernel replays any kick accumulated while
+				// the fd was gone. This mirrors libvduse, which
+				// sets kick fds at vhost dev start.
+				for _, q := range d.vqs {
+					var ea [8]byte
+					binary.LittleEndian.PutUint32(ea[0:], q.idx)
+					binary.LittleEndian.PutUint32(ea[4:], uint32(int32(q.kickFD.Fd())))
+					if _, err := ioctl(d.devFD.Fd(), iocVQSetupKickFD, unsafe.Pointer(&ea[0])); err != nil {
+						d.logf("kickfd reassign q%d: %v\n", q.idx, err)
+						resp[4] = reqResultFailed
+					}
+				}
 				// The driver may have submitted requests
 				// before the queue was ready (virtio-blk
 				// probe does): the kernel drops those kicks.
