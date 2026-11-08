@@ -74,6 +74,16 @@ type Cluster struct {
 	poolsMu sync.Mutex
 	pools   map[int32]*sdsnet.Pool // per OSD id, keyed for reuse
 
+	// poolOpts customises every per-OSD connection pool (see
+	// SetPoolOptions). The default caps a pool at defaultPoolLimit
+	// connections: an unlimited pool dials one TCP connection (and
+	// keeps 256KB of bufio on it) per in-flight op, so a deep-QD
+	// benchmark with 4x128 requests per target used ~1GB of pool
+	// buffers. Deep queues are served by the NBD read workers and the
+	// OSD itself, not by per-op client connections, so a few fat
+	// connections per OSD are enough.
+	poolOpts func(*sdsnet.Pool)
+
 	// refreshMin bounds how often Refresh may rebuild placement.
 	refreshMin time.Duration
 	lastRef    atomic.Int64 // unix nanos
@@ -140,6 +150,7 @@ func NewCluster(s meta.Store) *Cluster {
 	c.outTimeNs.Store(int64(600 * time.Second))
 	c.probeEveryNs.Store(int64(15 * time.Second))
 	c.hardMode.Store(true) // Vitastor "client waits" default
+	c.SetPoolLimit(defaultPoolLimit)
 	return c
 }
 
@@ -402,6 +413,21 @@ func (c *Cluster) Close() error {
 	return nil
 }
 
+// defaultPoolLimit caps connections per OSD. Deep queues live in the
+// NBD read workers and the OSD, not in per-op client connections; 64
+// connections per target sustain ~10x the throughput a single host
+// generates (each connection serialises at roughly 14K ops/s), while an
+// uncapped pool dials one connection (256KB of bufio) per in-flight op
+// and cost ~1GB of RSS under a QD512 benchmark.
+const defaultPoolLimit = 64
+
+// SetPoolLimit caps connections per OSD target (0 = unlimited). Calls
+// in flight beyond the cap queue inside the pool. Set before first use:
+// pools already dialed keep their previous limit.
+func (c *Cluster) SetPoolLimit(n int) {
+	c.poolOpts = func(pp *sdsnet.Pool) { pp.Limit = n }
+}
+
 // pool returns (dialing on demand) the connection pool for one OSD.
 func (c *Cluster) pool(id int32, addr string) (*sdsnet.Pool, error) {
 	c.poolsMu.Lock()
@@ -412,6 +438,9 @@ func (c *Cluster) pool(id int32, addr string) (*sdsnet.Pool, error) {
 	pp, ok := c.pools[id]
 	if !ok {
 		pp = sdsnet.NewPool(addr, "vol")
+		if c.poolOpts != nil {
+			c.poolOpts(pp)
+		}
 		c.pools[id] = pp
 	}
 	c.poolsMu.Unlock()
