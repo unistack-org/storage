@@ -13,19 +13,20 @@ import (
 	"unsafe"
 )
 
-// VDUSE ioctl numbers (uapi/linux/vduse.h), _IOC(dir,size,type,nr) with
-// dir NONE=1 WRITE=2 READ=3 on Linux encoding, type=0x81.
+// VDUSE ioctl numbers (uapi/linux/vduse.h), type = VDUSE_BASE = 0x81.
+// Linux _IOC encoding: dir<<30 | size<<16 | type<<8 | nr, NONE=0 WRITE=1
+// READ=2 (IOR=2, IOW=1, IOWR=3). Keep in sync with the kernel header.
 const (
-	iocGetAPIVersion  = 0x80080181 // _IOR(0x01, u64)
-	iocSetAPIVersion  = 0x40080181 // _IOW(0x01, u64)
-	iocCreateDev      = 0x41500281 // _IOW(0x02, vduse_dev_config=336)
-	iocDestroyDev     = 0x41000381 // _IOW(0x03, char[256])
-	iocIotlbGetFD     = 0xc0201081 // _IOWR(0x10, vduse_iotlb_entry=32)
-	iocDevGetFeatures = 0x80081181 // _IOR(0x11, u64)
-	iocVQSetup        = 0x40201481 // _IOW(0x14, vduse_vq_config=32)
-	iocVQGetInfo      = 0xc0301581 // _IOWR(0x15, vduse_vq_info=48)
-	iocVQSetupKickFD  = 0x40081681 // _IOW(0x16, vduse_vq_eventfd=8)
-	iocVQInjectIRQ    = 0x40041781 // _IOW(0x17, u32)
+	iocGetAPIVersion  = 0x80088100 // _IOR(0x81, 0x00, u64)
+	iocSetAPIVersion  = 0x40088101 // _IOW(0x81, 0x01, u64)
+	iocCreateDev      = 0x41508102 // _IOW(0x81, 0x02, vduse_dev_config=336)
+	iocDestroyDev     = 0x41008103 // _IOW(0x81, 0x03, char[256])
+	iocIotlbGetFD     = 0xc0208110 // _IOWR(0x81, 0x10, vduse_iotlb_entry=32)
+	iocDevGetFeatures = 0x80088111 // _IOR(0x81, 0x11, u64)
+	iocVQSetup        = 0x40208114 // _IOW(0x81, 0x14, vduse_vq_config=32)
+	iocVQGetInfo      = 0xc0308115 // _IOWR(0x81, 0x15, vduse_vq_info=48)
+	iocVQSetupKickFD  = 0x40088116 // _IOW(0x81, 0x16, vduse_vq_eventfd=8)
+	iocVQInjectIRQ    = 0x40048117 // _IOW(0x81, 0x17, u32)
 )
 
 // Control message types (enum vduse_req_type) and results.
@@ -88,8 +89,14 @@ func CreateDevice(name string, nq uint16, features uint64, config []byte) error 
 	if _, err := ioctl(cf.Fd(), iocGetAPIVersion, unsafe.Pointer(&ver)); err != nil {
 		return fmt.Errorf("vduse: get api version: %w", err)
 	}
-	if _, err := ioctl(cf.Fd(), iocSetAPIVersion, unsafe.Pointer(&ver)); err != nil {
-		return fmt.Errorf("vduse: set api version: %w", err)
+	// Pin API v0: v1 (vq groups / address spaces) requires ngroups>=1
+	// and nas>=1 in the create config and the *_V2 ioctls; v0 is
+	// supported by every kernel that has VDUSE at all.
+	var zero uint64
+	if ver > 0 {
+		if _, err := ioctl(cf.Fd(), iocSetAPIVersion, unsafe.Pointer(&zero)); err != nil {
+			return fmt.Errorf("vduse: set api version 0 (kernel has %d): %w", ver, err)
+		}
 	}
 	cfg := buildDevConfig(name, nq, features, config)
 	if _, err := ioctl(cf.Fd(), iocCreateDev, unsafe.Pointer(&cfg[0])); err != nil {
@@ -120,6 +127,10 @@ type queueState struct {
 	kickFD *os.File // eventfd readable by us, written by the kernel
 	ring   *SplitRing
 	irqs   uint64
+
+	// drainMu serialises consumers of the ring: a kick and the
+	// post-DRIVER_OK flush can run at the same time.
+	drainMu sync.Mutex
 }
 
 // Device is a running VDUSE virtio-blk device backed by be.
@@ -136,8 +147,15 @@ type Device struct {
 	vqs  []*queueState
 	trim bool
 	wz   bool
+	dbg  bool
 	stop chan struct{}
 	done chan struct{}
+}
+
+func (d *Device) logf(format string, args ...any) {
+	if d.dbg {
+		fmt.Fprintf(os.Stderr, "vduse[%s] "+format, append([]any{d.name}, args...)...)
+	}
 }
 
 // Options configures NewDevice.
@@ -173,6 +191,7 @@ func NewDevice(name string, opts Options, be Backend) (*Device, error) {
 		iotlb: &IOTLB{},
 		trim:  opts.Trim,
 		wz:    opts.WriteZeroes,
+		dbg:   os.Getenv("SDS_VDUSE_DEBUG") != "",
 		stop:  make(chan struct{}),
 		done:  make(chan struct{}),
 	}
@@ -254,6 +273,7 @@ func (d *Device) msgLoop() {
 		}
 		typ := binary.LittleEndian.Uint32(buf[0:])
 		id := binary.LittleEndian.Uint32(buf[4:])
+		d.logf("req type=%d id=%d payload=% x\n", typ, id, buf[24:56])
 		var resp [devMsgSize]byte
 		binary.LittleEndian.PutUint32(resp[0:], id)
 		resp[4] = reqResultOK
@@ -280,9 +300,23 @@ func (d *Device) msgLoop() {
 				d.mu.Unlock()
 			} else if st&statusDriverOK != 0 {
 				// Driver enabled: fetch ring addresses from the kernel.
+				d.mu.Lock()
 				for _, q := range d.vqs {
 					if err := d.vqRefresh(q); err != nil {
 						resp[4] = reqResultFailed
+					}
+				}
+				d.mu.Unlock()
+				// The driver may have submitted requests
+				// before the queue was ready (virtio-blk
+				// probe does): the kernel drops those kicks.
+				// Drain whatever sits in the avail ring now.
+				for _, q := range d.vqs {
+					d.mu.Lock()
+					ring := q.ring
+					d.mu.Unlock()
+					if ring != nil {
+						d.drain(q, ring)
 					}
 				}
 			}
@@ -292,7 +326,23 @@ func (d *Device) msgLoop() {
 			if err := d.iotlbApply(start, last); err != nil {
 				resp[4] = reqResultFailed
 			}
-		case reqSetVQReady, reqSuspend, reqSetVQGroupASID:
+		case reqSetVQReady:
+			// vduse_vq_ready: num u32@24, ready u8@28. The kernel
+			// marks the vq ready right after our reply and
+			// replays any kick accumulated while it was not;
+			// the ring must be live before that happens.
+			idx := binary.LittleEndian.Uint32(buf[24:])
+			ready := buf[28] != 0
+			d.logf("set vq ready: idx=%d ready=%v\n", idx, ready)
+			d.mu.Lock()
+			if int(idx) < len(d.vqs) {
+				if err := d.vqRefresh(d.vqs[idx]); err != nil {
+					d.logf("vqRefresh q%d at SET_VQ_READY: %v\n", idx, err)
+					resp[4] = reqResultFailed
+				}
+			}
+			d.mu.Unlock()
+		case reqSuspend, reqSetVQGroupASID:
 			// API v0 does not negotiate these; acknowledge.
 		default:
 			resp[4] = reqResultFailed
@@ -342,6 +392,7 @@ func (d *Device) iotlbApply(start, last uint64) error {
 // vqRefresh (re)reads a virtqueue's ring addresses from the kernel
 // (vduse_vq_info 48B: index@0 num@4 desc@8 avail@16 used@24
 // split.avail_index@32 ready@40) and (re)builds its SplitRing.
+// The caller must hold d.mu.
 func (d *Device) vqRefresh(q *queueState) error {
 	var info [48]byte
 	binary.LittleEndian.PutUint32(info[0:], q.idx)
@@ -352,10 +403,11 @@ func (d *Device) vqRefresh(q *queueState) error {
 	desc := binary.LittleEndian.Uint64(info[8:])
 	avail := binary.LittleEndian.Uint64(info[16:])
 	used := binary.LittleEndian.Uint64(info[24:])
+	// inline union@32: vduse_vq_state_split{avail_index u16} at 32; ready@40.
 	availIdx := binary.LittleEndian.Uint16(info[32:])
 	ready := info[40] != 0
-	d.mu.Lock()
-	defer d.mu.Unlock()
+	d.logf("vq%d info: num=%d desc=%x avail=%x used=%x availIdx=%d ready=%v\n",
+		q.idx, num, desc, avail, used, availIdx, ready)
 	if !ready {
 		q.ring = nil
 		return nil
@@ -379,7 +431,14 @@ func (d *Device) kickLoop(q *queueState) {
 		}
 		d.mu.Lock()
 		ring := q.ring
+		if ring == nil {
+			// Kick raced queue enable: try to pick the ring up now.
+			if err := d.vqRefresh(q); err == nil {
+				ring = q.ring
+			}
+		}
 		d.mu.Unlock()
+		d.logf("kick q%d ring=%v\n", q.idx, ring != nil)
 		if ring == nil {
 			continue
 		}
@@ -388,6 +447,8 @@ func (d *Device) kickLoop(q *queueState) {
 }
 
 func (d *Device) drain(q *queueState, ring *SplitRing) {
+	q.drainMu.Lock()
+	defer q.drainMu.Unlock()
 	gm := d.gm
 	for {
 		head, err := ring.NextAvail()
@@ -525,7 +586,10 @@ func (d *Device) exec(br *BlkReq, hdr BlkReqHeader) (uint8, uint32) {
 				if hdr.Type == ReqDiscard {
 					err = d.be.Trim(soff, length)
 				} else {
-					err = d.be.WriteZeroes(soff, length, seg.Flags&1 != 0)
+					// virtio flag bit 0 is BZVFLAG_NO_UNMAP: when set the
+					// device must NOT free the space, so punching is only
+					// allowed when the bit is clear.
+					err = d.be.WriteZeroes(soff, length, seg.Flags&1 == 0)
 				}
 				if err != nil {
 					return StatusIOErr, 0

@@ -42,14 +42,20 @@ const (
 	featBlkDiscard    = 1 << 13 // REQ_DISCARD supported
 	featBlkTopology   = 1 << 14 // config topology fields valid
 	featBlkWriteZeroe = 1 << 15 // REQ_WRITE_ZEROES supported
-	featBlkConfigWCE  = 1 << 16 // config.wce byte is writable
+	// config.wce is writable only with VIRTIO_BLK_F_CONFIG_WCE, which
+	// the VDUSE kernel driver forbids (read-only config space), so we
+	// advertise read-only VIRTIO_BLK_F_FLUSH and keep wce=1 fixed.
+	featAccessPlatform = 1 << 33 // VIRTIO_F_ACCESS_PLATFORM: required by VDUSE
 )
 
 // Features is the feature word offered to the guest (discard and
 // write-zeroes included; see Options to disable them per device).
+// VIRTIO_F_ACCESS_PLATFORM is mandatory (vduse features_is_valid()) and
+// CONFIG_WCE must stay off for the same reason.
 const Features = uint64(featVersion1 | featRingIndirect | featRingEventIdx |
+	featAccessPlatform |
 	featBlkSizeMax | featBlkSegMax | featBlkBlkSize | featBlkFlush |
-	featBlkDiscard | featBlkTopology | featBlkWriteZeroe | featBlkConfigWCE)
+	featBlkDiscard | featBlkTopology | featBlkWriteZeroe)
 
 // FeatureMask returns the feature word for a device, dropping the
 // discard / write-zeroes advertisement when the backend cannot honour
