@@ -312,9 +312,11 @@
       etcd). Наших χ²=25 при 65k pg хватает без LP — LP только для кластеров
       с сильной неравномерностью дисков
 - [x] Первый сравнительный отчёт против Vitastor 3.2.3 на общем стенде
-      (unibench, 2×P4510 RAID1, degraded steady-state): `todos/bench-stand.md`.
+      (unibench, 2×P4510 RAID1 — диск здоров, хост шумит LLM-инференсом):
+      `todos/bench-stand.md`.
       Итог: QD1-латентность наша в 2–6× лучше (89/231 µs vs 537/459 µs);
-      randwrite rep3 при QD128 — паритет (22.1K vs 22.3K, диск-баунд);
+      randwrite rep3 при QD128 — паритет (22.1K vs 22.3K = паритет по
+      device-амплификации 3×, оба у потолка устройства ~65K);
       randread QD128 — просадка 3× (41.6K vs 128K) → адресная оптимизация
       пути чтения (цель ≥100K). Для Vitastor потребовались mon (Node.js) +
       lp_solve + etcd --max-txn-ops 10000 + failure_domain=osd + writeback
