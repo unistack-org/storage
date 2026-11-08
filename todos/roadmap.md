@@ -225,9 +225,20 @@
       nbd.Backend: `sdsd -export vol0 ... -vduse vol0=sds-vol0` отдаёт кластерный
       том как диск. 8 тестов логики зелёные; кросс-компиляция linux/amd64+arm64
       чистая; Linux-runtime e2e требует хост с CONFIG_VDUSE (на macOS невозможен)
-- [ ] Отказоустойчивость экспорта: смерть Go-бэкенда → QSD reconnect,
-      без висячих сокетов/hugepages
+- [x] **Реконнект VDUSE-демона (commit bb64488d, проверено на железе)**:
+      устройство переживает смерть демона; новый процесс переоткрывает
+      `/dev/vduse/<имя>`, восстанавливает кольца (`VQ_GET_INFO`), переassign
+      kickfd (ядро реплеит kicks), заново тянет IOTLB (полный `IOTLB_GET_FD`
+      pull + pull-on-miss: драйвер virtio-vDPA не шлёт UPDATE_IOTLB).
+      Дроп старых avail-записей под fault-guard (SetPanicOnFault+recover):
+      SIGBUS по unmapped guest-памяти не убивает демон, запрос гасится EIO+IRQ.
+      Ограничение ядра (для всех реализаций): `vduse_dev_release` снимает все
+      IOTLB-маппинги при закрытии fd — запросы «в полёте» на момент смерти
+      завершить нельзя; плановый restart — только с quiesce гостя, аварийный —
+      лечится hot-unplug/plug устройства VM. Детали: `bench-stand.md`
+- [ ] systemd keep-alive юнит для VDUSE-демона + runbook восстановления
 - [ ] e2e-тест: Linux+KVM, гость пишет/читает, fio внутри гостя
+      (нужна чистая загрузка стенда 1.100 — согласовать окно)
 
 ## Фаза 5 — Производительность до уровня Vitastor (постоянно, с замерами на каждую фазу)
 
