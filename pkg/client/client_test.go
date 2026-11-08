@@ -75,6 +75,7 @@ step emit
 type cluster struct {
 	t     testing.TB
 	meta  meta.Store
+	dir   string // temp dir holding meta/ and osdN/ data dirs
 	daems []*osd.Daemon
 	cl    *Cluster
 }
@@ -89,14 +90,20 @@ func newCluster(tb testing.TB, n int) *cluster {
 	if err != nil {
 		t.Fatalf("meta: %v", err)
 	}
-	c := &cluster{t: t, meta: m}
+	c := &cluster{t: t, meta: m, dir: dir}
 	cctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(func() {
 		cancel()
 		for _, d := range c.daems {
+			if d == nil {
+				continue
+			}
 			d.Close()
 		}
 		for _, d := range c.daems {
+			if d == nil {
+				continue
+			}
 			if err := d.Run(context.Background()); err != nil && err != context.Canceled {
 				t.Logf("daemon run: %v", err)
 			}
@@ -438,9 +445,11 @@ func TestClusterMinSizeDegraded(t *testing.T) {
 		}
 	}
 
-	// vm1 under the same topology: writes must fail fast with
-	// ErrDegraded (1 live target < min_size 2) while reads keep
-	// answering from the survivor.
+	// vm1 under the same topology, in SOFT mode: writes must fail fast
+	// with ErrDegraded (1 live target < min_size 2) while reads keep
+	// answering from the survivor. (The cluster default is hard mode —
+	// "client waits" — exercised by the hard-semantics tests below.)
+	c.cl.SetHardSemantics(false)
 	start := time.Now()
 	if _, err := v1.WriteAt(ctx, data, 1<<20); !errors.Is(err, ErrDegraded) {
 		t.Fatalf("degraded write err = %v, want ErrDegraded", err)
@@ -666,5 +675,220 @@ func TestClusterOutTimeRestore(t *testing.T) {
 	}
 	if cl.hasOut(1) {
 		t.Fatal("OSD still marked out after restore")
+	}
+}
+
+// --- hard/soft semantics (the Vitastor "client waits" lesson) ----------
+
+// restartOSD relaunches OSD id on the address it last served (its
+// on-disk state and meta record, including the operator weight,
+// survive the restart) and drops the client's cached pool so the next
+// request redials.
+func (c *cluster) restartOSD(tb testing.TB, id int32) {
+	tb.Helper()
+	addr := c.daems[id].Addr()
+	c.daems[id] = nil
+	d, err := osd.New(osd.Options{
+		ID: id, Addr: addr,
+		DataDir: filepath.Join(c.dir, fmt.Sprintf("osd%d", id)),
+		Meta:    c.meta,
+	})
+	if err != nil {
+		tb.Fatalf("osd %d restart: %v", id, err)
+	}
+	c.daems[id] = d
+	cctx, cancel := context.WithCancel(context.Background())
+	tb.Cleanup(cancel)
+	go func() { _ = d.Run(cctx) }()
+	c.cl.dropPool(id)
+	if !waitFor(tb, 5*time.Second, func() bool {
+		_, err := meta.GetOSD(context.Background(), c.meta, id)
+		return err == nil
+	}) {
+		tb.Fatalf("osd %d did not re-register", id)
+	}
+}
+
+func TestClusterHardSemanticsWaits(t *testing.T) {
+	c := newCluster(t, 3)
+	c.publishMap(1)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	if !c.cl.HardSemantics() {
+		t.Fatal("hard semantics must be the default")
+	}
+	if _, err := c.cl.CreateVolume(ctx, "vm0", 64<<20, 3, 0, 64, "data"); err != nil {
+		t.Fatalf("CreateVolume: %v", err)
+	}
+	v, err := c.cl.OpenVolume(ctx, "vm0")
+	if err != nil {
+		t.Fatalf("OpenVolume: %v", err)
+	}
+	data := make([]byte, 64<<10)
+	fill(data, 0x77, 5)
+	if _, err := v.WriteAt(ctx, data, 0); err != nil {
+		t.Fatalf("baseline write: %v", err)
+	}
+
+	// Two replicas out (weight 0): 1 live target < min_size 2. Kill
+	// the daemons too, so a write cannot slip through before the
+	// client observes the weights.
+	c.setOSDWeight(t, ctx, 1, 0)
+	c.setOSDWeight(t, ctx, 2, 0)
+	c.daems[1].Close()
+	c.daems[2].Close()
+	c.cl.dropPool(1)
+	c.cl.dropPool(2)
+	c.forceRefresh()
+
+	// Hard mode: the write parks — it must NOT return an error, not
+	// even ErrDegraded, and it must not return at all.
+	werr := make(chan error, 1)
+	go func() {
+		_, err := v.WriteAt(ctx, data, 1<<20)
+		werr <- err
+	}()
+	select {
+	case err := <-werr:
+		t.Fatalf("hard-mode degraded write returned early: %v", err)
+	case <-time.After(200 * time.Millisecond):
+	}
+
+	// Heal: weight back, daemons back on their ports. The parked
+	// write must complete on its own, with no call from the user.
+	c.setOSDWeight(t, ctx, 1, 1)
+	c.setOSDWeight(t, ctx, 2, 1)
+	c.restartOSD(t, 1)
+	c.restartOSD(t, 2)
+	select {
+	case err := <-werr:
+		if err != nil {
+			t.Fatalf("write after recovery: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("hard-mode write did not resume after recovery")
+	}
+
+	// The data is where the parked write put it, readable on the
+	// healed cluster.
+	data2 := make([]byte, len(data))
+	fill(data2, 0x88, 6)
+	if _, err := v.WriteAt(ctx, data2, 1<<20); err != nil {
+		t.Fatalf("post-recovery write: %v", err)
+	}
+	got := make([]byte, len(data))
+	if n, err := v.ReadAt(ctx, got, 1<<20); err != nil || n != len(data) {
+		t.Fatalf("post-recovery read: n=%d err=%v", n, err)
+	}
+	if !bytes.Equal(got, data2) {
+		t.Fatal("post-recovery data mismatch")
+	}
+}
+
+func TestClusterHardSemanticsCancel(t *testing.T) {
+	c := newCluster(t, 3)
+	c.publishMap(1)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	if _, err := c.cl.CreateVolume(ctx, "vm0", 64<<20, 3, 0, 64, "data"); err != nil {
+		t.Fatalf("CreateVolume: %v", err)
+	}
+	v, err := c.cl.OpenVolume(ctx, "vm0")
+	if err != nil {
+		t.Fatalf("OpenVolume: %v", err)
+	}
+	c.setOSDWeight(t, ctx, 1, 0)
+	c.setOSDWeight(t, ctx, 2, 0)
+	c.forceRefresh()
+
+	// The wait is not a trap: expiring the caller's context (a VM
+	// teardown, a hung I/O the orchestrator gives up on) releases it
+	// promptly with the caller's error.
+	cctx, ccancel := context.WithTimeout(ctx, 150*time.Millisecond)
+	defer ccancel()
+	start := time.Now()
+	_, err = v.WriteAt(cctx, make([]byte, 4096), 0)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("cancelled hard write err = %v, want context.DeadlineExceeded", err)
+	}
+	if d := time.Since(start); d > 3*time.Second {
+		t.Fatalf("cancel took %v, want prompt release", d)
+	}
+}
+
+func TestClusterReadWaitsForTransports(t *testing.T) {
+	c := newCluster(t, 3)
+	c.publishMap(1)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	if _, err := c.cl.CreateVolume(ctx, "vm0", 64<<20, 3, 0, 64, "data"); err != nil {
+		t.Fatalf("CreateVolume: %v", err)
+	}
+	v, err := c.cl.OpenVolume(ctx, "vm0")
+	if err != nil {
+		t.Fatalf("OpenVolume: %v", err)
+	}
+	data := make([]byte, 64<<10)
+	fill(data, 0x91, 7)
+	if _, err := v.WriteAt(ctx, data, 1<<20); err != nil {
+		t.Fatalf("baseline write: %v", err)
+	}
+
+	// Soft mode with every replica dead mid-flight: the map still
+	// lists three targets (no weight changes), so placement is
+	// healthy — only the transports are gone. Soft mode surfaces the
+	// last transport error; the caller (NBD/VDUSE queue) decides.
+	c.cl.SetHardSemantics(false)
+	c.daems[0].Close()
+	c.daems[1].Close()
+	c.daems[2].Close()
+	c.cl.dropPool(0)
+	c.cl.dropPool(1)
+	c.cl.dropPool(2)
+	start := time.Now()
+	_, err = v.ReadAt(ctx, make([]byte, len(data)), 1<<20)
+	if err == nil {
+		t.Fatal("read from three dead OSDs succeeded")
+	}
+	if d := time.Since(start); d > 5*time.Second {
+		t.Fatalf("soft read took %v, want fast fail", d)
+	}
+
+	// Hard mode: the same read parks while the OSDs are gone and
+	// completes by itself once they return — the guest sees a paused
+	// disk, not an I/O error.
+	c.cl.SetHardSemantics(true)
+	rerr := make(chan error, 1)
+	go func() {
+		_, err := v.ReadAt(ctx, make([]byte, len(data)), 1<<20)
+		rerr <- err
+	}()
+	select {
+	case err := <-rerr:
+		t.Fatalf("hard-mode read returned early: %v", err)
+	case <-time.After(200 * time.Millisecond):
+	}
+	c.restartOSD(t, 0)
+	c.restartOSD(t, 1)
+	c.restartOSD(t, 2)
+	select {
+	case err := <-rerr:
+		if err != nil {
+			t.Fatalf("read after recovery: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("hard-mode read did not resume after recovery")
+	}
+
+	// And it came back with the right bytes.
+	got := make([]byte, len(data))
+	if n, err := v.ReadAt(ctx, got, 1<<20); err != nil || n != len(data) {
+		t.Fatalf("read after recovery: n=%d err=%v", n, err)
+	}
+	if !bytes.Equal(got, data) {
+		t.Fatal("read-after-recovery data mismatch")
 	}
 }

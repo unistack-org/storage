@@ -48,6 +48,22 @@ var (
 	ErrClosed = errors.New("client: closed")
 )
 
+// Sentinels distinguishing a write that could not reach its quorum
+// (the replicas were reachable but refused/failed, or too few answered)
+// from a placement that cannot even be attempted (ErrDegraded). Hard
+// semantics waits on both; soft semantics surfaces both. They are
+// unexported: callers branch on hard/soft, not on these.
+var (
+	errQuorumFailed = errors.New("client: quorum failed")
+	errQuorumLost   = errors.New("client: quorum lost")
+)
+
+// isQuorumFailure reports a write that reached its targets but could not
+// commit a quorum — the transient class hard semantics rides out.
+func isQuorumFailure(err error) bool {
+	return errors.Is(err, errQuorumFailed) || errors.Is(err, errQuorumLost)
+}
+
 // Cluster is the shared connection/placement context for one process
 // talking to one cluster: a meta store, one pool set per OSD, and the
 // live placement epoch. Dialing is per target and lazy; pools are reused
@@ -86,6 +102,19 @@ type Cluster struct {
 	outs         map[int32]bool      // evicted, awaiting recovery
 	proberOn     bool
 	probeStopCh  chan struct{}
+
+	// hardMode is the Vitastor "client waits" default: when a volume is
+	// below its write quorum (fewer live targets than min_size) or a
+	// write loses its quorum to transport failures, the call blocks —
+	// refreshing placement on capped backoff — until the cluster
+	// recovers, instead of surfacing an I/O error. A guest VM sees a
+	// paused disk (its own filesystem/timeout logic handles it) and
+	// resumes cleanly when the OSD returns; it never sees a spurious
+	// write error that fsck cannot undo. SetHardSemantics(false)
+	// restores fast-fail (ErrDegraded / quorum errors) for soft users
+	// that prefer to observe degradation and decide for themselves.
+	// Atomic so the hot path (writeChunk/readChunk) reads it lock-free.
+	hardMode atomic.Bool
 }
 
 // SetRefreshInterval overrides the placement refresh interval. The
@@ -110,8 +139,22 @@ func NewCluster(s meta.Store) *Cluster {
 	}
 	c.outTimeNs.Store(int64(600 * time.Second))
 	c.probeEveryNs.Store(int64(15 * time.Second))
+	c.hardMode.Store(true) // Vitastor "client waits" default
 	return c
 }
+
+// SetHardSemantics controls what a write does when the volume is below
+// its write quorum. hard=true (the default) blocks until the cluster
+// recovers: a degraded volume pauses the caller (refreshing placement
+// on capped backoff, ctx-cancelable) rather than returning an error, so
+// a guest VM sees a stalled disk it can ride out. hard=false restores
+// fast-fail: a degraded write returns ErrDegraded immediately and a
+// lost quorum returns a quorum error, for callers that want to detect
+// degradation and act on it. Safe to call at any time.
+func (c *Cluster) SetHardSemantics(hard bool) { c.hardMode.Store(hard) }
+
+// HardSemantics reports the current hard/soft setting.
+func (c *Cluster) HardSemantics() bool { return c.hardMode.Load() }
 
 // SetOutTime sets the dwell (osd_out_time analogue): an OSD whose
 // requests fail transport-wise stays in placement for this long before
@@ -655,11 +698,39 @@ func (v *Volume) readChunk(ctx context.Context, p []byte, index, inObj uint64) e
 	if err != nil {
 		return err
 	}
+	hard := v.cluster.hardMode.Load()
+	var backoff time.Duration
+	timer := time.NewTimer(0)
+	if !timer.Stop() {
+		<-timer.C
+	}
+	defer timer.Stop()
 	for attempt := 0; attempt < 2; attempt++ {
 		var scratch [maxReplicas]placement.Ref
 		refs, terr := v.targets(snap, index, scratch[:])
 		if terr != nil && len(refs) == 0 {
-			return terr
+			if !hard || !errors.Is(terr, ErrDegraded) {
+				return terr
+			}
+			// Hard mode: every replica of this pg is out of the
+			// registry. A read has no authoritative answer to fall
+			// back on, so (like Vitastor) wait for one to return.
+			// Below min_size but above zero, reads stay tolerant:
+			// any live replica answers identically.
+			for {
+				var ok bool
+				if backoff, ok = v.cluster.sleep(ctx, timer, backoff, hardBackoffMin, hardBackoffMax); !ok {
+					return ctx.Err()
+				}
+				s, rerr := v.cluster.forceRefresh(ctx)
+				if rerr != nil {
+					return rerr
+				}
+				snap = s
+				if refs, terr = v.targets(s, index, scratch[:]); len(refs) > 0 {
+					break
+				}
+			}
 		}
 		lastErr := error(terr)
 		var sawMissing bool
@@ -712,6 +783,27 @@ func (v *Volume) readChunk(ctx context.Context, p []byte, index, inObj uint64) e
 			return nil
 		}
 		if !isStale(lastErr) {
+			// Hard mode: every target existed in placement but none
+			// answered (transport deaths the map has not caught up
+			// with, e.g. before the out_time dwell evicts them).
+			// There is no authoritative answer to fall back on, so
+			// wait out the outage: a protocol reply means the OSD is
+			// alive and the error is real — only transport failures
+			// are worth waiting on.
+			if hard && len(refs) > 0 {
+				if _, isProtocol := sdsnet.AsError(lastErr); !isProtocol {
+					next, ok := v.cluster.sleep(ctx, timer, backoff, hardBackoffMin, hardBackoffMax)
+					if !ok {
+						return ctx.Err()
+					}
+					backoff = next
+					if snap, err = v.cluster.forceRefresh(ctx); err != nil {
+						return err
+					}
+					attempt-- // waiting does not consume a stale retry
+					continue
+				}
+			}
 			return lastErr
 		}
 		if snap, err = v.cluster.forceRefresh(ctx); err != nil {
@@ -753,24 +845,121 @@ func (v *Volume) writeChunk(ctx context.Context, p []byte, n uint64, index, inOb
 	if err != nil {
 		return err
 	}
-	for attempt := 0; attempt < 3; attempt++ {
+	hard := v.cluster.hardMode.Load()
+	// Capped backoff for the hard-semantics wait. The timer object is
+	// reused (Reset/Stop) rather than time.After, whose timers pile up
+	// until they fire when the loop runs for a long time.
+	var backoff time.Duration
+	timer := time.NewTimer(0)
+	if !timer.Stop() {
+		<-timer.C
+	}
+	defer timer.Stop()
+	// Soft mode caps total attempts (the original bounded retry); hard
+	// mode loops until success, ctx cancellation, or a non-transient
+	// error. A persistently stale reply is bounded in both modes: it
+	// means the placement loop itself is broken, and spinning on a
+	// falsified map forever would mask a bug.
+	for attempt, stale := 0, 0; ; attempt++ {
+		if !hard && attempt >= 3 {
+			break
+		}
 		var scratch [maxReplicas]placement.Ref
 		refs, terr := v.targets(snap, index, scratch[:])
 		if terr != nil {
-			return terr
+			if !hard || !errors.Is(terr, ErrDegraded) {
+				return terr
+			}
+			// Hard mode: the volume is below its write quorum. Pause
+			// here, watching meta, until enough replicas return —
+			// the VM's I/O resumes on its own.
+			backoff = 0
+			if err := v.awaitQuorum(ctx, index, &snap, timer, &backoff); err != nil {
+				return err
+			}
+			continue
 		}
 		err = v.quorumWrite(ctx, oid, inObj, p, n, hole, refs)
 		if err == nil {
 			return nil
 		}
-		if !isStale(err) {
+		if isStale(err) {
+			if stale >= 2 {
+				break
+			}
+			stale++
+			if snap, err = v.cluster.forceRefresh(ctx); err != nil {
+				return err
+			}
+			continue
+		}
+		if !hard || !isQuorumFailure(err) {
 			return err
 		}
+		// Hard mode: the targets were in the map but the quorum did
+		// not answer (transports died mid-write, e.g. an OSD process
+		// vanished before the out_time dwell marked it out). Refresh
+		// and retry on backoff; if the map itself marks the OSDs out,
+		// targets() takes over the wait above.
+		next, ok := v.cluster.sleep(ctx, timer, backoff, hardBackoffMin, hardBackoffMax)
+		if !ok {
+			return ctx.Err()
+		}
+		backoff = next
 		if snap, err = v.cluster.forceRefresh(ctx); err != nil {
 			return err
 		}
 	}
 	return fmt.Errorf("client: write oid %d: %w", oid, err)
+}
+
+// sleep grows a capped backoff (lo..hi on first use, doubling to hi)
+// and waits for it. ok=false means ctx was cancelled during the wait.
+func (c *Cluster) sleep(ctx context.Context, timer *time.Timer, cur, lo, hi time.Duration) (time.Duration, bool) {
+	if cur == 0 {
+		cur = lo
+	} else if cur *= 2; cur > hi {
+		cur = hi
+	}
+	timer.Reset(cur)
+	select {
+	case <-ctx.Done():
+		return cur, false
+	case <-timer.C:
+	}
+	return cur, true
+}
+
+// Backoff bounds for the hard-semantics wait: a refresh costs two meta
+// reads, so the floor keeps meta traffic sane while the cap keeps
+// recovery detection prompt (the watcher path makes a plain Refresh
+// observe a healed OSD the moment meta changes; the backoff mainly
+// paces the forced rebuilds).
+const (
+	hardBackoffMin = 10 * time.Millisecond
+	hardBackoffMax = 200 * time.Millisecond
+)
+
+// awaitQuorum blocks until pg for index has min_size live targets
+// (stores the fresh snapshot in *snapp), ctx is cancelled, or the
+// snapshot itself fails to rebuild. It is the hard-semantics
+// degraded-write wait.
+func (v *Volume) awaitQuorum(ctx context.Context, index uint64, snapp **placement.Snapshot, timer *time.Timer, backoff *time.Duration) error {
+	for {
+		var ok bool
+		if *backoff, ok = v.cluster.sleep(ctx, timer, *backoff, hardBackoffMin, hardBackoffMax); !ok {
+			return ctx.Err()
+		}
+		s, err := v.cluster.forceRefresh(ctx)
+		if err != nil {
+			return err
+		}
+		*snapp = s
+		var scratch [maxReplicas]placement.Ref
+		if refs, terr := v.targets(s, index, scratch[:]); terr == nil && len(refs) >= v.w {
+			return nil
+		}
+	}
 }
 
 // maxReplicas bounds the fan-out scratch of a chunk write; volumes
@@ -951,9 +1140,9 @@ func (v *Volume) quorumWrite(ctx context.Context, oid, inObj uint64, p []byte, n
 		return firstStale
 	}
 	if len(errs) == 0 {
-		return fmt.Errorf("client: quorum lost on oid %d: %d/%d acks", oid, ok, len(refs))
+		return fmt.Errorf("client: %w on oid %d: %d/%d acks", errQuorumLost, oid, ok, len(refs))
 	}
-	return fmt.Errorf("client: quorum failed for oid %d: %w", oid, errors.Join(errs...))
+	return fmt.Errorf("client: %w for oid %d: %w", errQuorumFailed, oid, errors.Join(errs...))
 }
 
 // replicaWrite performs one replica's write (data or zeroes mode) and
