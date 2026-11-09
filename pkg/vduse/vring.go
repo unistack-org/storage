@@ -7,7 +7,12 @@ import (
 	"encoding/binary"
 	"errors"
 	"sync"
+	"sync/atomic"
 )
+
+// vringBarrier is a scratch word whose atomic load we use as a full
+// memory barrier (Go atomics are sequentially consistent).
+var vringBarrier int32
 
 // Descriptor flags (virtio 1.x, vring_desc.flags).
 const (
@@ -273,6 +278,16 @@ func (r *SplitRing) PushUsed(head uint16, written uint32) (bool, error) {
 	if err := r.gm.Write(b[:], r.usedBase+usedIdxOff); err != nil {
 		return false, err
 	}
+	// Full memory barrier between publishing used.idx and sampling the
+	// driver's suppression flag. Without it the completion can become
+	// visible to the driver after we read avail.flags: the driver (which
+	// re-checks used.idx after setting VRING_AVAIL_F_NO_INTERRUPT, with
+	// the matching kernel-side barrier) sees nothing new and sleeps, we
+	// see NO_INTERRUPT (set in between) and stay quiet — the completion
+	// sits in the used ring until the driver's next kick happens to
+	// arrive, stalling the queue for seconds. Mirrors vhost's
+	// vring_used_write + smp_mb + vring_need_event sequence.
+	atomic.LoadInt32(&vringBarrier)
 	if err := r.gm.Read(b[:], r.availBase+availFlagsOff); err != nil {
 		return false, err
 	}

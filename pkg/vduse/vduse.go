@@ -94,6 +94,16 @@ const (
 	StatusUnsupp = 2
 )
 
+// vqMaxSize is the virtqueue depth we offer the driver. It must
+// comfortably exceed the descriptor count of the largest request
+// the guest can build (a 1 MiB write at 4 KiB segments = 256 data
+// descriptors + header + status): at the old 256-entry ring one
+// 1 MiB request consumed the whole queue and serialised every
+// large I/O behind it (measured 48 MB/s at qd1 for 1M seqwrite).
+// The kernel caps this at 32768; 1024 fits four full-size requests
+// and 4k workloads never notice.
+const vqMaxSize = 1024
+
 // ConfigLen is the virtio-blk configuration space size: struct
 // virtio_blk_config (packed) up to unused1[3] = 60 bytes. Secure-erase
 // and zoned fields beyond it are not advertised.
@@ -112,7 +122,7 @@ func ConfigSpace(sizeBytes uint64, numQueues uint16) []byte {
 	le := binary.LittleEndian
 	le.PutUint64(c[0:], sizeBytes/512) // capacity, 512-byte sectors
 	le.PutUint32(c[8:], 512*1024)      // size_max per segment
-	le.PutUint32(c[12:], 256)          // seg_max data segments (u32)
+	le.PutUint32(c[12:], vqMaxSize-2)  // seg_max data segments (u32)
 	// geometry@16 (cylinders/heads/sectors): informational, left zero
 	le.PutUint32(c[20:], 512) // blk_size (logical) = 512
 	// topology@24: physical_block_exp=3 (4KiB), alignment_offset=0,

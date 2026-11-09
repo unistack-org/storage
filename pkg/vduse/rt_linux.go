@@ -30,6 +30,9 @@ const (
 	iocVQGetInfo      = 0xc0308115 // _IOWR(0x81, 0x15, vduse_vq_info=48)
 	iocVQSetupKickFD  = 0x40088116 // _IOW(0x81, 0x16, vduse_vq_eventfd=8)
 	iocVQInjectIRQ    = 0x40048117 // _IOW(0x81, 0x17, u32)
+
+	iocDevSetConfig       = 0x40088112 // _IOW(0x81, 0x12, vduse_config_data=8)
+	iocDevInjectConfigIRQ = 0x00008113 // _IO(0x81, 0x13)
 )
 
 // Control message types (enum vduse_req_type) and results.
@@ -175,7 +178,8 @@ type job struct {
 	br   *BlkReq
 	hdr  BlkReqHeader
 	refs []*RegionRef
-	ring *SplitRing // ring the request was claimed from (completion target)
+	ring *SplitRing     // ring the request was claimed from (completion target)
+	t0   time.Time      // dispatch time (debug timing only)
 }
 
 // queueWorkers is the per-queue worker pool size. A request spends
@@ -189,7 +193,7 @@ const queueWorkers = 256
 
 // queueJobs bounds the dispatch window; a full channel throttles the
 // dispatcher (and the ring naturally fills at num entries).
-const queueJobs = 256
+const queueJobs = vqMaxSize
 
 // irqFlushBatch bounds how many completions may accumulate before an
 // interrupt is injected. Under saturation the queue never goes idle, so
@@ -281,6 +285,9 @@ func (d *Device) execJob(q *queueState, j *job) {
 		d.releaseJob(q, j)
 	}()
 	status, written := d.exec(j.br, j.hdr)
+	if d.dbg && time.Since(j.t0) > 2*time.Millisecond {
+		d.logf("q%d: head=%d exec-slow total-since-dispatch=%s\n", q.idx, j.br.Head, time.Since(j.t0))
+	}
 	complete(status, written)
 }
 
@@ -361,7 +368,7 @@ type Device struct {
 
 func (d *Device) logf(format string, args ...any) {
 	if d.dbg {
-		fmt.Fprintf(os.Stderr, "vduse[%s] "+format, append([]any{d.name}, args...)...)
+		fmt.Fprintf(os.Stderr, "vduse[%s] %s "+format, append([]any{d.name, time.Now().Format("15:04:05.000")}, args...)...)
 	}
 }
 
@@ -457,7 +464,7 @@ func (d *Device) setupVQs() error {
 	for i := 0; i < int(d.nq); i++ {
 		var vc [32]byte
 		binary.LittleEndian.PutUint32(vc[0:], uint32(i))
-		binary.LittleEndian.PutUint16(vc[4:], 256) // max ring size
+		binary.LittleEndian.PutUint16(vc[4:], vqMaxSize) // max ring size
 		if _, err := ioctl(d.devFD.Fd(), iocVQSetup, unsafe.Pointer(&vc[0])); err != nil {
 			return fmt.Errorf("vduse: vq setup %d: %w", i, err)
 		}
@@ -508,6 +515,7 @@ func (d *Device) Close() error {
 		// worker pool (in-flight jobs release their pins and touch
 		// guest memory), and only after workers.Stop may we close the
 		// dev fd (completions inject IRQs through it) and unmap.
+		// d.vqs is nil when Close runs after a failed setupVQs.
 		for _, q := range d.vqs {
 			var ea [8]byte
 			binary.LittleEndian.PutUint32(ea[0:], q.idx)
@@ -1181,6 +1189,8 @@ func (d *Device) dispatchLocked(q *queueState, ring *SplitRing) {
 		// this request only: complete it with I/O error and keep going.
 		nsegs := len(br.DataSegs) + 1
 		refs := make([]*RegionRef, 0, nsegs)
+		pinStart := time.Now()
+		pulls := 0
 		pin := func(addr uint64, length int) bool {
 			p, perr := gm.Acquire(addr, length)
 			if perr != nil {
@@ -1202,6 +1212,10 @@ func (d *Device) dispatchLocked(q *queueState, ring *SplitRing) {
 		if ok && !pin(br.StatusSeg.Addr, 1) {
 			ok = false
 		}
+		if d.dbg && ok {
+			_ = pulls
+			d.logf("q%d: head=%d segs=%d pin=%s\n", q.idx, head, nsegs, time.Since(pinStart))
+		}
 		if !ok {
 			for _, p := range refs {
 				p.Release()
@@ -1214,7 +1228,7 @@ func (d *Device) dispatchLocked(q *queueState, ring *SplitRing) {
 			}
 			continue
 		}
-		j := &job{br: br, hdr: hdr, refs: refs, ring: ring}
+		j := &job{br: br, hdr: hdr, refs: refs, ring: ring, t0: pinStart}
 		// inflight accounting must be incremented before the job is
 		// visible to workers (releaseJob decrements): take ctrlMu
 		// first, publish under it, so quiesce can never observe
@@ -1243,6 +1257,142 @@ func (d *Device) injectIRQ(idx uint32) {
 	}
 }
 
+// SetCapacity updates the device's virtio-blk configuration space with a
+// new disk size and injects the config-change interrupt, so a connected
+// guest kernel re-reads the capacity (virtio-blk's config change handler
+// updates the gendisk size: the block device grows live, no detach).
+// The capacity field is the first u64 (512-byte sectors) of the config
+// space.
+func (d *Device) SetCapacity(sizeBytes uint64) error {
+	c := ConfigSpace(sizeBytes, d.nq)
+	// struct vduse_config_data { u32 offset; u32 length; u8 buffer[] }
+	hdr := [8]byte{}
+	binary.LittleEndian.PutUint32(hdr[0:], 0)    // capacity @0
+	binary.LittleEndian.PutUint32(hdr[4:], 8)    // 8 bytes
+	buf := append(hdr[:], c[:8]...)              //
+	if _, err := ioctl(d.devFD.Fd(), iocDevSetConfig, unsafe.Pointer(&buf[0])); err != nil {
+		return fmt.Errorf("vduse set_config: %w", err)
+	}
+	if _, err := ioctl(d.devFD.Fd(), iocDevInjectConfigIRQ, nil); err != nil {
+		return fmt.Errorf("vduse config irq: %w", err)
+	}
+	return nil
+}
+
+// execIO drives one data-bearing request (IN/OUT) through the backend.
+//
+// A guest 1 MiB request arrives as a chain of many small segments (the
+// guest splits by page/merging rules; we see ~146 segments per 1 MiB).
+// Handing each segment to the backend separately turns one block
+// request into hundreds of cluster round-trips: at ~150µs per parallel
+// replication fan-out that is 20-40ms per megabyte, which dominated the
+// VDUSE write latency. The backend's own fast path is one big
+// ReadAt/WriteAt (one fan-out per object), so we coalesce: contiguous
+// guest mappings (the common case — the vDPA DMA layer hands us one
+// large IOVA region split into page-sized descriptors) are sliced and
+// passed straight through; when a mapping boundary splits the chain we
+// fall back to a gather/scatter through a scratch buffer so the backend
+// still sees a single contiguous call.
+func (d *Device) execIO(gm SliceGuestMem, segs []Seg, wantWrite bool, off int64) (int, uint8) {
+	if len(segs) == 0 {
+		return 0, StatusOK
+	}
+	total := 0
+	for _, sg := range segs {
+		total += int(sg.Len)
+	}
+	if total == 0 {
+		return 0, StatusOK
+	}
+	if off+int64(total) > int64(d.be.Size()) {
+		return 0, StatusIOErr
+	}
+	// Fast path: every segment slices out of one contiguous guest
+	// mapping. Guest request buffers virtually always qualify; the
+	// check is a per-segment Lookup under an RLock (nanoseconds).
+	if total <= maxReqBytes {
+		buf, ok := d.coalesce(gm, segs, total)
+		if ok {
+			var n int
+			var err error
+			if wantWrite {
+				n, err = d.be.WriteAt(buf, off)
+			} else {
+				n, err = d.be.ReadAt(buf, off)
+			}
+			if err != nil {
+				return n, StatusIOErr
+			}
+			return n, StatusOK
+		}
+	}
+	// Slow path: gather (OUT) or scatter (IN) through scratch.
+	scratch := make([]byte, total)
+	if wantWrite {
+		pos := 0
+		for _, sg := range segs {
+			b, err := gm.Slice(sg.Addr, int(sg.Len))
+			if err != nil {
+				return 0, StatusIOErr
+			}
+			copy(scratch[pos:], b)
+			pos += int(sg.Len)
+		}
+		n, err := d.be.WriteAt(scratch, off)
+		if err != nil {
+			return n, StatusIOErr
+		}
+		return n, StatusOK
+	}
+	n, err := d.be.ReadAt(scratch, off)
+	if err != nil {
+		return n, StatusIOErr
+	}
+	pos := 0
+	for _, sg := range segs {
+		if pos >= n {
+			break
+		}
+		b, serr := gm.Slice(sg.Addr, int(sg.Len))
+		if serr != nil {
+			return n, StatusIOErr
+		}
+		m := copy(b, scratch[pos:])
+		pos += m
+	}
+	return n, StatusOK
+}
+
+// coalesce returns one byte slice spanning the whole segment chain.
+// ok=false means the chain crosses IOTLB mapping boundaries and the
+// caller must gather/scatter through a copy.
+func (d *Device) coalesce(gm SliceGuestMem, segs []Seg, total int) (buf []byte, ok bool) {
+	if len(segs) == 1 {
+		b, err := gm.Slice(segs[0].Addr, int(segs[0].Len))
+		if err != nil {
+			return nil, false
+		}
+		return b, true
+	}
+	// Contiguous guest IOVA: seg[k].Addr + seg[k].Len == seg[k+1].Addr
+	// for all k, and one Slice over the whole span succeeds.
+	addr := segs[0].Addr
+	for i := range segs {
+		if uint64(segs[i].Len) == 0 {
+			continue
+		}
+		if i > 0 && segs[i].Addr != addr {
+			return nil, false
+		}
+		addr += uint64(segs[i].Len)
+	}
+	b, err := gm.Slice(segs[0].Addr, total)
+	if err != nil {
+		return nil, false
+	}
+	return b, true
+}
+
 // exec runs one virtio-blk request and returns (status, bytes-written-
 // into-the-guest). Guest buffers are used zero-copy straight from the
 // IOTLB mappings: the backend preads/pwrites the guest pages directly,
@@ -1253,8 +1403,7 @@ func (d *Device) exec(br *BlkReq, hdr BlkReqHeader) (uint8, uint32) {
 	switch hdr.Type {
 	case ReqIn:
 		// VIRTIO_BLK_T_IN: the guest receives data, so every data
-		// segment is device-writeable (VRING_DESC_F_WRITE set).
-		var n uint32
+		// segment must be device-writeable (VRING_DESC_F_WRITE set).
 		for _, sg := range br.DataSegs {
 			if !sg.Write {
 				if d.dbg {
@@ -1262,47 +1411,23 @@ func (d *Device) exec(br *BlkReq, hdr BlkReqHeader) (uint8, uint32) {
 				}
 				return StatusIOErr, 0
 			}
-			b, err := gm.Slice(sg.Addr, int(sg.Len))
-			if err != nil {
-				if d.dbg {
-					d.logf("exec IN: slice(%x,%d): %v\n", sg.Addr, sg.Len, err)
-				}
-				return StatusIOErr, 0
-			}
-			if off+int64(len(b)) > int64(d.be.Size()) {
-				if d.dbg {
-					d.logf("exec IN: sector %d len %d past size %d\n", hdr.Sector, len(b), d.be.Size())
-				}
-				return StatusIOErr, 0
-			}
-			if _, err := d.be.ReadAt(b, off); err != nil {
-				if d.dbg {
-					d.logf("exec IN: readat(%d,%d): %v\n", off, len(b), err)
-				}
-				return StatusIOErr, 0
-			}
-			off += int64(len(b))
-			n += uint32(len(b))
 		}
-		return StatusOK, n
+		n, st := d.execIO(gm, br.DataSegs, false, off)
+		if d.dbg && st != StatusOK {
+			d.logf("exec IN: sector %d segs %d: status %d\n", hdr.Sector, len(br.DataSegs), st)
+		}
+		return st, uint32(n)
 	case ReqOut:
 		for _, sg := range br.DataSegs {
 			if sg.Write {
 				return StatusIOErr, 0
 			}
-			b, err := gm.Slice(sg.Addr, int(sg.Len))
-			if err != nil {
-				return StatusIOErr, 0
-			}
-			if off+int64(len(b)) > int64(d.be.Size()) {
-				return StatusIOErr, 0
-			}
-			if _, err := d.be.WriteAt(b, off); err != nil {
-				return StatusIOErr, 0
-			}
-			off += int64(len(b))
 		}
-		return StatusOK, 0
+		_, st := d.execIO(gm, br.DataSegs, true, off)
+		if d.dbg && st != StatusOK {
+			d.logf("exec OUT: sector %d segs %d: status %d\n", hdr.Sector, len(br.DataSegs), st)
+		}
+		return st, 0
 	case ReqFlush:
 		if err := d.be.Flush(); err != nil {
 			return StatusIOErr, 0

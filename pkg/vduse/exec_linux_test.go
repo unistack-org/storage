@@ -75,3 +75,94 @@ func TestExecOutReadsDriverData(t *testing.T) {
 		}
 	}
 }
+
+// countBE records how many ReadAt/WriteAt calls the backend sees: the
+// coalescing in execIO must reduce a many-segment request to ONE call.
+type countBE struct {
+	stubBE
+	reads, writes int
+}
+
+func (c *countBE) ReadAt(p []byte, off int64) (int, error) {
+	c.reads++
+	return c.stubBE.ReadAt(p, off)
+}
+func (c *countBE) WriteAt(p []byte, off int64) (int, error) {
+	c.writes++
+	return c.stubBE.WriteAt(p, off)
+}
+
+// TestExecCoalescesSegments: a 1MiB write split into 256 page-sized
+// segments must reach the backend as a single WriteAt (regression: per-
+// segment calls turned one guest request into hundreds of cluster
+// round-trips, ~30ms each megabyte).
+func TestExecCoalescesSegments(t *testing.T) {
+	g := newMemGuest()
+	payload := make([]byte, 1<<20)
+	for i := range payload {
+		payload[i] = byte(i)
+	}
+	g.Write(payload, 0x100000)
+	be := &countBE{stubBE: stubBE{data: make([]byte, 2<<20)}}
+	d := &Device{gm: g, be: be}
+	var segs []Seg
+	for off := 0; off < len(payload); off += 4096 {
+		segs = append(segs, Seg{Addr: uint64(0x100000 + off), Len: 4096})
+	}
+	br := &BlkReq{
+		HeaderSeg: Seg{Addr: 0x1000, Len: 16},
+		DataSegs:  segs,
+		StatusSeg: Seg{Addr: 0x3000, Len: 1, Write: true},
+	}
+	status, _ := d.exec(br, BlkReqHeader{Type: ReqOut, Sector: 8})
+	if status != StatusOK {
+		t.Fatalf("exec OUT: status=%d", status)
+	}
+	if be.writes != 1 {
+		t.Fatalf("backend saw %d WriteAt calls, want 1", be.writes)
+	}
+	for i := range payload {
+		if be.data[4096+i] != payload[i] {
+			t.Fatalf("payload mismatch at %d", i)
+		}
+	}
+
+	// IN path: one ReadAt, scattered across all segments. IN data segs
+	// are device-writeable (Write=true).
+	for i := range segs {
+		segs[i].Write = true
+	}
+	status, n := d.exec(br, BlkReqHeader{Type: ReqIn, Sector: 8})
+	if status != StatusOK || n != uint32(len(payload)) {
+		t.Fatalf("exec IN: status=%d n=%d", status, n)
+	}
+	if be.reads != 1 {
+		t.Fatalf("backend saw %d ReadAt calls, want 1", be.reads)
+	}
+	got := g.load(0x100000, len(payload))
+	for i := range got {
+		if got[i] != payload[i] {
+			t.Fatalf("scattered data mismatch at %d", i)
+		}
+	}
+}
+
+// TestExecPastVolumeEnd: the coalesced request must still be bounds
+// checked against the export size.
+func TestExecPastVolumeEnd(t *testing.T) {
+	g := newMemGuest()
+	be := &countBE{stubBE: stubBE{data: make([]byte, 4096)}}
+	d := &Device{gm: g, be: be}
+	br := &BlkReq{
+		HeaderSeg: Seg{Addr: 0x1000, Len: 16},
+		DataSegs:  []Seg{{Addr: 0x2000, Len: 4096}, {Addr: 0x3000, Len: 4096}},
+		StatusSeg: Seg{Addr: 0x4000, Len: 1, Write: true},
+	}
+	status, _ := d.exec(br, BlkReqHeader{Type: ReqOut, Sector: 1})
+	if status != StatusIOErr {
+		t.Fatalf("status=%d, want IOErr", status)
+	}
+	if be.writes != 0 {
+		t.Fatalf("backend saw %d writes, want 0", be.writes)
+	}
+}
