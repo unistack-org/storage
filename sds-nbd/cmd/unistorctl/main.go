@@ -8,6 +8,7 @@
 //	vol info    <name>
 //	vol qos     <name> [-class c] [-r iops[:Bps]] [-w iops[:Bps]]
 //	vol quota   <name> <size|0>                (allocation cap; 0 = cap at volume size)
+//	vol resize  <name> <size>                   (online grow; shrink is refused)
 //	vol import  <name> <file|url> [-offset N]   (streamed, 1 MiB chunks)
 //	vol export  <name> <file|->                (holes preserved)
 //	qos ls
@@ -196,6 +197,33 @@ func volCmd(ctx context.Context, cl *client.Cluster, ms meta.Store, args []strin
 			return err
 		}
 		fmt.Printf("volume %q: quota = %s\n", spec.Name, quotaLabel(spec))
+		return nil
+
+	case "resize":
+		fs := flag.NewFlagSet("vol resize", flag.ExitOnError)
+		mustParse(fs, rearg(rest))
+		if fs.NArg() != 2 {
+			fs.Usage()
+			return errors.New(`vol resize: <name> <size> e.g. "vol resize vm0 40G" (grow only)`)
+		}
+		size, err := sizeSuffix(fs.Arg(1))
+		if err != nil {
+			return fmt.Errorf("vol resize: %w", err)
+		}
+		spec, err := cl.ResizeVolume(ctx, fs.Arg(0), size)
+		if err != nil {
+			if errors.Is(err, meta.ErrShrinkUnsupported) {
+				cur, cerr := meta.GetVolume(ctx, ms, fs.Arg(0))
+				if cerr == nil {
+					return fmt.Errorf("vol resize: shrinking is not supported (volume %q is %d bytes, asked for %d)",
+						fs.Arg(0), cur.Size, size)
+				}
+				return fmt.Errorf("vol resize: shrinking is not supported: %w", err)
+			}
+			return err
+		}
+		fmt.Printf("volume %q: size = %d bytes (%d objects, %d extent(s))\n",
+			spec.Name, spec.Size, spec.ReservedObjs(), len(spec.Extents))
 		return nil
 
 	case "qos":

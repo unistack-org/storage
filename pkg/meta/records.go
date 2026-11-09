@@ -3,8 +3,11 @@ package meta
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strconv"
+
+	"github.com/unistack-org/storage/pkg/object"
 )
 
 // Canonical key prefixes.
@@ -52,6 +55,14 @@ type VolumeSpec struct {
 	// volumes never address the same object on a shared OSD.
 	OIDBase  uint64 `json:"oid_base"`
 	OIDShift uint32 `json:"oid_shift"` // object size = 1<<OIDShift
+	// OIDCount is the object count the base range was reserved for at
+	// create time. Online grow (ResizeVolume) cannot extend a contiguous
+	// reservation (other volumes allocate from the top meanwhile), so a
+	// grown volume gains extra Extents; Lookup maps a logical object
+	// index across the base range plus the extents. 0 on a legacy record
+	// means "created at Size, never grown" (BaseObjs derives it).
+	OIDCount uint64      `json:"oid_count,omitempty"`
+	Extents  []OIDExtent `json:"extents,omitempty"`
 	Replicas int    `json:"replicas"`
 	// MinSize is the minimum number of live replicas a volume stays
 	// writable with (quorum width). 0 means the Ceph-style default
@@ -80,6 +91,56 @@ type VolumeSpec struct {
 // QoSed reports whether the spec carries any limit.
 func (v VolumeSpec) QoSed() bool {
 	return v.ReadIOPS != 0 || v.ReadBPS != 0 || v.WriteIOPS != 0 || v.WriteBPS != 0
+}
+
+// OIDExtent is an extra object-id range a volume received by growing
+// online. Like the base range, Base itself is unused: objects are
+// Base+1 .. Base+Count, so an extent never collides with the id its
+// predecessor's last object uses (the allocator hands out contiguous,
+// non-overlapping ranges).
+type OIDExtent struct {
+	Base  uint64 `json:"base"`
+	Count uint64 `json:"count"`
+}
+
+// BaseObjs is the object count the base range covers: recorded on
+// resize, derived from Size for records created before growth existed
+// (a grown legacy record has Extents, and its OIDCount was written
+// with it).
+func (v VolumeSpec) BaseObjs() uint64 {
+	if v.OIDCount != 0 {
+		return v.OIDCount
+	}
+	return object.NumObjects(v.Size)
+}
+
+// Lookup maps a logical object index (0-based within the volume) to its
+// object id, walking the base range and then the extents in order. It
+// reports false for an index at or beyond the reserved object count
+// (a caller must never address it: the ids belong to other volumes).
+func (v VolumeSpec) Lookup(index uint64) (object.OID, bool) {
+	if base := v.BaseObjs(); index < base {
+		return object.OID(v.OIDBase + index + 1), true
+	}
+	index -= v.BaseObjs()
+	for _, e := range v.Extents {
+		if index < e.Count {
+			return object.OID(e.Base + index + 1), true
+		}
+		index -= e.Count
+	}
+	return object.NilOID, false
+}
+
+// ReservedObjs is the total object count the volume may address (base
+// plus extents). After a resize it is >= NumObjects(Size): grow only
+// appends whole/partial ranges as needed.
+func (v VolumeSpec) ReservedObjs() uint64 {
+	n := v.BaseObjs()
+	for _, e := range v.Extents {
+		n += e.Count
+	}
+	return n
 }
 
 // MapRecord stores one crush map generation.
@@ -187,6 +248,82 @@ func NextOIDBase(ctx context.Context, s Store, count uint64) (uint64, error) {
 		return base, nil
 	}
 }
+
+// ResizeVolume grows a volume to newSize (grow-only: shrinking would
+// strand the data in the removed objects, and the guest's filesystem
+// has no idea its disk got smaller). Growing a volume is a two-phase
+// meta change and it is crash-safe in this order:
+//
+//  1. Reserve the extra object ids from the cluster allocator. The
+//     allocator is monotonic, so an interrupted grow leaks ids at worst
+//     (harmless) and can never make the grown range overlap a range a
+//     later volume receives.
+//  2. CAS-write the new spec (Size grows; OIDBase, replicas and the
+//     rest are untouched). A concurrent editor makes the CAS fail, so
+//     two racing resizes cannot both "win" with a lost update, and a
+//     concurrent QoS/quota edit forces a retry against the fresh spec.
+//
+// The allocation bitmap needs no touch: GetAllocMap zero-extends a
+// bitmap written before the grow (the new objects are, truthfully,
+// unallocated), and clients refresh their cached size from the volume
+// watch. Shrinking is refused (ErrShrinkUnsupported). Returns the
+// committed spec.
+func ResizeVolume(ctx context.Context, s Store, name string, newSize uint64) (VolumeSpec, error) {
+	for {
+		b, rev, err := s.Get(ctx, PrefixVolumes, name)
+		if err != nil {
+			return VolumeSpec{}, err
+		}
+		var spec VolumeSpec
+		if err := json.Unmarshal(b, &spec); err != nil {
+			return VolumeSpec{}, fmt.Errorf("meta: volume %s: %w", name, err)
+		}
+		if newSize < spec.Size {
+			return VolumeSpec{}, fmt.Errorf("meta: volume %s: shrink %d < %d: %w",
+				name, newSize, spec.Size, ErrShrinkUnsupported)
+		}
+		if newSize == spec.Size {
+			return spec, nil // idempotent no-op
+		}
+		// The volume addresses indices [0, NumObjects(newSize)). The
+		// base plus existing extents cover ReservedObjs; the delta is
+		// the new range to reserve. Extents (not a widened base) are
+		// used because the allocator hands ranges out from the top:
+		// the ids directly above a volume's base may belong to a
+		// volume created after it.
+		want := object.NumObjects(newSize)
+		if have := spec.ReservedObjs(); want > have {
+			base, err := NextOIDBase(ctx, s, want-have)
+			if err != nil {
+				return VolumeSpec{}, fmt.Errorf("meta: volume %s resize: oid reserve: %w", name, err)
+			}
+			// Pin the base count so BaseObjs stays stable across
+			// further grows (the first resize freezes what create
+			// reserved).
+			if spec.OIDCount == 0 {
+				spec.OIDCount = object.NumObjects(spec.Size)
+			}
+			spec.Extents = append(spec.Extents, OIDExtent{Base: base, Count: want - have})
+		}
+		spec.Size = newSize
+		// Quota deliberately stays where the operator put it: growing
+		// the volume never raises the allocation cap.
+		nb, err := json.Marshal(spec)
+		if err != nil {
+			return VolumeSpec{}, err
+		}
+		if _, err := s.Put(ctx, PrefixVolumes, name, nb, rev); err != nil {
+			if err == ErrConflict {
+				continue // racing editor: re-read and re-check
+			}
+			return VolumeSpec{}, err
+		}
+		return spec, nil
+	}
+}
+
+// ErrShrinkUnsupported is returned by ResizeVolume for a shrink.
+var ErrShrinkUnsupported = errors.New("meta: volume shrink is not supported")
 
 // PutVolume stores a volume spec.
 func PutVolume(ctx context.Context, s Store, spec VolumeSpec) (int64, error) {

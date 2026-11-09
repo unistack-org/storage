@@ -66,6 +66,8 @@ func (b *VolumeBackend) WriteZeroes(off int64, length uint32, punchHole bool) er
 	return b.vol.WriteZeroes(context.Background(), uint64(off), uint64(length), punchHole)
 }
 
-func (b *VolumeBackend) Close() error { return nil }
+// Close releases the volume's QoS watcher. The cluster connection
+// pools are shared per target and stay open for other users.
+func (b *VolumeBackend) Close() error { return b.vol.Close() }
 
 var _ Backend = (*VolumeBackend)(nil)

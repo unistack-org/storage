@@ -447,6 +447,18 @@ func serve(ctx context.Context, logger *log.Logger, listen string, opts nbd.Serv
 	if err := srv.Serve(ln); err != nil && ctx.Err() == nil {
 		logger.Fatalf("serve: %v", err)
 	}
+	// Drain the exports after the server stops: the store backend
+	// fsyncs every object file it holds, the file backend syncs its
+	// file, so a SIGTERM-interrupted run leaves the same bytes on
+	// disk as a clean one.
+	for _, e := range es {
+		if e.Backend == nil {
+			continue
+		}
+		if err := e.Backend.Close(); err != nil {
+			logger.Printf("export %s close: %v", e.Name, err)
+		}
+	}
 	logger.Printf("bye")
 }
 

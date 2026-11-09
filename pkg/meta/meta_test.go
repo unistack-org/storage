@@ -1,6 +1,7 @@
 package meta
 
 import (
+	"reflect"
 	"context"
 	"errors"
 	"sync"
@@ -192,7 +193,7 @@ func TestRecordsRoundTrip(t *testing.T) {
 		t.Fatal(err)
 	}
 	gotSpec, err := GetVolume(ctx, s, "vm0")
-	if err != nil || gotSpec != spec {
+	if err != nil || !reflect.DeepEqual(gotSpec, spec) {
 		t.Fatalf("Volume = %+v, %v", gotSpec, err)
 	}
 

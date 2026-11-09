@@ -200,6 +200,7 @@ func (s *Server) logf(format string, args ...any) {
 // handle runs one connection: handshake, then the request loop.
 func (s *Server) handle(c net.Conn) {
 	defer c.Close()
+	setNoDelay(c)
 
 	// Handshake: 16-byte fixed part, then the export name.
 	var fixed [16]byte

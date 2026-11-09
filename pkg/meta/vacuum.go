@@ -20,12 +20,16 @@ import (
 // the rest), never orphan a range nobody knows about.
 const PrefixVacuum = "vacuums"
 
-// VacuumRecord is one tombstone: the object range to vacuum.
+// VacuumRecord is one tombstone: the object ranges to vacuum. NumObjs
+// counts the base range (Base+1..Base+NumObjs); Extents are the extra
+// ranges an online resize appended (see VolumeSpec.Extents). Records
+// written before online resize simply have no extents.
 type VacuumRecord struct {
-	Name      string `json:"name"`
-	OIDBase   uint64 `json:"oid_base"`
-	NumObjs   uint64 `json:"num_objects"` // count; objects are Base+1..Base+NumObjs
-	DeletedAt int64  `json:"deleted_at"`  // unix seconds, informational
+	Name      string      `json:"name"`
+	OIDBase   uint64      `json:"oid_base"`
+	NumObjs   uint64      `json:"num_objects"` // count; objects are Base+1..Base+NumObjs
+	Extents   []OIDExtent `json:"extents,omitempty"`
+	DeletedAt int64       `json:"deleted_at"` // unix seconds, informational
 }
 
 // PutVacuum records a tombstone (overwrite is fine: a repeated delete

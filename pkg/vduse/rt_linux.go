@@ -160,6 +160,11 @@ type queueState struct {
 	// every completion of the burst; and any completion while the
 	// dispatcher runs is flushed by the dispatcher's tail.
 	irqPending atomic.Bool
+	// irqBatch counts completions since the last interrupt so a batch
+	// of finished requests is announced promptly even while the queue
+	// stays saturated (inflight never reaches zero, so the idle flush in
+	// releaseJob never fires under load).
+	irqBatch atomic.Int32
 }
 
 // job is one validated virtio-blk request: chain parsed, header read,
@@ -173,14 +178,24 @@ type job struct {
 	ring *SplitRing // ring the request was claimed from (completion target)
 }
 
-// queueWorkers is the per-queue worker pool size: enough concurrency
-// to keep ~qd128 of loopback backend round-trips in flight. Workers
-// are pure goroutines parked on a channel — idle cost is nil.
-const queueWorkers = 64
+// queueWorkers is the per-queue worker pool size. A request spends
+// nearly all of its time blocked in a backend round-trip (~2-3ms once
+// the backend is saturated), so throughput is workers/RTT — 64 workers
+// capped us at ~32K IOPS. Sizing the pool to the ring depth lets the
+// queue keep the backend at its measured saturation point (176K IOPS
+// at ~512 inflight). Workers are goroutines parked on a channel; those
+// blocked on network I/O cost the scheduler nothing.
+const queueWorkers = 256
 
 // queueJobs bounds the dispatch window; a full channel throttles the
 // dispatcher (and the ring naturally fills at num entries).
 const queueJobs = 256
+
+// irqFlushBatch bounds how many completions may accumulate before an
+// interrupt is injected. Under saturation the queue never goes idle, so
+// without a threshold completions can sit in the used ring until the
+// next guest kick (or the 250ms watchdog) notices them.
+const irqFlushBatch = 16
 
 func (q *queueState) startWorkers(d *Device) {
 	q.jobs = make(chan *job, queueJobs)
@@ -291,6 +306,12 @@ func (d *Device) completeSafe(q *queueState, ring *SplitRing, br *BlkReq, status
 		return false
 	} else if irq {
 		q.irqPending.Store(true)
+		// Under load the queue never goes idle, so the idle flush in
+		// releaseJob cannot be the only trigger: announce a finished
+		// batch as soon as it is worth an interrupt.
+		if q.irqBatch.Add(1) >= irqFlushBatch {
+			d.flushIRQ(q)
+		}
 	}
 	return true
 }
@@ -298,6 +319,7 @@ func (d *Device) completeSafe(q *queueState, ring *SplitRing, br *BlkReq, status
 // flushIRQ injects at most one pending interrupt for the queue.
 func (d *Device) flushIRQ(q *queueState) {
 	if q.irqPending.Swap(false) {
+		q.irqBatch.Store(0)
 		d.injectIRQ(q.idx)
 	}
 }

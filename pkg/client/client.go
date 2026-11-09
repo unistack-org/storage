@@ -699,6 +699,20 @@ func (c *Cluster) ListVolumes(ctx context.Context) ([]meta.VolumeSpec, error) {
 	return meta.ListVolumes(ctx, c.meta)
 }
 
+// ResizeVolume grows a volume online (grow-only; shrinking is refused
+// — see meta.ResizeVolume). The extra object ids come from the
+// cluster-wide allocator and are appended as extents, so no other
+// volume can be holding them. Open handles on this client pick the new
+// size up through the volume watch; clients on other hosts refresh
+// within their watch latency too. The quota deliberately does not grow
+// with the volume: raising the cap is a separate admin decision.
+func (c *Cluster) ResizeVolume(ctx context.Context, name string, newSize uint64) (meta.VolumeSpec, error) {
+	if name == "" || newSize == 0 {
+		return meta.VolumeSpec{}, errors.New("client: volume name and size required")
+	}
+	return meta.ResizeVolume(ctx, c.meta, name, newSize)
+}
+
 // SetVolumeQoS updates a volume's QoS fields (inline rates and/or
 // QoSTemplate) in the cluster meta. Open volumes pick the change up on
 // their next Open; running NBD targets are updated by calling
@@ -790,10 +804,15 @@ func (c *Cluster) DeleteVolume(ctx context.Context, name string) error {
 		// Tombstone first: leaking a tombstone is harmless (the vacuum
 		// is idempotent), leaking the range is not (the objects would
 		// be unreachable garbage forever).
+		numObjs := spec.BaseObjs()
+		if numObjs == 0 {
+			numObjs = object.NumObjects(spec.Size)
+		}
 		if _, err := meta.PutVacuum(ctx, c.meta, meta.VacuumRecord{
 			Name:      name,
 			OIDBase:   spec.OIDBase,
-			NumObjs:   object.NumObjects(spec.Size),
+			NumObjs:   numObjs,
+			Extents:   spec.Extents,
 			DeletedAt: time.Now().Unix(),
 		}); err != nil {
 			return fmt.Errorf("client: delete volume %q: vacuum tombstone: %w", name, err)
@@ -868,6 +887,7 @@ func (c *Cluster) OpenVolume(ctx context.Context, name string) (*Volume, error) 
 	if v.quota == 0 {
 		v.quota = spec.Size
 	}
+	v.cur.Store(&spec) // live geometry: resize swaps this pointer
 	if v.quota < spec.Size {
 		// Capped volume: load the allocation bitmap so the quota check
 		// has its counter. A brand-new volume has no record yet (zeros).
@@ -938,6 +958,10 @@ func (v *Volume) reloadQoS(ctx context.Context) {
 	}
 	v.mu.Lock()
 	v.qosTemplate = spec.QoSTemplate
+	// Live geometry: an online resize (Size, OID extents) travels on
+	// the same watch. Swap the whole spec atomically so readers see a
+	// consistent size/extents pair.
+	v.cur.Store(&spec)
 	// A quota edit travels on the same watch: refresh the cap live.
 	// Growing the cap needs no bitmap work; shrinking takes effect on
 	// the next first-touch charge (existing allocations stay readable).
@@ -964,7 +988,12 @@ type qosRates [4]uint64
 // for concurrent use.
 type Volume struct {
 	cluster *Cluster
-	spec    meta.VolumeSpec
+	// spec is the open-time record; Name is immutable and safe to read
+	// directly. The live geometry (size and the OID ranges behind it)
+	// lives in cur: an online resize swaps it atomically, so readers
+	// never observe a torn size/extent pair.
+	spec meta.VolumeSpec
+	cur  atomic.Pointer[meta.VolumeSpec]
 
 	pgNum uint32
 	mask  uint32
@@ -1056,19 +1085,21 @@ func (v *Volume) Close() error {
 }
 
 // Spec returns the volume's registered spec.
-func (v *Volume) Spec() meta.VolumeSpec { return v.spec }
+func (v *Volume) Spec() meta.VolumeSpec { return *v.cur.Load() }
 
 // Size is the logical volume size.
-func (v *Volume) Size() uint64 { return v.spec.Size }
+func (v *Volume) Size() uint64 { return v.cur.Load().Size }
 
-// oid maps an object index to the volume's private OID range:
-// OIDBase+1 .. OIDBase+NumObjects (OIDBase itself is unused, mirroring the
-// reserved NilOID). Because bases are allocated cluster-wide, no two
-// volumes ever share an object id on a shared OSD.
-func (v *Volume) oid(index uint64) uint64 { return v.spec.OIDBase + index + 1 }
+// oid maps an object index to its object id: the base range
+// OIDBase+1 .. OIDBase+BaseObjs, then the resize extents (see
+// meta.VolumeSpec.Lookup). Because ranges are allocated cluster-wide,
+// no two volumes ever share an object id on a shared OSD. The lookup
+// is false for indices beyond the reserved range, which only a spec
+// torn mid-resize could produce.
+func (v *Volume) oid(index uint64) (object.OID, bool) { return v.cur.Load().Lookup(index) }
 
 // nbits is the volume's object count (= allocation bitmap size).
-func (v *Volume) nbits() int { return int(object.NumObjects(v.spec.Size)) }
+func (v *Volume) nbits() int { return int(object.NumObjects(v.cur.Load().Size)) }
 
 // quotaCap returns the effective allocation cap (mu-guarded, live
 // refreshed by the config watch).
@@ -1088,7 +1119,7 @@ func (v *Volume) chargeQuota(ctx context.Context, index uint64) error {
 	if index >= uint64(v.nbits()) {
 		return nil // safety: nothing to charge beyond the volume
 	}
-	if v.quotaCap() >= v.spec.Size {
+	if v.quotaCap() >= v.Size() {
 		return nil // uncapped (quota >= logical size)
 	}
 	v.allocMu.Lock()
@@ -1133,7 +1164,7 @@ func (v *Volume) releaseQuota(ctx context.Context, index uint64) {
 	v.allocMu.Lock()
 	cached := v.alloc
 	v.allocMu.Unlock()
-	if v.quotaCap() >= v.spec.Size && (cached == nil || !allocBitLocal(cached, int(index))) {
+	if v.quotaCap() >= v.Size() && (cached == nil || !allocBitLocal(cached, int(index))) {
 		return // uncapped and nothing booked locally: nothing to release
 	}
 	bits, _, err := meta.MutateAlloc(ctx, v.cluster.meta, v.spec.Name, v.nbits(), func(b []byte) bool {
@@ -1162,9 +1193,20 @@ func (v *Volume) Usage(ctx context.Context) (uint64, error) {
 func (v *Volume) Quota() uint64 { return v.quotaCap() }
 
 // Bitmap copies are LSB-first per 8-byte group; tiny local helpers keep
-// the client free of meta's unexported bit functions.
-func allocBitLocal(b []byte, i int) bool { return b[i>>3]&(1<<(i&7)) != 0 }
+// the client free of meta's unexported bit functions. They are
+// length-tolerant: a cached bitmap can be shorter than the live nbits()
+// after an online resize (the watch refreshes the cached copy shortly
+// after the size), and bits beyond the stored prefix are unallocated.
+func allocBitLocal(b []byte, i int) bool {
+	if i>>3 >= len(b) {
+		return false
+	}
+	return b[i>>3]&(1<<(i&7)) != 0
+}
 func setAllocBitLocal(b []byte, i int) bool {
+	if i>>3 >= len(b) {
+		return false
+	}
 	w := &b[i>>3]
 	m := byte(1) << (i & 7)
 	if *w&m != 0 {
@@ -1174,6 +1216,9 @@ func setAllocBitLocal(b []byte, i int) bool {
 	return true
 }
 func clearAllocBitLocal(b []byte, i int) bool {
+	if i>>3 >= len(b) {
+		return false
+	}
 	w := &b[i>>3]
 	m := byte(1) << (i & 7)
 	if *w&m == 0 {
@@ -1226,11 +1271,11 @@ func (v *Volume) targets(snap *placement.Snapshot, index uint64, scratch []place
 // live replica that answers (replicas are byte-identical at quorum
 // commit); a missing object is thin and reads as zeros.
 func (v *Volume) ReadAt(ctx context.Context, p []byte, off uint64) (int, error) {
-	if off >= v.spec.Size {
-		return 0, fmt.Errorf("client: read at %d past volume end %d", off, v.spec.Size)
+	if size := v.Size(); off >= size {
+		return 0, fmt.Errorf("client: read at %d past volume end %d", off, size)
 	}
-	if uint64(len(p)) > v.spec.Size-off {
-		p = p[:v.spec.Size-off]
+	if size := v.Size(); uint64(len(p)) > size-off {
+		p = p[:size-off]
 	}
 	// One guest request = one op token on the read axis, charged before
 	// the (possibly multi-chunk, multi-replica) work below.
@@ -1259,7 +1304,10 @@ func (v *Volume) ReadAt(ctx context.Context, p []byte, off uint64) (int, error) 
 }
 
 func (v *Volume) readChunk(ctx context.Context, p []byte, index, inObj uint64) error {
-	oid := v.oid(index)
+	oid, ok := v.oid(index)
+	if !ok {
+		return fmt.Errorf("client: volume %q: object index %d outside the reserved ranges", v.spec.Name, index)
+	}
 	snap, err := v.cluster.Refresh(ctx)
 	if err != nil {
 		return err
@@ -1306,7 +1354,7 @@ func (v *Volume) readChunk(ctx context.Context, p []byte, index, inObj uint64) e
 			if err != nil {
 				return err
 			}
-			n, err := pp.Read(ctx, oid, inObj, p)
+			n, err := pp.Read(ctx, uint64(oid), inObj, p)
 			switch {
 			case err == nil:
 				v.cluster.noteSuccess(ref.OSD)
@@ -1376,7 +1424,7 @@ func (v *Volume) readChunk(ctx context.Context, p []byte, index, inObj uint64) e
 			return err
 		}
 	}
-	return fmt.Errorf("client: read oid %d: %w", oid, errStaleRead(oid))
+	return fmt.Errorf("client: read oid %d: %w", oid, errStaleRead(uint64(oid)))
 }
 
 func errStaleRead(oid uint64) error {
@@ -1386,8 +1434,8 @@ func errStaleRead(oid uint64) error {
 // WriteAt writes p at off, fanning out to every replica and committing
 // on the write quorum (W = R/2+1).
 func (v *Volume) WriteAt(ctx context.Context, p []byte, off uint64) (int, error) {
-	if off+uint64(len(p)) > v.spec.Size {
-		return 0, fmt.Errorf("client: write at %d len %d past volume end %d", off, len(p), v.spec.Size)
+	if size := v.Size(); off+uint64(len(p)) > size {
+		return 0, fmt.Errorf("client: write at %d len %d past volume end %d", off, len(p), size)
 	}
 	if lim := v.limitsSnapshot(); lim != nil {
 		if err := lim.Write.Wait(ctx, uint64(len(p))); err != nil {
@@ -1417,7 +1465,10 @@ func (v *Volume) WriteAt(ctx context.Context, p []byte, off uint64) (int, error)
 // zeroes mode (no payload on the wire); sparse asks the replicas to punch a
 // real hole so guest TRIM vacuums space (it implies hole).
 func (v *Volume) writeChunk(ctx context.Context, p []byte, n uint64, index, inObj uint64, hole, sparse bool) error {
-	oid := v.oid(index)
+	oid, ok := v.oid(index)
+	if !ok {
+		return fmt.Errorf("client: volume %q: object index %d outside the reserved ranges", v.spec.Name, index)
+	}
 	// Quota charge (plan M0.4): a real payload write into an object the
 	// volume has not allocated yet must fit under the cap. Zeroes modes
 	// do not allocate (hole punches and literal-zero writes of an
@@ -1466,7 +1517,7 @@ func (v *Volume) writeChunk(ctx context.Context, p []byte, n uint64, index, inOb
 			}
 			continue
 		}
-		err = v.quorumWrite(ctx, oid, inObj, p, n, hole, sparse, refs)
+		err = v.quorumWrite(ctx, uint64(oid), inObj, p, n, hole, sparse, refs)
 		if err == nil {
 			return nil
 		}
@@ -1787,8 +1838,8 @@ func (v *Volume) replicaWrite(ctx context.Context, ref placement.Ref, oid, inObj
 // store literal zeroes (NBD Write_Zeroes with the NO_HOLE flag), which is
 // the byte-exact, allocation-keeping variant.
 func (v *Volume) WriteZeroes(ctx context.Context, off, n uint64, sparse bool) error {
-	if off+n > v.spec.Size {
-		return fmt.Errorf("client: write zeroes at %d len %d past volume end %d", off, n, v.spec.Size)
+	if size := v.Size(); off+n > size {
+		return fmt.Errorf("client: write zeroes at %d len %d past volume end %d", off, n, size)
 	}
 	if lim := v.limitsSnapshot(); lim != nil {
 		// Discard is coarse (a guest FITRIM can span the whole volume in

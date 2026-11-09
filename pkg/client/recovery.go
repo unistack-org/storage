@@ -102,7 +102,10 @@ func (v *Volume) RecoveryCheck(ctx context.Context) (*RecoveryReport, error) {
 		if err := ctx.Err(); err != nil {
 			return rep, err
 		}
-		oid := v.oid(uint64(index))
+		oid, ok := v.oid(uint64(index))
+		if !ok {
+			continue // index outside the reserved ranges (spec mid-resize)
+		}
 		row := v.rowFor(snap, uint64(index), scratch)
 		// Stat every live target of the row.
 		type obs struct {
@@ -124,7 +127,7 @@ func (v *Volume) RecoveryCheck(ctx context.Context) (*RecoveryReport, error) {
 				return rep, err
 			}
 			pp.SetEpoch(epoch)
-			_, present, err := pp.Stat(ctx, oid)
+			_, present, err := pp.Stat(ctx, uint64(oid))
 			if err != nil {
 				// Transport-level failure: the OSD is down for
 				// recovery purposes; record once, do not spam items.
@@ -159,7 +162,7 @@ func (v *Volume) RecoveryCheck(ctx context.Context) (*RecoveryReport, error) {
 			if !o.present {
 				good = false
 				rep.Items = append(rep.Items, RecoveryItem{
-					Index: uint64(index), OID: oid,
+					Index: uint64(index), OID: uint64(oid),
 					OSD: o.ref.OSD, Source: obses[source].ref.OSD,
 				})
 			}

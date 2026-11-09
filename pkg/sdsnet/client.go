@@ -51,6 +51,7 @@ func Dial(addr, export string, timeout time.Duration) (*Conn, error) {
 	if err != nil {
 		return nil, err
 	}
+	setNoDelay(c)
 	cc := &Conn{
 		c:  c,
 		rd: bufio.NewReaderSize(c, 128<<10),

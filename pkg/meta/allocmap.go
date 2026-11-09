@@ -51,8 +51,15 @@ func GetAllocMap(ctx context.Context, s Store, name string, nbits int) (AllocMap
 	if err := json.Unmarshal(b, &stored); err != nil {
 		return rec, fmt.Errorf("meta: allocmap %s: %w", name, err)
 	}
-	if len(stored.Bits) != len(rec.Bits) {
-		return rec, fmt.Errorf("meta: allocmap %s: bitmap %d bytes, want %d (volume resized?)",
+	// Grow-only online resize: the volume object count (nbits) rises, so
+	// a stored bitmap that is shorter than requested is the pre-resize
+	// prefix. The freshly grown objects are unallocated (bits 0), which
+	// is exactly the all-zero tail this record is zeroed to, so copying
+	// the stored prefix into the wider bitmap is the truthful view. A
+	// bitmap longer than requested means the volume shrank, which
+	// resize never does: treat it as the corruption it is.
+	if len(stored.Bits) > len(rec.Bits) {
+		return rec, fmt.Errorf("meta: allocmap %s: bitmap %d bytes, want %d (volume shrank?)",
 			name, len(stored.Bits), len(rec.Bits))
 	}
 	copy(rec.Bits, stored.Bits)

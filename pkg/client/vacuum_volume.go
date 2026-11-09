@@ -211,7 +211,11 @@ func (v *Volume) objectAllocated(ctx context.Context, snap *placement.Snapshot, 
 		if err != nil {
 			return 0, false, err
 		}
-		alloc, exists, err := pp.StatInfo(ctx, v.oid(index))
+		oid, ok := v.oid(index)
+		if !ok {
+			return 0, false, fmt.Errorf("client: volume %q: object index %d outside the reserved ranges", v.spec.Name, index)
+		}
+		alloc, exists, err := pp.StatInfo(ctx, uint64(oid))
 		if err != nil {
 			continue // this replica unreachable: ask the next one
 		}

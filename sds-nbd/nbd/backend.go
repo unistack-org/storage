@@ -110,8 +110,15 @@ func (b *FileBackend) Close() error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	if b.f != nil {
+		// Flush the page cache for this file before releasing it so a
+		// graceful daemon exit is durable; the error is kept, the
+		// close is always attempted.
+		serr := b.f.Sync()
 		err := b.f.Close()
 		b.f = nil
+		if serr != nil {
+			return serr
+		}
 		return err
 	}
 	return nil

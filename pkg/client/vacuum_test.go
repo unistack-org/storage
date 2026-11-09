@@ -406,8 +406,17 @@ func TestVolumeVacuumLive(t *testing.T) {
 		t.Fatalf("write obj1: %v", err)
 	}
 	// obj2, obj3 stay thin.
-	oid0, oid1 := v.oid(0), v.oid(1)
+	o0, ok := v.oid(0)
+	if !ok {
+		t.Fatal("oid(0) outside ranges")
+	}
+	o1, ok := v.oid(1)
+	if !ok {
+		t.Fatal("oid(1) outside ranges")
+	}
+	oid0 := uint64(o0)
 	waitForObj(t, c.dir, oid0, 3)
+	oid1 := uint64(o1)
 	waitForObj(t, c.dir, oid1, 3)
 
 	res, err := v.Vacuum(ctx)

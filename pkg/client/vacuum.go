@@ -57,19 +57,27 @@ func vacuumOSD(ctx context.Context, c *Cluster, info meta.OSDInfo, rec meta.Vacu
 		return 0, err
 	}
 	done := 0
-	for i := uint64(1); i <= rec.NumObjs; i++ {
-		if err := ctx.Err(); err != nil {
-			return done, err
-		}
-		// Keep the pool's epoch current so the remove is not fenced.
-		pp.SetEpoch(c.epochSnapshot())
-		if err := pp.Remove(ctx, rec.OIDBase+i); err != nil {
-			if !vacuumSupported(err) {
-				return done, fmt.Errorf("osd %d does not support OpRemove (upgrade it)", info.ID)
+	// Every reserved segment: the base range, then each resize extent.
+	segments := make([]meta.OIDExtent, 0, 1+len(rec.Extents))
+	if rec.NumObjs > 0 {
+		segments = append(segments, meta.OIDExtent{Base: rec.OIDBase, Count: rec.NumObjs})
+	}
+	segments = append(segments, rec.Extents...)
+	for _, seg := range segments {
+		for i := uint64(1); i <= seg.Count; i++ {
+			if err := ctx.Err(); err != nil {
+				return done, err
 			}
-			return done, err
+			// Keep the pool's epoch current so the remove is not fenced.
+			pp.SetEpoch(c.epochSnapshot())
+			if err := pp.Remove(ctx, seg.Base+i); err != nil {
+				if !vacuumSupported(err) {
+					return done, fmt.Errorf("osd %d does not support OpRemove (upgrade it)", info.ID)
+				}
+				return done, err
+			}
+			done++
 		}
-		done++
 	}
 	// Persist the unlinks in one flush per pass per OSD.
 	if err := pp.Sync(ctx); err != nil {

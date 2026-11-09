@@ -20,6 +20,7 @@
 //	DELETE /v1/volumes/{name}
 //	PUT    /v1/volumes/{name}/qos               {"read_iops":...,"qos_template":...}
 //	PUT    /v1/volumes/{name}/quota             {"quota":"20G"}
+//	PUT    /v1/volumes/{name}/resize            {"size":"40G"} (grow only)
 //	PUT    /v1/volumes/{name}/import?offset=N   body: application/octet-stream
 //	POST   /v1/volumes/{name}/import            {"url":"http://...","offset":N}
 //	GET    /v1/volumes/{name}/export            reply: application/octet-stream
@@ -87,6 +88,7 @@ func newAdminServer(ms meta.Store, addr string, logger *log.Logger, raftSt *meta
 	mux.HandleFunc("DELETE /v1/volumes/{name}", a.handleDeleteVolume)
 	mux.HandleFunc("PUT /v1/volumes/{name}/qos", a.handleVolumeQoS)
 	mux.HandleFunc("PUT /v1/volumes/{name}/quota", a.handleVolumeQuota)
+	mux.HandleFunc("PUT /v1/volumes/{name}/resize", a.handleVolumeResize)
 	mux.HandleFunc("PUT /v1/volumes/{name}/import", a.handleImportBody)
 	mux.HandleFunc("POST /v1/volumes/{name}/import", a.handleImportURL)
 	mux.HandleFunc("GET /v1/volumes/{name}/export", a.handleExport)
@@ -531,6 +533,13 @@ func (a *adminAPI) handleVolumeQoS(w http.ResponseWriter, r *http.Request) {
 
 type quotaRequest struct {
 	Quota string `json:"quota"` // bytes or 40G form; "0" = cap at volume size
+}
+
+// resizeRequest grows a volume online. Shrink is refused (400): data
+// in the removed range would strand, and no guest filesystem expects
+// its disk to shrink under it.
+type resizeRequest struct {
+	Size string `json:"size"` // bytes or 40G form; must exceed the current size
 }
 
 // handleVolumeQuota edits a volume's allocation cap live (plan M0.4):
