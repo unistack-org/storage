@@ -71,7 +71,9 @@
       torn-tail устойчивость, replay, truncate) — задел под journaling Vitastor-типа
 - [x] NBD-сервер (`sds-nbd/nbd`, протокол NBD over TCP) — точка входа для QEMU/fio;
       **StoreBackend**: экспорт поверх pkg/store (`sdsd -store -direct [-preallocate]`),
-      split по 4M-границам, WRITE_ZEROES через punch hole (Linux), fallback zeroes на darwin
+      split по 4M-границам, WRITE_ZEROES через punch hole (Linux fallocate,
+      darwin fcntl(F_PUNCHHOLE) — APFS отдаёт блоки), выравнивание 4K +
+      zero-fill краёв, fallback zeroes только на платформах без punch
 - [x] Бенчмарк-клиент `sdsbench` (pipelined NBD, QD, латентные перцентили)
 - [ ] Приёмка фазы: `fio --ioengine=nbd/libaio` 4K randread ≥ базовой линии
       (замер локального файла как потолок), latency p99 < 1 мс на NVMe-хосте
@@ -480,11 +482,17 @@
 - [x] **`meta.ListVolumes` / `meta.DeleteVolume` + `Cluster.ListVolumes` /
       `Cluster.DeleteVolume`** — без них контрол не может ни показать тома, ни
       удалить диск ВМ. Удаление снимает регистрацию; объекты остаётся
-      чистить reclaim-проходом (ниже).
-- [ ] **Reclaim объектов удалённого тома** — проход «снести
-      `[OIDBase, OIDBase+NumObjects]` удалённого тома» по OSD с очередью и
-      приоритетом ниже клиентского I/O (их GC-механика, §6). Нужен для
-      зачистки полигона.
+      чистить проходом вакуума (ниже).
+- [x] **Вакуум (vacuum) объектов удалённого тома** — реализовано: тумбстон
+      `meta.VacuumRecord` + проход `Cluster.VacuumDeletedVolumes` по OSD
+      последовательно (по одному OSD, медленный trickle — ниже клиентского
+      I/O никогда); триггеры `unistorctl vacuum [ls|run]`, HTTP
+      `GET/POST /v1/vacuum`, автовакуум `unistord -vacuum-interval N`.
+      Пер-томный режим: `unistorctl vacuum run <vol>` / `POST
+      /v1/vacuum/{name}` — тумбстон удалённого тома либо live-vacuum
+      живого тома (punch полностью нулевых объектов по всей длине,
+      предикат — физическая аллокация через `OpStatInfo`, протокол v3).
+      Детали: `test-vm-plan.md` M1.4.
 - [ ] **Квота тома + честный ENOSPC**: запись за квотой → отдельный
       `StatusNoSpace` в `sdsnet`, ENOSPC от реплики не считается гибелью OSD
       (не в `noteFailure`), полный журнал → форс-флеш/EAGAIN вместо падения;

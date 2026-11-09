@@ -19,10 +19,10 @@ func TestClusterTwoVolumeIsolation(t *testing.T) {
 	defer cancel()
 
 	const size = 64 << 20
-	if _, err := c.cl.CreateVolume(ctx, "vm-a", size, 3, 0, 64, "data"); err != nil {
+	if _, err := c.cl.CreateVolume(ctx, "vm-a", size, 0, 3, 0, 64, "data"); err != nil {
 		t.Fatalf("CreateVolume vm-a: %v", err)
 	}
-	if _, err := c.cl.CreateVolume(ctx, "vm-b", size, 3, 0, 64, "data"); err != nil {
+	if _, err := c.cl.CreateVolume(ctx, "vm-b", size, 0, 3, 0, 64, "data"); err != nil {
 		t.Fatalf("CreateVolume vm-b: %v", err)
 	}
 	a, err := c.cl.OpenVolume(ctx, "vm-a")
@@ -103,7 +103,7 @@ func TestClusterVolumeListDelete(t *testing.T) {
 	defer cancel()
 
 	for _, n := range []string{"vm-b", "vm-a"} {
-		if _, err := c.cl.CreateVolume(ctx, n, 8<<20, 3, 0, 64, "data"); err != nil {
+		if _, err := c.cl.CreateVolume(ctx, n, 8<<20, 0, 3, 0, 64, "data"); err != nil {
 			t.Fatalf("CreateVolume %s: %v", n, err)
 		}
 	}
@@ -120,7 +120,7 @@ func TestClusterVolumeListDelete(t *testing.T) {
 	if _, err := c.cl.OpenVolume(ctx, "vm-a"); err == nil {
 		t.Fatal("open after delete succeeded")
 	}
-	if err := c.cl.DeleteVolume(ctx, "vm-a"); err == nil {
-		t.Fatal("double delete reported success")
+	if err := c.cl.DeleteVolume(ctx, "vm-a"); err != nil {
+		t.Fatal("double delete reported failure (delete is idempotent)")
 	}
 }

@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"os"
 	"sync"
 	"testing"
 	"time"
@@ -15,13 +16,14 @@ import (
 // memBackend duplicates the sdsnet test backend (tests can't import
 // test helpers across packages).
 type memBackend struct {
-	mu   sync.Mutex
-	data map[[2]uint64][]byte
-	size uint64
+	mu    sync.Mutex
+	data  map[[2]uint64][]byte
+	size  uint64
+	sizes map[uint64]uint64 // oid -> high-water mark of writes
 }
 
 func newMemBackend(size uint64) *memBackend {
-	return &memBackend{data: map[[2]uint64][]byte{}, size: size}
+	return &memBackend{data: map[[2]uint64][]byte{}, size: size, sizes: map[uint64]uint64{}}
 }
 
 func (m *memBackend) Size() uint64 { return m.size }
@@ -56,6 +58,9 @@ func (m *memBackend) ReadAt(_ context.Context, oid, off uint64, p []byte) (int, 
 func (m *memBackend) WriteAt(_ context.Context, oid, off uint64, p []byte) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if end := off + uint64(len(p)); end > m.sizes[oid] {
+		m.sizes[oid] = end
+	}
 	n := 0
 	for n < len(p) {
 		chunk := off >> 12
@@ -82,6 +87,27 @@ func (m *memBackend) WriteZeroes(ctx context.Context, oid, off, n uint64, _ bool
 }
 
 func (m *memBackend) Sync(context.Context) error { return nil }
+
+func (m *memBackend) Remove(_ context.Context, oid uint64) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for k := range m.data {
+		if k[0] == oid {
+			delete(m.data, k)
+		}
+	}
+	delete(m.sizes, oid)
+	return nil
+}
+
+func (m *memBackend) Stat(_ context.Context, oid uint64) (uint64, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if n, ok := m.sizes[oid]; ok {
+		return n, nil
+	}
+	return 0, os.ErrNotExist
+}
 
 // startReplica boots an sdsnet server; returns its address.
 func startReplica(t *testing.T) (*sdsnet.Server, Target) {

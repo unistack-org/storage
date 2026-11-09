@@ -6,15 +6,35 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 )
+
+// newTestRing builds a ring for tests and skips the test where the real
+// io_uring syscall is blocked (e.g. containers whose default seccomp
+// profile denies io_uring_setup → ENOSYS). On other platforms New is the
+// portable worker-pool implementation, so tests run unchanged.
+func newTestRing(t *testing.T, entries int) Ring {
+	t.Helper()
+	ring, err := New(entries)
+	if err != nil {
+		if errors.Is(err, syscall.ENOSYS) {
+			t.Skipf("io_uring unavailable: %v", err)
+		}
+		t.Fatal(err)
+	}
+	return ring
+}
 
 // TestRingRoundtrip exercises whichever implementation the platform
 // provides: io_uring on Linux, the worker pool elsewhere.
 func TestRingRoundtrip(t *testing.T) {
 	ring, err := New(16)
 	if err != nil {
+		if errors.Is(err, syscall.ENOSYS) {
+			t.Skipf("io_uring unavailable: %v", err)
+		}
 		t.Fatal(err)
 	}
 	path := filepath.Join(t.TempDir(), "obj")
@@ -75,10 +95,7 @@ func TestRingRoundtrip(t *testing.T) {
 }
 
 func TestRingConcurrent(t *testing.T) {
-	ring, err := New(64)
-	if err != nil {
-		t.Fatal(err)
-	}
+	ring := newTestRing(t, 64)
 	defer ring.Close()
 	path := filepath.Join(t.TempDir(), "many")
 	f, err := os.Create(path)
@@ -151,16 +168,13 @@ func TestRingConcurrent(t *testing.T) {
 }
 
 func TestRingClosePending(t *testing.T) {
-	ring, err := New(8)
-	if err != nil {
-		t.Fatal(err)
-	}
+	ring := newTestRing(t, 8)
 	// Submit to a closed ring fires Done with ErrClosed.
 	if err := ring.Close(); err != nil {
 		t.Fatal(err)
 	}
 	done := make(chan error, 1)
-	err = ring.Submit([]Op{{Buf: make([]byte, 4), Done: func(_ int, err error) { done <- err }}})
+	err := ring.Submit([]Op{{Buf: make([]byte, 4), Done: func(_ int, err error) { done <- err }}})
 	if !errors.Is(err, ErrClosed) {
 		t.Fatalf("Submit after Close = %v, want ErrClosed", err)
 	}

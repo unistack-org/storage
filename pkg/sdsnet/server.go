@@ -10,6 +10,9 @@ import (
 	"os"
 	"sync"
 	"sync/atomic"
+	"syscall"
+
+	"github.com/unistack-org/storage/pkg/qos"
 )
 
 // Backend is the storage a Server exposes over the wire. store.Backend
@@ -26,6 +29,23 @@ type Backend interface {
 	WriteZeroes(ctx context.Context, oid uint64, off uint64, n uint64, sparse bool) error
 	// Sync persists prior writes.
 	Sync(ctx context.Context) error
+	// Remove deletes the object; a missing object is not an error
+	// (vacuum vacuums idempotently).
+	Remove(ctx context.Context, oid uint64) error
+	// Stat returns the object's size, or os.ErrNotExist when the
+	// object is absent (recovery uses it to find thin/missing
+	// replicas; unlike store.Lookup it never creates).
+	Stat(ctx context.Context, oid uint64) (uint64, error)
+}
+
+// statInfoer is the optional Backend extension for allocated-byte
+// accounting (OpStatInfo, live vacuum). It returns the apparent size
+// and the bytes actually allocated on disk (st_blocks*512): a
+// punched/fully-sparse object has size>0 and alloc==0. Backends that
+// omit it get StatusNotSupp on OpStatInfo (per-op mixed-version
+// degradation), which is exactly how an old server behaves.
+type statInfoer interface {
+	StatInfo(ctx context.Context, oid uint64) (uint64, uint64, error)
 }
 
 // Server serves Backends over accepted connections. Every connection is
@@ -40,6 +60,17 @@ type Server struct {
 	Exports map[string]Backend
 	// ReadOnly rejects all mutating operations (status read-only).
 	ReadOnly bool
+	// Limits, when set, is consulted per handshake: it returns the QoS
+	// limiter pair for an export name (nil = unlimited). The server
+	// throttles every op of the connection through it. An OSD uses it
+	// to enforce per-volume classes (per-export = per-volume in the
+	// cluster data path, where exports are named by volume).
+	Limits func(export string) *qos.Pair
+	// Aggregate, when set, throttles the whole disk: every op of every
+	// connection passes it before the per-export pair. This is the
+	// "limit iops on the physical device" knob — the per-OSD ceiling
+	// that keeps one noisy volume from starving its neighbours.
+	Aggregate *qos.Pair
 	// Logf receives connection lifecycle and request errors (may be nil).
 	Logf func(format string, args ...any)
 
@@ -208,6 +239,12 @@ func (s *Server) handle(c net.Conn) {
 	rd := bufio.NewReaderSize(c, 128<<10)
 	wr := bufio.NewWriterSize(c, 128<<10)
 	ctx := context.Background()
+	// QoS pair for this export (nil = unlimited). Resolved once per
+	// connection: the handshake binds it, matching the export lookup.
+	var limits *qos.Pair
+	if s.Limits != nil {
+		limits = s.Limits(string(name))
+	}
 	// Per-connection reusable buffers: stack arrays passed to
 	// io.ReadFull/bufio.Writer escape (bufio.Writer.Write forwards to an
 	// io.Writer interface), costing one allocation per request. Reusing
@@ -230,6 +267,30 @@ func (s *Server) handle(c net.Conn) {
 				return
 			}
 			continue
+		}
+		// QoS: charge the disk aggregate, then this export's pair, for
+		// the request's payload. Throttling happens before dispatch, so
+		// the limiter paces the op the guest actually issued (reads paced
+		// on the read axis, writes/zeroes/trim on the write axis).
+		if s.Aggregate != nil || limits != nil {
+			status, proceed, alive := s.throttle(ctx, limits, &h)
+			if !alive {
+				return // client went away mid-wait
+			}
+			if !proceed {
+				// A rejected write must still consume its payload from
+				// the socket, or the request stream desyncs.
+				if h.Op == OpWrite && h.Length > 0 {
+					if _, err := io.CopyN(io.Discard, rd, int64(h.Length)); err != nil {
+						return
+					}
+				}
+				s.replyRW(wr, rw, &RespHeader{Seq: h.Seq, Status: status}, nil)
+				if wr.Flush() != nil {
+					return
+				}
+				continue
+			}
 		}
 		var payload []byte
 		if h.Op == OpWrite && h.Length > 0 {
@@ -264,6 +325,54 @@ func (rw *connRW) getBuf(n int) []byte {
 	return rw.b
 }
 
+// throttle charges the QoS limiters for one request: the disk
+// aggregate first (the device ceiling), then the export's pair.
+// proceed=false means reply with status (the export's limiter is
+// closed — the volume is going away); alive=false means the client
+// context was cancelled while waiting and the connection should drop.
+func (s *Server) throttle(ctx context.Context, limits *qos.Pair, h *ReqHeader) (status Status, proceed, alive bool) {
+	read := h.Op == OpRead || h.Op == OpStat || h.Op == OpStatInfo
+	n := uint64(h.Length)
+	if h.Op == OpSync || h.Op == OpRemove {
+		n = 0 // a flush or an unlink costs an op, not bytes
+	}
+	wait := func(lim *qos.Limiter) (ok, alive bool) {
+		if lim == nil {
+			return true, true
+		}
+		if err := lim.Wait(ctx, n); err != nil {
+			if errors.Is(err, qos.ErrClosed) {
+				return false, true
+			}
+			return false, false // ctx done: the client is gone
+		}
+		return true, true
+	}
+	if s.Aggregate != nil {
+		lim := s.Aggregate.Write
+		if read {
+			lim = s.Aggregate.Read
+		}
+		if ok, al := wait(lim); !al {
+			return 0, false, false
+		} else if !ok {
+			return StatusIO, false, true
+		}
+	}
+	if limits != nil {
+		lim := limits.Write
+		if read {
+			lim = limits.Read
+		}
+		if ok, al := wait(lim); !al {
+			return 0, false, false
+		} else if !ok {
+			return StatusIO, false, true
+		}
+	}
+	return StatusOK, true, true
+}
+
 // dispatch executes one request. The returned out slice (read payload)
 // is streamed by the caller right after the response header.
 func (s *Server) dispatch(ctx context.Context, backend Backend, h *ReqHeader, payload []byte, rw *connRW) (RespHeader, []byte) {
@@ -272,7 +381,7 @@ func (s *Server) dispatch(ctx context.Context, backend Backend, h *ReqHeader, pa
 	}
 	if s.ReadOnly {
 		switch h.Op {
-		case OpWrite, OpWriteZeroes, OpTrim, OpSync:
+		case OpWrite, OpWriteZeroes, OpTrim, OpSync, OpRemove:
 			return RespHeader{Seq: h.Seq, Status: StatusReadOnly}, nil
 		}
 	}
@@ -283,8 +392,10 @@ func (s *Server) dispatch(ctx context.Context, backend Backend, h *ReqHeader, pa
 	// authoritative replica, and the StatusStale reply is what drives
 	// clients to rebuild their map.
 	if min := s.minEpoch.Load(); min != 0 && h.Epoch < min {
+		// OpStat is deliberately not fenced: recovery diagnostics must
+		// work against any replica, and a stat cannot corrupt anything.
 		switch h.Op {
-		case OpRead, OpWrite, OpWriteZeroes, OpTrim, OpSync:
+		case OpRead, OpWrite, OpWriteZeroes, OpTrim, OpSync, OpRemove:
 			s.logf("sdsnet: stale request epoch %d < %d (op %s oid %d)", h.Epoch, min, h.Op, h.OID)
 			return RespHeader{Seq: h.Seq, Status: StatusStale, Value: uint64(min)}, nil
 		}
@@ -336,6 +447,30 @@ func (s *Server) dispatch(ctx context.Context, backend Backend, h *ReqHeader, pa
 			return RespHeader{Seq: h.Seq, Status: statusFromErr(err)}, nil
 		}
 		return RespHeader{Seq: h.Seq, Status: StatusOK}, nil
+
+	case OpRemove:
+		if err := backend.Remove(ctx, h.OID); err != nil {
+			return RespHeader{Seq: h.Seq, Status: statusFromErr(err)}, nil
+		}
+		return RespHeader{Seq: h.Seq, Status: StatusOK}, nil
+
+	case OpStat:
+		size, err := backend.Stat(ctx, h.OID)
+		if err != nil {
+			return RespHeader{Seq: h.Seq, Status: statusFromErr(err)}, nil
+		}
+		return RespHeader{Seq: h.Seq, Status: StatusOK, Value: size}, nil
+
+	case OpStatInfo:
+		si, ok := backend.(statInfoer)
+		if !ok {
+			return RespHeader{Seq: h.Seq, Status: StatusNotSupp}, nil
+		}
+		_, alloc, err := si.StatInfo(ctx, h.OID)
+		if err != nil {
+			return RespHeader{Seq: h.Seq, Status: statusFromErr(err)}, nil
+		}
+		return RespHeader{Seq: h.Seq, Status: StatusOK, Value: alloc}, nil
 	}
 	return RespHeader{Seq: h.Seq, Status: StatusNotSupp}, nil
 }
@@ -376,6 +511,10 @@ func statusFromErr(err error) Status {
 		return StatusEOF
 	case errors.Is(err, os.ErrNotExist):
 		return StatusNotFound
+	case errors.Is(err, syscall.ENOSPC), errors.Is(err, syscall.EDQUOT):
+		// store.ErrNoSpace wraps the raw errno, so a full disk (or a
+		// quota) reaches the client as StatusNoSpace, not StatusIO.
+		return StatusNoSpace
 	default:
 		return StatusIO
 	}

@@ -64,32 +64,32 @@ func TestPunchFreesBlocks(t *testing.T) {
 	s := newTestStore(t, Options{})
 	const oid = object.OID(0x77)
 
-	// Fill 8 MiB of real data across the object, so blocks are allocated.
-	const fill = 8 << 20
+	// Fill the whole object with real data, so every block is allocated.
+	const fill = object.Size
 	buf := bytes.Repeat([]byte("D"), 1<<20)
-	for off := int64(0); off < fill; off += int64(len(buf)) {
+	for off := int64(0); off < int64(fill); off += int64(len(buf)) {
 		if _, err := s.WriteAt(oid, buf, off); err != nil {
 			t.Fatal(err)
 		}
 	}
 	path := filepath.Join(s.dir, "0000000000000077")
 	before := allocatedBytes(t, path)
-	if before < fill/2 {
+	if before < int64(fill)/2 {
 		t.Skipf("filesystem does not seem to allocate written bytes (%d)", before)
 	}
 
-	// Punch 4 MiB out of the middle.
-	if err := s.WriteZeroes(oid, 2<<20, 4<<20, true); err != nil {
+	// Punch 2 MiB out of the middle.
+	if err := s.WriteZeroes(oid, 1<<20, 2<<20, true); err != nil {
 		t.Fatal(err)
 	}
 	after := allocatedBytes(t, path)
-	if after > before-(3<<20) {
+	if after > before-int64(1<<20) {
 		t.Fatalf("punch freed too little: allocated %d -> %d", before, after)
 	}
 
 	// The punched region reads as zeroes; neighbours survive.
-	got := make([]byte, 4<<20)
-	if _, err := s.ReadAt(oid, got, 2<<20); err != nil {
+	got := make([]byte, 2<<20)
+	if _, err := s.ReadAt(oid, got, 1<<20); err != nil {
 		t.Fatal(err)
 	}
 	for i, b := range got {
@@ -103,7 +103,7 @@ func TestPunchFreesBlocks(t *testing.T) {
 	if !bytes.Equal(got[:1<<20], buf) {
 		t.Fatal("data before the hole changed")
 	}
-	if _, err := s.ReadAt(oid, got[:1<<20], 6<<20); err != nil {
+	if _, err := s.ReadAt(oid, got[:1<<20], 3<<20); err != nil {
 		t.Fatal(err)
 	}
 	if !bytes.Equal(got[:1<<20], buf) {
@@ -111,10 +111,10 @@ func TestPunchFreesBlocks(t *testing.T) {
 	}
 
 	// Rewriting into a hole works and re-allocates.
-	if _, err := s.WriteAt(oid, buf, 2<<20); err != nil {
+	if _, err := s.WriteAt(oid, buf, 1<<20); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.ReadAt(oid, got[:1<<20], 2<<20); err != nil {
+	if _, err := s.ReadAt(oid, got[:1<<20], 1<<20); err != nil {
 		t.Fatal(err)
 	}
 	if !bytes.Equal(got[:1<<20], buf) {

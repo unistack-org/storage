@@ -110,8 +110,8 @@ func TestStoreBackendDirect(t *testing.T) {
 	if n, err := b.ReadAt(got, int64(2<<20-1024)); err != nil || n != len(p) || !bytes.Equal(got, p) {
 		t.Fatalf("ReadAt = %d, %v match=%v", n, err, bytes.Equal(got, p))
 	}
-	// WriteZeroes with punchHole=true must fall back to real zeroes on
-	// darwin (punch unsupported) — data reads back zero everywhere.
+	// WriteZeroes with punchHole=true zeroes the range on every platform
+	// (punched interior + zero-filled edges) — data reads back zero.
 	if err := b.WriteZeroes(int64(2<<20-1024), 1<<20, true); err != nil {
 		t.Fatalf("WriteZeroes: %v", err)
 	}

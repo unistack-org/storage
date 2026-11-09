@@ -117,11 +117,12 @@ func (b *FileBackend) Close() error {
 	return nil
 }
 
-// punchHole punches a sparse hole via an OS-specific helper. On platforms
-// without FALLOC_FL_PUNCH_HOLE it returns ErrTrimUnsupported, which the
-// Server maps to NBD's EOPNOTSUPP/ENOTSUP — a legal NBD response.
+// punchHole makes the range read as zeroes: the aligned interior is punched
+// (Linux fallocate, darwin fcntl(F_PUNCHHOLE)), the edges are zero-filled. On
+// platforms with no punch primitive at all it returns ErrTrimUnsupported,
+// which the Server maps to NBD's EOPNOTSUPP/ENOTSUP — a legal NBD response.
 func (b *FileBackend) punchHole(off, length int64) error {
-	return punchHole(b.f, off, length)
+	return punchRange(b.f, off, length)
 }
 
 // ErrTrimUnsupported is returned by platforms lacking hole-punch support.

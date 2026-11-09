@@ -22,6 +22,7 @@ import (
 
 	"github.com/unistack-org/storage/pkg/meta"
 	"github.com/unistack-org/storage/pkg/object"
+	"github.com/unistack-org/storage/pkg/qos"
 	"github.com/unistack-org/storage/pkg/sdsnet"
 	"github.com/unistack-org/storage/pkg/store"
 )
@@ -40,6 +41,17 @@ type Options struct {
 	// Direct / Preallocate are passed through to the object store.
 	Direct      bool
 	Preallocate bool
+	// Aggregate caps this disk (one store directory): every op from
+	// every client/export passes it before touching the store. This is
+	// the "limit iops on the NVMe" knob that keeps one volume from
+	// starving its neighbours (nil = unlimited).
+	Aggregate *qos.Pair
+	// Limits is consulted per connection handshake: it returns the
+	// limiter pair for an export name (nil = unlimited). In `-export`
+	// mode (one named volume per sdsnet server) it enforces the
+	// per-volume class at the disk; in cluster mode exports share the
+	// anonymous name and per-volume limits live in the clients.
+	Limits func(export string) *qos.Pair
 	// Logf receives informational messages (nil = silent).
 	Logf func(format string, args ...any)
 }
@@ -48,7 +60,8 @@ type Options struct {
 type Daemon struct {
 	opts Options
 	srv  *sdsnet.Server
-	addr string // resolved listen address (set by Run)
+	addr string       // resolved listen address (set by Run)
+	st   *store.Store // object store (set by Run)
 
 	mu       sync.Mutex
 	uuid     string
@@ -97,11 +110,14 @@ func (d *Daemon) Run(ctx context.Context) error {
 
 	d.mu.Lock()
 	d.addr = addr
+	d.st = st
 	d.mu.Unlock()
 
 	srv := &sdsnet.Server{
-		Backend: &objectBackend{st: st},
-		Logf:    d.opts.Logf,
+		Backend:   &objectBackend{st: st},
+		Logf:      d.opts.Logf,
+		Aggregate: d.opts.Aggregate,
+		Limits:    d.opts.Limits,
 	}
 	d.mu.Lock()
 	d.srv = srv
@@ -112,9 +128,30 @@ func (d *Daemon) Run(ctx context.Context) error {
 		return err
 	}
 
-	if err := d.register(); err != nil {
-		return fmt.Errorf("osd: register: %w", err)
-	}
+	// Registration is a meta write: on a raft cluster this node may be a
+	// follower (writes go to the leader) and the leader may not be
+	// elected yet at boot. Serve the data plane immediately and register
+	// in the background with a retry, so an OSD on a node that is not
+	// the leader still joins as soon as the write succeeds.
+	go func() {
+		for {
+			err := d.register()
+			if err == nil {
+				return
+			}
+			if meta.IsReadOnly(err) {
+				// No quorum / not the leader: keep trying, this is
+				// expected before the cluster has a leader.
+			} else {
+				d.opts.Logf("osd: register: %v", err)
+			}
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(200 * time.Millisecond):
+			}
+		}
+	}()
 
 	// Epoch fence from the map epoch: bump MinEpoch whenever a newer
 	// map lands in meta.
@@ -233,7 +270,7 @@ func (d *Daemon) loadOrCreateUUID() error {
 	return nil
 }
 
-// Addr returns the resolved listen address.
+// Addr returns the resolved listen address (valid once Run is serving).
 func (d *Daemon) Addr() string {
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -251,6 +288,21 @@ func (d *Daemon) Fence() uint32 {
 		return 0
 	}
 	return d.srv.MinEpoch()
+}
+
+// DiskStats reports the OSD's own disk accounting for the status API:
+// bytes stored in object files, and the filesystem's free/total for the
+// store directory (ok=false when the directory is not open yet or the
+// filesystem cannot be queried).
+func (d *Daemon) DiskStats() (usage, free, total int64, ok bool) {
+	d.mu.Lock()
+	st := d.st
+	d.mu.Unlock()
+	if st == nil {
+		return 0, 0, 0, false
+	}
+	free, total, ok = st.DiskSpace()
+	return st.Usage(), free, total, ok
 }
 
 // Close stops the daemon. Safe to call repeatedly and concurrently.
@@ -294,3 +346,17 @@ func (b *objectBackend) WriteZeroes(_ context.Context, oid uint64, off uint64, n
 }
 
 func (b *objectBackend) Sync(_ context.Context) error { return b.st.Sync() }
+
+func (b *objectBackend) Remove(_ context.Context, oid uint64) error {
+	return b.st.Remove(object.OID(oid))
+}
+
+func (b *objectBackend) Stat(_ context.Context, oid uint64) (uint64, error) {
+	return b.st.Stat(object.OID(oid))
+}
+
+// StatInfo implements the statInfoer extension (OpStatInfo): apparent
+// size plus physically allocated bytes, straight from the store.
+func (b *objectBackend) StatInfo(_ context.Context, oid uint64) (uint64, uint64, error) {
+	return b.st.StatInfo(object.OID(oid))
+}

@@ -1,4 +1,4 @@
-// Command sdsbench is a benchmark client for the sdsd NBD server.
+// Command sdsbench is a benchmark client for the unistord NBD server.
 //
 // It performs the newstyle handshake (OPT_GO with structured replies, like
 // the kernel and QEMU do), then pipelines READ/WRITE requests at a
@@ -58,7 +58,7 @@ const (
 )
 
 func main() {
-	addr := flag.String("addr", "127.0.0.1:10809", "sdsd address")
+	addr := flag.String("addr", "127.0.0.1:10809", "unistord address")
 	export := flag.String("export", "vol0", "export name")
 	rw := flag.String("rw", "randread", "read | seqread | randread | write | seqwrite | randwrite")
 	bs := flag.String("bs", "4K", "block size (e.g. 4K, 1M)")

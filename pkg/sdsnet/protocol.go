@@ -21,7 +21,12 @@ import (
 )
 
 // Protocol version. Bumped only for incompatible framing changes.
-const Version = 1
+// Version 2 added OpRemove and OpStat (vacuum / recovery support);
+// version 3 added OpStatInfo (live vacuum needs the physically
+// allocated size, not the apparent one). Servers answer StatusNotSupp
+// for ops they do not implement, so a mixed-version cluster degrades
+// per-op, not per-connection.
+const Version = 3
 
 // Header sizes (bytes).
 const (
@@ -43,6 +48,9 @@ const (
 	OpWriteZeroes // zeroes [Offset, Offset+Length); FlagsHole requests sparse
 	OpTrim        // punch a hole (sparse zeroes)
 	OpSync        // persist everything prior to this request
+	OpRemove      // delete the object (vacuum of deleted-volume garbage)
+	OpStat        // does the object exist? response value = file size
+	OpStatInfo    // does the object exist? response value = allocated bytes
 )
 
 func (o Op) String() string {
@@ -59,6 +67,12 @@ func (o Op) String() string {
 		return "trim"
 	case OpSync:
 		return "sync"
+	case OpRemove:
+		return "remove"
+	case OpStat:
+		return "stat"
+	case OpStatInfo:
+		return "stat_info"
 	}
 	return fmt.Sprintf("op(%d)", uint8(o))
 }
@@ -84,6 +98,7 @@ const (
 	StatusStale           // request epoch below the server's minimum epoch
 	StatusUnknown         // export name not served by this server
 	StatusNotFound        // object does not exist (thin provisioning)
+	StatusNoSpace         // target is out of space (write refused, data intact)
 )
 
 func (s Status) String() string {
@@ -108,6 +123,8 @@ func (s Status) String() string {
 		return "unknown export"
 	case StatusNotFound:
 		return "object missing"
+	case StatusNoSpace:
+		return "no space"
 	}
 	return fmt.Sprintf("status(%d)", uint32(s))
 }

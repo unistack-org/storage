@@ -2,26 +2,27 @@
 
 Модуль `github.com/unistack-org/sds-nbd`: сервер протокола
 [NBD (Network Block Device)](https://github.com/NetworkBlockDevice/nbd/blob/master/doc/proto.md)
-на чистом stdlib Go (без внешних зависимостей) + демон `sdsd`.
+на чистом stdlib Go (без внешних зависимостей) + демон `unistord`.
 
 Назначение (фаза 4a роадмапа): отдать блок-устройство клиенту QEMU так,
 чтобы внутри виртуалки оно появилось как **`/dev/nvme0n1`**:
 
 ```
-гость (Linux) ── /dev/nvme0n1 ──> QEMU NVMe-эмуляция ──> blockdev nbd ── TCP ──> sdsd (Go) ──> файл/устройство на хосте
+гость (Linux) ── /dev/nvme0n1 ──> QEMU NVMe-эмуляция ──> blockdev nbd ── TCP ──> unistord (Go) ──> файл/устройство на хосте
 ```
 
 ## Быстрый старт
 
 ```sh
 cd storage/sds-nbd
-GOWORK=off go build -o sdsd ./cmd/sdsd
+GOWORK=off go build -o unistord ./cmd/unistord
 
 # экспорт vol0 = файл 1 GiB (разрежённый)
-./sdsd -listen 127.0.0.1:10809 -export vol0=/var/lib/sdsd/vol0.img:1G
+./unistord -listen 127.0.0.1:10809 -export vol0=/var/lib/unistord/vol0.img:1G
 
-# на macOS (dev-хост) отключить TRIM/WRITE_ZEROES (нет hole punching):
-./sdsd -listen 127.0.0.1:10809 -export vol0=/tmp/vol0.img:1G \
+# на macOS TRIM/WRITE_ZEROES работают (fcntl F_PUNCHHOLE на APFS);
+# отключаются флагами, если нужно:
+./unistord -listen 127.0.0.1:10809 -export vol0=/tmp/vol0.img:1G \
        -trim=false -write-zeroes=false
 ```
 
@@ -77,8 +78,9 @@ echo secret > /mnt/secret.txt && sync && umount /mnt
   LIST_META/SET_META/STARTTLS/EXTENDED_HEADERS — вежливый отказ (QEMU
   корректно деградирует).
 - Transmission: READ, WRITE (+FUA→fsync), FLUSH, DISC; TRIM/WRITE_ZEROES —
-  при включённых флагах (Linux: `fallocate punches`; на других ОС флаги
-  выключают). BLOCK_STATUS — отказ (meta-контекстов нет).
+  при включённых флагах (Linux: `fallocate punches`, macOS: `F_PUNCHHOLE`;
+  на прочих ОС флаги выключают — zero-fill). BLOCK_STATUS — отказ
+  (meta-контекстов нет).
 - Все ответы передачи учитывают согласованный формат: после
   STRUCTURED_REPLY **каждый** ответ (включая WRITE/FLUSH/TRIM и ошибки)
   идёт structured-чанками; simple-ответ на WRITE QEMU считает протокольной
@@ -94,4 +96,5 @@ echo secret > /mnt/secret.txt && sync && umount /mnt
 - NVMe-эмуляция QEMU даёт «честный» `/dev/nvme*` в госте, но с лишними
   копированиями; целевой путь фазы 4b — vhost-user / vfio-user (см.
   `todos/roadmap.md`).
-- Продакшн-платформа Linux (io_uring, hole punching); macOS — dev-хост.
+- Продакшн-платформа Linux (io_uring); macOS — dev-хост, hole punching
+  там тоже работает (APFS `F_PUNCHHOLE`).

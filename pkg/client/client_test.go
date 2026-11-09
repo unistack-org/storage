@@ -13,6 +13,7 @@ import (
 	"github.com/unistack-org/storage/pkg/meta"
 	"github.com/unistack-org/storage/pkg/object"
 	"github.com/unistack-org/storage/pkg/osd"
+	"github.com/unistack-org/storage/pkg/sdsnet"
 )
 
 // map3 is a three-host rep3 map (one osd per host): every pg row spans
@@ -92,6 +93,7 @@ func newCluster(tb testing.TB, n int) *cluster {
 	}
 	c := &cluster{t: t, meta: m, dir: dir}
 	cctx, cancel := context.WithCancel(context.Background())
+	var runs []chan error
 	t.Cleanup(func() {
 		cancel()
 		for _, d := range c.daems {
@@ -100,13 +102,11 @@ func newCluster(tb testing.TB, n int) *cluster {
 			}
 			d.Close()
 		}
-		for _, d := range c.daems {
-			if d == nil {
-				continue
-			}
-			if err := d.Run(context.Background()); err != nil && err != context.Canceled {
-				t.Logf("daemon run: %v", err)
-			}
+		// Wait for every Run to return (its defers close the store and
+		// listener) before t.TempDir() removes the data dirs; re-running
+		// Run here would recreate files during removal and fail on Linux.
+		for _, rc := range runs {
+			<-rc
 		}
 	})
 	for i := 0; i < n; i++ {
@@ -122,6 +122,7 @@ func newCluster(tb testing.TB, n int) *cluster {
 		c.daems = append(c.daems, d)
 		errc := make(chan error, 1)
 		go func() { errc <- d.Run(cctx) }()
+		runs = append(runs, errc)
 		// Wait for registration in meta.
 		deadline := time.Now().Add(5 * time.Second)
 		for {
@@ -180,7 +181,7 @@ func TestClusterVolumeRoundTrip(t *testing.T) {
 	defer cancel()
 
 	const size = 128 << 20 // 128 MiB = 32 objects
-	if _, err := c.cl.CreateVolume(ctx, "vm0", size, 3, 0, 64, "data"); err != nil {
+	if _, err := c.cl.CreateVolume(ctx, "vm0", size, 0, 3, 0, 64, "data"); err != nil {
 		t.Fatalf("CreateVolume: %v", err)
 	}
 	v, err := c.cl.OpenVolume(ctx, "vm0")
@@ -252,7 +253,7 @@ func TestClusterQuorumKillOne(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	if _, err := c.cl.CreateVolume(ctx, "vm0", 64<<20, 3, 0, 64, "data"); err != nil {
+	if _, err := c.cl.CreateVolume(ctx, "vm0", 64<<20, 0, 3, 0, 64, "data"); err != nil {
 		t.Fatalf("CreateVolume: %v", err)
 	}
 	v, err := c.cl.OpenVolume(ctx, "vm0")
@@ -294,7 +295,7 @@ func TestClusterStaleEpochRefresh(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	if _, err := c.cl.CreateVolume(ctx, "vm0", 64<<20, 3, 0, 64, "data"); err != nil {
+	if _, err := c.cl.CreateVolume(ctx, "vm0", 64<<20, 0, 3, 0, 64, "data"); err != nil {
 		t.Fatalf("CreateVolume: %v", err)
 	}
 	v, err := c.cl.OpenVolume(ctx, "vm0")
@@ -373,20 +374,20 @@ func TestClusterMinSizeCreation(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	if _, err := c.cl.CreateVolume(ctx, "bad-high", 1<<20, 3, 4, 64, "data"); err == nil {
+	if _, err := c.cl.CreateVolume(ctx, "bad-high", 1<<20, 0, 3, 4, 64, "data"); err == nil {
 		t.Fatal("min_size 4 with replicas 3 accepted")
 	}
-	if _, err := c.cl.CreateVolume(ctx, "bad-low", 1<<20, 3, -1, 64, "data"); err == nil {
+	if _, err := c.cl.CreateVolume(ctx, "bad-low", 1<<20, 0, 3, -1, 64, "data"); err == nil {
 		t.Fatal("negative min_size accepted")
 	}
-	spec, err := c.cl.CreateVolume(ctx, "def", 1<<20, 3, 0, 64, "data")
+	spec, err := c.cl.CreateVolume(ctx, "def", 1<<20, 0, 3, 0, 64, "data")
 	if err != nil {
 		t.Fatalf("CreateVolume default: %v", err)
 	}
 	if spec.MinSize != 2 {
 		t.Fatalf("default min_size = %d, want 2", spec.MinSize)
 	}
-	if spec, err = c.cl.CreateVolume(ctx, "one", 1<<20, 3, 1, 64, "data"); err != nil {
+	if spec, err = c.cl.CreateVolume(ctx, "one", 1<<20, 0, 3, 1, 64, "data"); err != nil {
 		t.Fatalf("CreateVolume min_size=1: %v", err)
 	}
 	if spec.MinSize != 1 {
@@ -400,7 +401,7 @@ func TestClusterMinSizeDegraded(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	if _, err := c.cl.CreateVolume(ctx, "vm0", 64<<20, 3, 1, 64, "data"); err != nil {
+	if _, err := c.cl.CreateVolume(ctx, "vm0", 64<<20, 0, 3, 1, 64, "data"); err != nil {
 		t.Fatalf("CreateVolume: %v", err)
 	}
 	v, err := c.cl.OpenVolume(ctx, "vm0")
@@ -415,7 +416,7 @@ func TestClusterMinSizeDegraded(t *testing.T) {
 
 	// vm1 uses the default quorum (2/3). Exercise it while all
 	// replicas are in.
-	if _, err := c.cl.CreateVolume(ctx, "vm1", 64<<20, 3, 0, 64, "data"); err != nil {
+	if _, err := c.cl.CreateVolume(ctx, "vm1", 64<<20, 0, 3, 0, 64, "data"); err != nil {
 		t.Fatalf("CreateVolume vm1: %v", err)
 	}
 	v1, err := c.cl.OpenVolume(ctx, "vm1")
@@ -486,7 +487,7 @@ func TestClusterOutTimeEvict(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	if _, err := c.cl.CreateVolume(ctx, "vm0", 64<<20, 3, 0, 64, "data"); err != nil {
+	if _, err := c.cl.CreateVolume(ctx, "vm0", 64<<20, 0, 3, 0, 64, "data"); err != nil {
 		t.Fatalf("CreateVolume: %v", err)
 	}
 	v, err := c.cl.OpenVolume(ctx, "vm0")
@@ -686,7 +687,14 @@ func TestClusterOutTimeRestore(t *testing.T) {
 // request redials.
 func (c *cluster) restartOSD(tb testing.TB, id int32) {
 	tb.Helper()
+	ctx := context.Background()
 	addr := c.daems[id].Addr()
+	// Shut the old daemon down first: its listener must be released
+	// before the replacement binds the same address, and any pooled
+	// connection the client still holds must stop serving (a live old
+	// daemon would answer writes to files deleted from disk behind its
+	// back, landing them in unlinked inodes).
+	c.daems[id].Close()
 	c.daems[id] = nil
 	d, err := osd.New(osd.Options{
 		ID: id, Addr: addr,
@@ -697,15 +705,32 @@ func (c *cluster) restartOSD(tb testing.TB, id int32) {
 		tb.Fatalf("osd %d restart: %v", id, err)
 	}
 	c.daems[id] = d
+	runErr := make(chan error, 1)
 	cctx, cancel := context.WithCancel(context.Background())
 	tb.Cleanup(cancel)
-	go func() { _ = d.Run(cctx) }()
+	go func() { runErr <- d.Run(cctx) }()
 	c.cl.dropPool(id)
 	if !waitFor(tb, 5*time.Second, func() bool {
-		_, err := meta.GetOSD(context.Background(), c.meta, id)
+		select {
+		case err := <-runErr:
+			tb.Fatalf("osd %d restart died: %v", id, err)
+			return true
+		default:
+		}
+		if _, err := meta.GetOSD(ctx, c.meta, id); err != nil {
+			return false
+		}
+		// BootedAt has second granularity, so probe the listener
+		// itself: the replacement daemon answers only once it is up
+		// on the address the old one released.
+		pp := sdsnet.NewPool(addr, "vol")
+		pctx, pcancel := context.WithTimeout(context.Background(), time.Second)
+		err := pp.Ping(pctx)
+		pcancel()
+		pp.Close()
 		return err == nil
 	}) {
-		tb.Fatalf("osd %d did not re-register", id)
+		tb.Fatalf("osd %d did not come back on %s", id, addr)
 	}
 }
 
@@ -718,7 +743,7 @@ func TestClusterHardSemanticsWaits(t *testing.T) {
 	if !c.cl.HardSemantics() {
 		t.Fatal("hard semantics must be the default")
 	}
-	if _, err := c.cl.CreateVolume(ctx, "vm0", 64<<20, 3, 0, 64, "data"); err != nil {
+	if _, err := c.cl.CreateVolume(ctx, "vm0", 64<<20, 0, 3, 0, 64, "data"); err != nil {
 		t.Fatalf("CreateVolume: %v", err)
 	}
 	v, err := c.cl.OpenVolume(ctx, "vm0")
@@ -792,7 +817,7 @@ func TestClusterHardSemanticsCancel(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	if _, err := c.cl.CreateVolume(ctx, "vm0", 64<<20, 3, 0, 64, "data"); err != nil {
+	if _, err := c.cl.CreateVolume(ctx, "vm0", 64<<20, 0, 3, 0, 64, "data"); err != nil {
 		t.Fatalf("CreateVolume: %v", err)
 	}
 	v, err := c.cl.OpenVolume(ctx, "vm0")
@@ -824,7 +849,7 @@ func TestClusterReadWaitsForTransports(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	if _, err := c.cl.CreateVolume(ctx, "vm0", 64<<20, 3, 0, 64, "data"); err != nil {
+	if _, err := c.cl.CreateVolume(ctx, "vm0", 64<<20, 0, 3, 0, 64, "data"); err != nil {
 		t.Fatalf("CreateVolume: %v", err)
 	}
 	v, err := c.cl.OpenVolume(ctx, "vm0")

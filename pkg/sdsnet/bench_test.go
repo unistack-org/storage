@@ -3,6 +3,7 @@ package sdsnet
 import (
 	"context"
 	"io"
+	"io/fs"
 	"net"
 	"runtime"
 	"testing"
@@ -30,7 +31,9 @@ func (z *zeroBackend) WriteAt(_ context.Context, oid, off uint64, p []byte) erro
 func (z *zeroBackend) WriteZeroes(context.Context, uint64, uint64, uint64, bool) error {
 	return nil
 }
-func (z *zeroBackend) Sync(context.Context) error { return nil }
+func (z *zeroBackend) Sync(context.Context) error                   { return nil }
+func (z *zeroBackend) Remove(context.Context, uint64) error         { return nil }
+func (z *zeroBackend) Stat(context.Context, uint64) (uint64, error) { return 0, fs.ErrNotExist }
 
 func benchServer(tb testing.TB) (string, *Server) {
 	tb.Helper()

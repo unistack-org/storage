@@ -139,12 +139,24 @@ func (s *DirStore) Put(_ context.Context, prefix, key string, value []byte, casR
 	if err != nil {
 		return 0, err
 	}
-	tmp := p + ".tmp"
-	if err := os.WriteFile(tmp, b, 0o644); err != nil {
+	// Unique temp name: two concurrent writers to the same key must not
+	// share one ".tmp" file (the loser's rename would fail with ENOENT
+	// after the winner consumed the shared temp).
+	tmp, err := os.CreateTemp(filepath.Dir(p), filepath.Base(p)+".tmp-")
+	if err != nil {
 		return 0, err
 	}
-	if err := os.Rename(tmp, p); err != nil {
-		os.Remove(tmp)
+	if _, err := tmp.Write(b); err != nil {
+		tmp.Close()
+		os.Remove(tmp.Name())
+		return 0, err
+	}
+	if err := tmp.Close(); err != nil {
+		os.Remove(tmp.Name())
+		return 0, err
+	}
+	if err := os.Rename(tmp.Name(), p); err != nil {
+		os.Remove(tmp.Name())
 		return 0, err
 	}
 	s.notify(prefix, key, "put", next)
@@ -206,6 +218,7 @@ type dirWatcher struct {
 	events chan Event
 	stop   chan struct{}
 	once   sync.Once
+	store  *DirStore
 
 	mu  sync.Mutex
 	rev map[string]int64 // last seen revision per key
@@ -218,6 +231,7 @@ func (s *DirStore) Watch(_ context.Context, prefix string) (Watcher, error) {
 		events: make(chan Event, 64),
 		stop:   make(chan struct{}),
 		rev:    map[string]int64{},
+		store:  s,
 	}
 	// Prime the baseline so the first poll only reports real changes.
 	w.scan(s)
@@ -280,6 +294,9 @@ func (w *dirWatcher) scan(s *DirStore) {
 
 // emit records the new revision and delivers the event without holding
 // the watcher lock (so a full buffer cannot deadlock a notify caller).
+// The stop check makes delivery safe after Stop: the events channel is
+// never closed (see Stop), so a racing notify can never send on a
+// closed channel.
 func (w *dirWatcher) emit(e Event) {
 	w.mu.Lock()
 	if e.Type == "put" {
@@ -297,9 +314,20 @@ func (w *dirWatcher) emit(e Event) {
 // Events implements Watcher.
 func (w *dirWatcher) Events() <-chan Event { return w.events }
 
-// Stop implements Watcher.
+// Stop implements Watcher. It unregisters the watcher from the store
+// and halts its poll loop. The events channel is deliberately NOT
+// closed: a notify() that already snapshotted this watcher may be about
+// to emit, and closing events would panic that writer. Consumers end
+// their read loops on their own context (the select in emit also drops
+// deliveries after stop), so no close is needed to unblock them.
 func (w *dirWatcher) Stop() {
-	w.once.Do(func() { close(w.stop); close(w.events) })
+	w.once.Do(func() {
+		close(w.stop)
+		s := w.store
+		s.mu.Lock()
+		delete(s.watch, w)
+		s.mu.Unlock()
+	})
 }
 
 // notify lets in-process watchers learn about a change immediately,
@@ -327,7 +355,9 @@ func (s *DirStore) Close() error {
 	}
 	s.closed = true
 	for w := range s.watch {
-		w.Stop()
+		// Inline stop: w.Stop() takes s.mu, which this loop holds.
+		// The once guard makes the duplicate Stop a no-op afterwards.
+		w.once.Do(func() { close(w.stop) })
 	}
 	s.watch = nil
 	return nil

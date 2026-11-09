@@ -3,6 +3,7 @@ package meta
 import (
 	"context"
 	"errors"
+	"sync"
 	"testing"
 	"time"
 )
@@ -207,4 +208,52 @@ func TestRecordsRoundTrip(t *testing.T) {
 	if err != nil || rec.Epoch != 10 {
 		t.Fatalf("LatestMap = %+v, %v", rec, err)
 	}
+}
+
+// Stop must make the store forget the watcher: a Put after Stop used to
+// deliver into a closed events channel and panic the writer.
+func TestWatchStopThenPut(t *testing.T) {
+	s := openStore(t)
+	ctx := context.Background()
+	w, err := s.Watch(ctx, "osds")
+	if err != nil {
+		t.Fatal(err)
+	}
+	w.Stop()
+	w.Stop() // idempotent
+	for i := 0; i < 200; i++ {
+		if _, err := s.Put(ctx, "osds", "1", []byte("x"), -1); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.Delete(ctx, "osds", "1", -1); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+// A racing Stop (from another goroutine, e.g. a volume closing) must
+// never panic a concurrent Put's notify: events is never closed.
+func TestWatchStopRaceWithPut(t *testing.T) {
+	s := openStore(t)
+	s.PollInterval = 5 * time.Millisecond
+	ctx := context.Background()
+	var wg sync.WaitGroup
+	for i := 0; i < 20; i++ {
+		wg.Add(2)
+		go func(i int) {
+			defer wg.Done()
+			w, err := s.Watch(ctx, "osds")
+			if err != nil {
+				return
+			}
+			time.Sleep(time.Duration(i%5) * time.Millisecond)
+			w.Stop()
+		}(i)
+		go func(i int) {
+			defer wg.Done()
+			_, _ = s.Put(ctx, "osds", "1", []byte("x"), -1)
+			_ = s.Delete(ctx, "osds", "1", -1)
+		}(i)
+	}
+	wg.Wait()
 }

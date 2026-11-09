@@ -18,10 +18,12 @@ import (
 	"bufio"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"hash/crc32"
 	"io"
 	"os"
 	"sync"
+	"syscall"
 )
 
 // HeaderSize is the per-record header length.
@@ -32,6 +34,23 @@ var crcTable = crc32.MakeTable(crc32.Castagnoli)
 // ErrCorrupt is returned when a record is present but fails its CRC.
 var ErrCorrupt = errors.New("journal: corrupt record")
 
+// ErrNoSpace means the journal's filesystem refused the append. It wraps
+// the raw errno so callers classify it with errors.Is(err, syscall.ENOSPC)
+// and the OSD maps it onto StatusNoSpace.
+//
+// A journal has no room to absorb a full disk: unlike an object write,
+// where the caller loses one 4 KiB chunk, a journal that fills mid-append
+// leaves the log position unknown. So the journal treats ENOSPC as fatal
+// for itself — see Failed — and refuses every later append instead of
+// appending into a buffer whose flush is guaranteed to fail. That is the
+// Vitastor lesson: the journal must never be allowed to fill, and when it
+// does, writes must stop loudly, not continue on a corrupt prefix.
+var ErrNoSpace = fmt.Errorf("journal: no space left on device: %w", syscall.ENOSPC)
+
+// journalFailed is the sticky cause recorded on an ENOSPC failure; every
+// later call returns it, so the reason is not lost after the first one.
+var errPoisonedPrefix = errors.New("journal: poisoned by an earlier write failure")
+
 // Journal is a durable append-only log. Append is safe for concurrent
 // use; records are serialised in seq order.
 type Journal struct {
@@ -40,6 +59,20 @@ type Journal struct {
 	w    *bufio.Writer
 	path string
 	seq  uint64
+	// failed is set once a write reaches the file and the filesystem
+	// refused it (ENOSPC). From then on the buffered content cannot be
+	// trusted to be durable, so the journal poisons: every Append and
+	// Flush/Sync returns the original cause.
+	failed error
+}
+
+// Failed reports the fatal journal error (currently ENOSPC), nil while
+// healthy. Callers use it to mark the OSD read-only / refuse writes:
+// a dead journal means the node must stop taking writes.
+func (j *Journal) Failed() error {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	return j.failed
 }
 
 // Open opens (creating if needed) the journal at path and recovers the
@@ -67,39 +100,74 @@ func Open(path string) (*Journal, error) {
 
 // Append writes one record and returns its sequence number. The data is
 // copied into the journal buffer; Sync (or Flush+Sync) makes it durable.
+// Once the journal has failed (Failed != nil) Append refuses immediately:
+// the buffer behind it cannot become durable.
 func (j *Journal) Append(payload []byte) (uint64, error) {
 	j.mu.Lock()
 	defer j.mu.Unlock()
+	if j.failed != nil {
+		return 0, j.failed
+	}
 	j.seq++
 	var hdr [HeaderSize]byte
 	binary.BigEndian.PutUint64(hdr[0:8], j.seq)
 	binary.BigEndian.PutUint32(hdr[8:12], uint32(len(payload)))
 	binary.BigEndian.PutUint32(hdr[12:16], crc32.Checksum(payload, crcTable))
 	if _, err := j.w.Write(hdr[:]); err != nil {
-		return 0, err
+		return 0, j.poison(err)
 	}
 	if _, err := j.w.Write(payload); err != nil {
-		return 0, err
+		return 0, j.poison(err)
 	}
 	return j.seq, nil
 }
 
+// poison records a write failure as the journal's fatal cause. bufio
+// reaches the file only when its buffer fills, Flush, or Sync run, so a
+// plain Append error is rare; when it happens it is the sticky bufio
+// error and equally fatal. ENOSPC is reported as ErrNoSpace.
+// Callers hold j.mu.
+func (j *Journal) poison(err error) error {
+	if j.failed == nil {
+		if errors.Is(err, syscall.ENOSPC) || errors.Is(err, syscall.EDQUOT) {
+			err = fmt.Errorf("%w (%s)", ErrNoSpace, j.path)
+		}
+		j.failed = err
+	}
+	return j.failed
+}
+
 // Flush moves buffered records to the OS (visible to Replay after a
-// process crash, not to a machine crash).
+// process crash, not to a machine crash). A failed Flush poisons the
+// journal: the log position is no longer known, so appends stop.
 func (j *Journal) Flush() error {
 	j.mu.Lock()
 	defer j.mu.Unlock()
-	return j.w.Flush()
+	if j.failed != nil {
+		return j.failed
+	}
+	if err := j.w.Flush(); err != nil {
+		return j.poison(err)
+	}
+	return nil
 }
 
-// Sync flushes and fsyncs: durable to machine crash.
+// Sync flushes and fsyncs: durable to machine crash. Like Flush, a
+// failure poisons the journal (ENOSPC surfaces here: bufio only reaches
+// the file when its 64 KiB buffer fills).
 func (j *Journal) Sync() error {
 	j.mu.Lock()
 	defer j.mu.Unlock()
-	if err := j.w.Flush(); err != nil {
-		return err
+	if j.failed != nil {
+		return j.failed
 	}
-	return j.f.Sync()
+	if err := j.w.Flush(); err != nil {
+		return j.poison(err)
+	}
+	if err := j.f.Sync(); err != nil {
+		return j.poison(err)
+	}
+	return nil
 }
 
 // Replay feeds every durable record to fn in seq order, stopping at the

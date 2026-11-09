@@ -27,6 +27,9 @@ func punchHole(f *os.File, off, length int64) error {
 	return nil
 }
 
+// punchSupported reports that this platform can punch holes.
+const punchSupported = true
+
 // errnoToNBDLinux encodes errno as the NBD wire code (negated errno), since
 // the NBD protocol defines the error field in terms of Linux errno.
 func errnoToNBDLinux(errno syscall.Errno) uint32 {

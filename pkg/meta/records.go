@@ -15,6 +15,9 @@ const (
 	// PrefixAlloc holds cluster-wide allocators; the "oids" key is the
 	// next free object id (see NextOIDBase).
 	PrefixAlloc = "alloc"
+	// PrefixQoSClasses holds named IOPS/bandwidth classes referenced by
+	// volume specs (per-user tiers).
+	PrefixQoSClasses = "qos"
 )
 
 // AllocOIDs is the allocator key for volume object-id ranges.
@@ -34,6 +37,14 @@ type OSDInfo struct {
 type VolumeSpec struct {
 	Name string `json:"name"`
 	Size uint64 `json:"size"` // logical bytes
+	// Quota caps the bytes the volume may actually allocate on the
+	// OSDs (thin provisioning, plan M0.4): a write that first touches
+	// a new object-granularity block beyond the cap fails with ENOSPC,
+	// a sparse trim that frees whole blocks gives room back. 0 means
+	// the quota equals Size (the volume can never hold more than its
+	// logical size). The counter is the per-volume allocation bitmap
+	// (allocmap prefix), not a per-OSD byte figure.
+	Quota uint64 `json:"quota,omitempty"`
 	// OIDBase is the first object id of the volume's private OID range.
 	// Objects of a volume are OIDBase+1 .. OIDBase+NumObjects(Size); OID
 	// OIDBase itself is reserved (mirrors the NilOID = 0 convention). The
@@ -51,6 +62,24 @@ type VolumeSpec struct {
 	Rule    string `json:"rule"` // crush rule name
 	PGNum   int    `json:"pg_num"`
 	Epoch   uint32 `json:"epoch"` // map epoch the volume was created/last rebalanced at
+	// QoS: sustained ceilings enforced by every client that opens the
+	// volume (so the limit travels with the volume, whoever touches it)
+	// and, for exports, by the OSD serving them. 0 on an axis =
+	// unlimited. An all-zero QoS is the admin class: operators,
+	// backup/restore, and the admin HTTP API are never throttled.
+	// QoSTemplate names a QoSClassRecord (the per-user tier): when set
+	// and the class exists, the class rates override the inline fields
+	// (OpenVolume resolves it).
+	QoSTemplate string `json:"qos_template,omitempty"`
+	ReadIOPS    uint64 `json:"read_iops,omitempty"`
+	ReadBPS     uint64 `json:"read_bps,omitempty"`
+	WriteIOPS   uint64 `json:"write_iops,omitempty"`
+	WriteBPS    uint64 `json:"write_bps,omitempty"`
+}
+
+// QoSed reports whether the spec carries any limit.
+func (v VolumeSpec) QoSed() bool {
+	return v.ReadIOPS != 0 || v.ReadBPS != 0 || v.WriteIOPS != 0 || v.WriteBPS != 0
 }
 
 // MapRecord stores one crush map generation.
@@ -239,4 +268,69 @@ func LatestMap(ctx context.Context, s Store) (MapRecord, error) {
 	}
 	var rec MapRecord
 	return rec, json.Unmarshal(b, &rec)
+}
+
+// QoSClassRecord is a named IOPS/bandwidth class (the "user tier" of
+// per-user limits): volumes reference classes by name via
+// VolumeSpec.QoSTemplate. 0 on an axis = unlimited there; an all-zero
+// class (or a missing record) is the admin class: no limits.
+type QoSClassRecord struct {
+	Name      string `json:"name"`
+	ReadIOPS  uint64 `json:"read_iops,omitempty"`
+	ReadBPS   uint64 `json:"read_bps,omitempty"`
+	WriteIOPS uint64 `json:"write_iops,omitempty"`
+	WriteBPS  uint64 `json:"write_bps,omitempty"`
+}
+
+// Pair converts the record into a qos-free limiter spec: the four rates.
+// (The meta package must not import qos; call sites build the pair.)
+func (r QoSClassRecord) Rates() (readIOPS, readBPS, writeIOPS, writeBPS uint64) {
+	return r.ReadIOPS, r.ReadBPS, r.WriteIOPS, r.WriteBPS
+}
+
+// PutQoSClass stores a class record.
+func PutQoSClass(ctx context.Context, s Store, rec QoSClassRecord) (int64, error) {
+	b, err := json.Marshal(rec)
+	if err != nil {
+		return 0, err
+	}
+	return s.Put(ctx, PrefixQoSClasses, rec.Name, b, -1)
+}
+
+// GetQoSClass reads one class record (ErrNotFound when absent: callers
+// treat a missing class as unlimited, never as an error at open time).
+func GetQoSClass(ctx context.Context, s Store, name string) (QoSClassRecord, error) {
+	var rec QoSClassRecord
+	b, _, err := s.Get(ctx, PrefixQoSClasses, name)
+	if err != nil {
+		return rec, err
+	}
+	err = json.Unmarshal(b, &rec)
+	return rec, err
+}
+
+// ListQoSClasses returns every class record.
+func ListQoSClasses(ctx context.Context, s Store) ([]QoSClassRecord, error) {
+	keys, err := s.List(ctx, PrefixQoSClasses)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]QoSClassRecord, 0, len(keys))
+	for _, k := range keys {
+		b, _, err := s.Get(ctx, PrefixQoSClasses, k)
+		if err != nil {
+			return nil, err
+		}
+		var rec QoSClassRecord
+		if err := json.Unmarshal(b, &rec); err != nil {
+			return nil, fmt.Errorf("meta: qos class %q: %w", k, err)
+		}
+		out = append(out, rec)
+	}
+	return out, nil
+}
+
+// DeleteQoSClass removes a class record.
+func DeleteQoSClass(ctx context.Context, s Store, name string) error {
+	return s.Delete(ctx, PrefixQoSClasses, name, -1)
 }

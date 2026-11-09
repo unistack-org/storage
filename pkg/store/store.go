@@ -41,6 +41,11 @@ var ErrNoSuchObject = fmt.Errorf("store: no such object: %w", fs.ErrNotExist)
 // 4 MiB, so in practice the aligned region covers the whole request.
 const punchAlign = 4096
 
+// PunchSupported reports whether this platform can punch holes
+// (FALLOC_FL_PUNCH_HOLE). Sparse WriteZeroes degrades to a zero-fill when
+// it is false.
+const PunchSupported = punchSupported
+
 // Options configures a Store.
 type Options struct {
 	// Direct requests O_DIRECT (Linux) / F_NOCACHE (darwin) on object
@@ -49,6 +54,16 @@ type Options struct {
 	// Preallocate fallocates each newly created object file to the full
 	// object size.
 	Preallocate bool
+	// MinFreeBytes refuses to create new objects when the filesystem has
+	// less than this many bytes free (0 = no check). It is a cheap
+	// guard-rail that fires *before* the kernel ENOSPC so a full disk is
+	// reported as "no space" (StatusNoSpace) with the OSD healthy,
+	// instead of mid-write corruption of the journal. With Preallocate
+	// the reservation is object.Size, so sizing this >= a few objects is
+	// enough on a quiet store.
+	MinFreeBytes int64
+	// Logf receives informational messages (nil = silent).
+	Logf func(format string, args ...any)
 }
 
 // Store is a directory of object files. It is safe for concurrent use.
@@ -70,6 +85,9 @@ type entry struct {
 func New(dir string, opts Options) (*Store, error) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, err
+	}
+	if opts.Logf == nil {
+		opts.Logf = func(string, ...any) {}
 	}
 	return &Store{dir: dir, opts: opts, files: map[object.OID]*entry{}}, nil
 }
@@ -103,8 +121,31 @@ func (s *Store) openSlow(oid object.OID, create bool) (*entry, error) {
 		return e, nil
 	}
 	p := s.path(oid)
+	_, statErr := os.Stat(p)
+	exists := statErr == nil
+	if create && s.opts.MinFreeBytes > 0 && !exists {
+		// A brand-new object reserves (at least logically) a full
+		// object of space. Refuse before the filesystem does, so the
+		// OSD answers "no space" with a healthy process. Existing
+		// objects skip the guard: a full disk must never lock a VM
+		// out of data it already owns (and the real ENOSPC from the
+		// kernel below is the authoritative check for them). The
+		// check races with other writers.
+		if f, err := storeDirStat(s.dir); err == nil {
+			avail, ok := fileAvail(f)
+			f.Close()
+			if ok && avail < s.opts.MinFreeBytes {
+				s.opts.Logf("store: refusing to create %s: %d bytes free, min %d",
+					p, avail, s.opts.MinFreeBytes)
+				return nil, ErrNoSpace
+			}
+		}
+	}
 	f, err := s.openFile(p, create)
 	if err != nil {
+		if isNoSpace(err) {
+			return nil, ErrNoSpace
+		}
 		return nil, err
 	}
 	st, err := f.Stat()
@@ -114,6 +155,9 @@ func (s *Store) openSlow(oid object.OID, create bool) (*entry, error) {
 	}
 	if create && st.Size() < int64(object.Size) {
 		if err := s.grow(f, object.Size); err != nil {
+			if isNoSpace(err) {
+				err = ErrNoSpace
+			}
 			f.Close()
 			return nil, err
 		}
@@ -153,6 +197,9 @@ func (s *Store) WriteAt(oid object.OID, p []byte, off int64) (int, error) {
 		return 0, err
 	}
 	n, err := e.f.WriteAt(p, off)
+	if isNoSpace(err) {
+		err = ErrNoSpace
+	}
 	// A write past EOF grew the object.
 	s.mu.Lock()
 	if grow := off + int64(n) - e.size; grow > 0 {
@@ -221,6 +268,9 @@ func (s *Store) zeroFill(e *entry, off, n uint64) error {
 			ch = n - written
 		}
 		if _, err := e.f.WriteAt(buf[:ch], int64(off+written)); err != nil {
+			if isNoSpace(err) {
+				err = ErrNoSpace
+			}
 			return err
 		}
 		written += ch
@@ -274,6 +324,37 @@ func (e *entry) sizeLookup() int64 {
 	return e.size
 }
 
+// Stat reports the size of an existing object without creating it.
+// It returns fs.ErrNotExist (wrapped by os.Stat) when the object is
+// absent, which is what recovery uses to tell a thin object from a
+// stored one. Unlike Lookup it never creates a file.
+func (s *Store) Stat(oid object.OID) (uint64, error) {
+	fi, err := os.Stat(s.path(oid))
+	if err != nil {
+		return 0, err
+	}
+	if fi.IsDir() {
+		return 0, fs.ErrNotExist
+	}
+	return uint64(fi.Size()), nil
+}
+
+// StatInfo reports both the apparent size and the physically allocated
+// bytes (st_blocks*512) of an existing object. Vacuum uses the pair to
+// tell a punched (freed) object from one that still occupies blocks:
+// the apparent size alone cannot, because a punch keeps the size and a
+// preallocated thin object reports the full size.
+func (s *Store) StatInfo(oid object.OID) (size, alloc uint64, err error) {
+	fi, err := os.Stat(s.path(oid))
+	if err != nil {
+		return 0, 0, err
+	}
+	if fi.IsDir() {
+		return 0, 0, fs.ErrNotExist
+	}
+	return uint64(fi.Size()), uint64(fileAllocated(fi)), nil
+}
+
 // Lookup returns the cached handle for an existing object (creating it
 // when needed) so callers can perform file-level operations (hole
 // punching, fcntl) outside the ReadAt/WriteAt API.
@@ -306,6 +387,18 @@ func (s *Store) Usage() int64 {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.usage
+}
+
+// DiskSpace reports the bytes the store directory can still grow into
+// (filesystem free space) and the filesystem size. ok=false when the
+// filesystem cannot be queried.
+func (s *Store) DiskSpace() (free, total int64, ok bool) {
+	f, err := storeDirStat(s.dir)
+	if err != nil {
+		return 0, 0, false
+	}
+	defer f.Close()
+	return fileSpace(f)
 }
 
 // Close syncs and closes all cached files.

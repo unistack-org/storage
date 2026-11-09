@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"io/fs"
 	"net"
 	"strings"
 	"sync"
@@ -88,12 +89,13 @@ func TestHandshakeRoundTrip(t *testing.T) {
 type memBackend struct {
 	mu   sync.Mutex
 	data map[[2]uint64][]byte // (oid, aligned chunk) → bytes; key: oid, off>>12
+	live map[uint64]bool      // oids that have been written (for Stat)
 	size uint64
 	sync sync.Mutex
 }
 
 func newMemBackend(size uint64) *memBackend {
-	return &memBackend{data: map[[2]uint64][]byte{}, size: size}
+	return &memBackend{data: map[[2]uint64][]byte{}, live: map[uint64]bool{}, size: size}
 }
 
 func (m *memBackend) Size() uint64 { return m.size }
@@ -128,6 +130,7 @@ func (m *memBackend) ReadAt(_ context.Context, oid, off uint64, p []byte) (int, 
 func (m *memBackend) WriteAt(_ context.Context, oid, off uint64, p []byte) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	m.live[oid] = true
 	n := 0
 	for n < len(p) {
 		chunk := off >> 12
@@ -149,11 +152,61 @@ func (m *memBackend) WriteAt(_ context.Context, oid, off uint64, p []byte) error
 	return nil
 }
 
-func (m *memBackend) WriteZeroes(_ context.Context, oid, off, n uint64, _ bool) error {
+func (m *memBackend) WriteZeroes(_ context.Context, oid, off, n uint64, sparse bool) error {
+	if sparse {
+		// Model a punch: drop the chunks (they read back as zeroes,
+		// alloc drops) while the object itself stays "live" — exactly
+		// a sparse file of size>0 and alloc 0.
+		m.mu.Lock()
+		defer m.mu.Unlock()
+		m.live[oid] = true
+		for o := off &^ 4095; o < off+n; o += 4096 {
+			delete(m.data, [2]uint64{oid, o >> 12})
+		}
+		return nil
+	}
 	return m.WriteAt(context.Background(), oid, off, make([]byte, n))
 }
 
+// StatInfo models the store: chunks in play are the allocated bytes;
+// a punched object is live with zero chunks (size>0, alloc==0).
+func (m *memBackend) StatInfo(_ context.Context, oid uint64) (uint64, uint64, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if !m.live[oid] {
+		return 0, 0, fs.ErrNotExist
+	}
+	var chunks uint64
+	for k := range m.data {
+		if k[0] == oid {
+			chunks++
+		}
+	}
+	return m.size, chunks * 4096, nil
+}
+
 func (m *memBackend) Sync(context.Context) error { return nil }
+
+func (m *memBackend) Remove(_ context.Context, oid uint64) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.live, oid)
+	for k := range m.data {
+		if k[0] == oid {
+			delete(m.data, k)
+		}
+	}
+	return nil
+}
+
+func (m *memBackend) Stat(_ context.Context, oid uint64) (uint64, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if !m.live[oid] {
+		return 0, fs.ErrNotExist
+	}
+	return m.size, nil
+}
 
 // startServer boots a Server on a random port with a mem backend.
 // The server must not log through t: its goroutines can outlive the
@@ -287,6 +340,81 @@ func TestReadOnly(t *testing.T) {
 	buf := make([]byte, 4)
 	if _, err := cc.Read(ctx, 1, 0, buf); err != nil {
 		t.Fatalf("read on read-only: %v", err)
+	}
+}
+
+// TestRemoveStatOps covers the vacuum/recovery ops: OpStat sees a
+// written object and reports thin (NotFound → exists=false) for an
+// absent one; OpRemove deletes it, is idempotent, and a remove on a
+// read-only server is refused while a stat is served.
+func TestRemoveStatOps(t *testing.T) {
+	be := newMemBackend(1 << 20)
+	addr, shutdown := startServer(t, be)
+	defer shutdown()
+
+	cc, err := Dial(addr, "vol0", 2*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cc.Close()
+	ctx := context.Background()
+
+	// Thin object: stat says "absent", not an error.
+	if size, exists, err := cc.Stat(ctx, 7); err != nil || exists || size != 0 {
+		t.Fatalf("stat thin = %d %v %v, want 0 false nil", size, exists, err)
+	}
+	if err := cc.Write(ctx, 7, 0, []byte("data"), false); err != nil {
+		t.Fatal(err)
+	}
+	if size, exists, err := cc.Stat(ctx, 7); err != nil || !exists || size != 1<<20 {
+		t.Fatalf("stat written = %d %v %v, want size true nil", size, exists, err)
+	}
+	if err := cc.Remove(ctx, 7); err != nil {
+		t.Fatalf("remove: %v", err)
+	}
+	if _, exists, err := cc.Stat(ctx, 7); err != nil || exists {
+		t.Fatalf("stat after remove = %v %v, want false nil", exists, err)
+	}
+	if err := cc.Remove(ctx, 7); err != nil {
+		t.Fatalf("remove is not idempotent: %v", err)
+	}
+
+	// StatInfo reports allocated bytes: present after a write, 0 on a
+	// fully punched object (the punch model drops the chunks), absent
+	// for a thin one.
+	if err := cc.Write(ctx, 7, 0, []byte("data"), false); err != nil {
+		t.Fatal(err)
+	}
+	if alloc, exists, err := cc.StatInfo(ctx, 7); err != nil || !exists || alloc == 0 {
+		t.Fatalf("stat_info written = %d %v %v, want >0 true nil", alloc, exists, err)
+	}
+	if err := cc.Trim(ctx, 7, 0, 1<<20); err != nil {
+		t.Fatal(err)
+	}
+	if alloc, exists, err := cc.StatInfo(ctx, 7); err != nil || !exists || alloc != 0 {
+		t.Fatalf("stat_info punched = %d %v %v, want 0 true nil", alloc, exists, err)
+	}
+	if _, exists, err := cc.StatInfo(ctx, 3); err != nil || exists {
+		t.Fatalf("stat_info thin = %v %v, want false nil", exists, err)
+	}
+
+	// Read-only: remove refused, stat served.
+	s := &Server{Backend: be, ReadOnly: true}
+	go s.Serve("127.0.0.1:0")
+	for s.Addr() == "" {
+		time.Sleep(time.Millisecond)
+	}
+	defer s.Close()
+	rc, err := Dial(s.Addr(), "vol0", 2*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rc.Close()
+	if err := rc.Remove(ctx, 7); statusOf(t, err) != StatusReadOnly {
+		t.Fatalf("remove on read-only: got %v", err)
+	}
+	if _, _, err := rc.Stat(ctx, 7); err != nil {
+		t.Fatalf("stat on read-only: %v", err)
 	}
 }
 

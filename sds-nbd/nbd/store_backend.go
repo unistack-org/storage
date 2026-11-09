@@ -118,8 +118,6 @@ func (b *StoreBackend) WriteZeroes(off int64, length uint32, punchHole bool) err
 // Close releases the store.
 func (b *StoreBackend) Close() error { return b.st.Close() }
 
-var zeros = make([]byte, 1<<20) // init-time allocation; hot path reuses it
-
 func (b *StoreBackend) writeZeroes(off, length int64) error {
 	if off < 0 || uint64(off) >= b.size {
 		return io.EOF
@@ -158,7 +156,7 @@ func (b *StoreBackend) punch(off, length int64) error {
 		if err != nil {
 			return err
 		}
-		if err := punchHole(f, int64(inObj), n); err != nil {
+		if err := punchRange(f, int64(inObj), n); err != nil {
 			return err
 		}
 		off += n

@@ -503,7 +503,7 @@ func TestExportNotFound(t *testing.T) {
 
 func TestTrimAndWriteZeroes(t *testing.T) {
 	if os.Getenv("SDS_NBD_TRIM_TESTS") != "1" {
-		t.Skip("hole punching requires Linux; set SDS_NBD_TRIM_TESTS=1 on Linux")
+		t.Skip("hole punching needs a punching FS (Linux/darwin-APFS); set SDS_NBD_TRIM_TESTS=1 to run")
 	}
 	addr, _ := testServer(t, 1<<20, ServerOptions{EnableTrim: true, EnableWriteZeroes: true})
 	cl := newClient(t, addr)

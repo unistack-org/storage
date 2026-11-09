@@ -214,6 +214,44 @@ func (cc *Conn) Sync(ctx context.Context) error {
 	return err
 }
 
+// Remove deletes object oid; a missing object is reported as success
+// (the server-side remove is idempotent, so vacuums can be replayed).
+func (cc *Conn) Remove(ctx context.Context, oid uint64) error {
+	_, err := cc.op(ctx, OpRemove, oid, 0, 0, 0, nil, nil)
+	return err
+}
+
+// Stat reports the size of object oid. It returns (0, false, nil) when
+// the object does not exist and (0, false, err) on a real failure, so
+// recovery can tell a thin object from an unreachable OSD.
+func (cc *Conn) Stat(ctx context.Context, oid uint64) (size uint64, exists bool, err error) {
+	n, err := cc.op(ctx, OpStat, oid, 0, 0, 0, nil, nil)
+	switch {
+	case err == nil:
+		return uint64(n), true, nil
+	case IsObjectMissing(err):
+		return 0, false, nil
+	default:
+		return 0, false, err
+	}
+}
+
+// StatInfo is Stat plus physical accounting: it reports the bytes
+// actually allocated on disk for object oid (st_blocks*512), so a
+// punched/fully-sparse object answers alloc==0. Absent objects map to
+// (0, false, nil) as in Stat.
+func (cc *Conn) StatInfo(ctx context.Context, oid uint64) (alloc uint64, exists bool, err error) {
+	n, err := cc.op(ctx, OpStatInfo, oid, 0, 0, 0, nil, nil)
+	switch {
+	case err == nil:
+		return uint64(n), true, nil
+	case IsObjectMissing(err):
+		return 0, false, nil
+	default:
+		return 0, false, err
+	}
+}
+
 // IsProtocolError reports a framing/desync failure (connection must be
 // discarded), as opposed to a per-request Status error.
 func IsProtocolError(err error) bool { return err == ErrProtocol || err == ErrShortHeader }
@@ -369,18 +407,44 @@ func (pp *Pool) Stats() (idle, inUse int) {
 }
 
 // Do runs fn with a pooled connection, discarding it on protocol errors.
+//
+// A transport-level failure on an idle connection (the peer restarted
+// while the socket sat in the pool) is retried once over a fresh
+// connection: every op in the protocol is idempotent (writes are
+// file+offset, removes/syncs/stats are repeatable), so a retry cannot
+// double-apply. The second attempt's error is returned as-is.
 func (pp *Pool) Do(ctx context.Context, fn func(*Conn) error) error {
 	cc, err := pp.Get(ctx)
 	if err != nil {
 		return err
 	}
 	err = fn(cc)
-	if err != nil && (IsProtocolError(err) || cc.Dead()) {
+	if err == nil {
+		pp.Put(cc)
+		return nil
+	}
+	if IsProtocolError(err) {
 		pp.Discard(cc)
 		return err
 	}
+	if !cc.Dead() {
+		// Remote status error (*Error) or a ctx failure: the stream is
+		// intact, keep the connection.
+		pp.Put(cc)
+		return err
+	}
+	pp.Discard(cc)
+	cc, err2 := pp.Get(ctx)
+	if err2 != nil {
+		return err // report the original transport failure
+	}
+	err2 = fn(cc)
+	if err2 != nil && (IsProtocolError(err2) || cc.Dead()) {
+		pp.Discard(cc)
+		return err2
+	}
 	pp.Put(cc)
-	return err
+	return err2
 }
 
 // do runs fn with a pooled connection, discarding it on protocol errors.
@@ -417,6 +481,37 @@ func (pp *Pool) WriteZeroes(ctx context.Context, oid, off, n uint64, hole, fua b
 // Sync runs a pooled sync.
 func (pp *Pool) Sync(ctx context.Context) error {
 	return pp.Do(ctx, func(cc *Conn) error { return cc.Sync(ctx) })
+}
+
+// Remove runs a pooled remove.
+func (pp *Pool) Remove(ctx context.Context, oid uint64) error {
+	return pp.Do(ctx, func(cc *Conn) error { return cc.Remove(ctx, oid) })
+}
+
+// Stat runs a pooled stat (see Conn.Stat).
+func (pp *Pool) Stat(ctx context.Context, oid uint64) (size uint64, exists bool, err error) {
+	err = pp.Do(ctx, func(cc *Conn) error {
+		var e error
+		size, exists, e = cc.Stat(ctx, oid)
+		return e
+	})
+	if err != nil {
+		return 0, false, err
+	}
+	return size, exists, nil
+}
+
+// StatInfo runs a pooled allocated-bytes stat (see Conn.StatInfo).
+func (pp *Pool) StatInfo(ctx context.Context, oid uint64) (alloc uint64, exists bool, err error) {
+	err = pp.Do(ctx, func(cc *Conn) error {
+		var e error
+		alloc, exists, e = cc.StatInfo(ctx, oid)
+		return e
+	})
+	if err != nil {
+		return 0, false, err
+	}
+	return alloc, exists, nil
 }
 
 const dialTimeout = 5 * time.Second
