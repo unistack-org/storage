@@ -21,6 +21,10 @@
 //	PUT    /v1/volumes/{name}/qos               {"read_iops":...,"qos_template":...}
 //	PUT    /v1/volumes/{name}/quota             {"quota":"20G"}
 //	PUT    /v1/volumes/{name}/resize            {"size":"40G"} (grow only)
+//	POST   /v1/volumes/{name}/snapshot          create a read-only snapshot
+//	GET    /v1/volumes/{name}/snapshots         list snapshots (oldest first)
+//	DELETE /v1/volumes/{name}/snapshot/{gen}    drop one snapshot
+//	POST   /v1/volumes/{name}/rollback          {"gen":N} (discards newer snapshots)
 //	PUT    /v1/volumes/{name}/import?offset=N   body: application/octet-stream
 //	POST   /v1/volumes/{name}/import            {"url":"http://...","offset":N}
 //	GET    /v1/volumes/{name}/export            reply: application/octet-stream
@@ -36,6 +40,7 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -59,12 +64,15 @@ import (
 const importChunk = 1 << 20 // 1 MiB
 
 type adminAPI struct {
-	cl     *client.Cluster
-	ms     meta.Store
+	cl      *client.Cluster
+	ms      meta.Store
 	raft   *meta.RaftStore // nil in dir-backed mode
 	disks  *diskRegistry   // OSDs hosted in this process (disk stats)
 	logger *log.Logger
 	srv    *http.Server
+	// recoveryRecord feeds the recovery counters when metrics are
+	// enabled (nil = no-op); it never exposes metrics over REST.
+	recoveryRecord func(copies int, bytes uint64)
 }
 
 // newAdminServer binds the routes on the process-wide meta store (in
@@ -75,8 +83,13 @@ type adminAPI struct {
 // collects the OSDs hosted in this process (the admin starts before the
 // daemons; they register into the registry as they come up). It does not
 // start serving; call serve.
-func newAdminServer(ms meta.Store, addr string, logger *log.Logger, raftSt *meta.RaftStore, disks *diskRegistry) (*adminAPI, error) {
+func newAdminServer(ms meta.Store, addr string, logger *log.Logger, raftSt *meta.RaftStore, disks *diskRegistry, tlsCfg *tls.Config, clientTLS *tls.Config) (*adminAPI, error) {
 	cl := client.NewCluster(ms)
+	if clientTLS != nil {
+		// Import/export touch the OSDs over the data plane: dial it the
+		// same TLS way the exports do.
+		cl.SetTLS(clientTLS)
+	}
 	a := &adminAPI{cl: cl, ms: ms, logger: logger, raft: raftSt, disks: disks}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", a.handleHealthz)
@@ -89,6 +102,11 @@ func newAdminServer(ms meta.Store, addr string, logger *log.Logger, raftSt *meta
 	mux.HandleFunc("PUT /v1/volumes/{name}/qos", a.handleVolumeQoS)
 	mux.HandleFunc("PUT /v1/volumes/{name}/quota", a.handleVolumeQuota)
 	mux.HandleFunc("PUT /v1/volumes/{name}/resize", a.handleVolumeResize)
+	mux.HandleFunc("POST /v1/volumes/{name}/snapshot", a.handleSnapshotCreate)
+	mux.HandleFunc("GET /v1/volumes/{name}/snapshots", a.handleSnapshotList)
+	mux.HandleFunc("DELETE /v1/volumes/{name}/snapshot/{gen}", a.handleSnapshotDelete)
+	mux.HandleFunc("POST /v1/volumes/{name}/rollback", a.handleRollback)
+	mux.HandleFunc("POST /v1/volumes/{name}/clone", a.handleClone)
 	mux.HandleFunc("PUT /v1/volumes/{name}/import", a.handleImportBody)
 	mux.HandleFunc("POST /v1/volumes/{name}/import", a.handleImportURL)
 	mux.HandleFunc("GET /v1/volumes/{name}/export", a.handleExport)
@@ -101,7 +119,7 @@ func newAdminServer(ms meta.Store, addr string, logger *log.Logger, raftSt *meta
 	mux.HandleFunc("GET /v1/recovery", a.handleRecoveryScan)
 	mux.HandleFunc("GET /v1/recovery/{name}", a.handleRecoveryCheck)
 	mux.HandleFunc("POST /v1/recovery/{name}", a.handleRecoveryRepair)
-	a.srv = &http.Server{Addr: addr, Handler: mux, ReadHeaderTimeout: 10 * time.Second}
+	a.srv = &http.Server{Addr: addr, Handler: mux, ReadHeaderTimeout: 10 * time.Second, TLSConfig: tlsCfg}
 	return a, nil
 }
 
@@ -117,7 +135,11 @@ func (a *adminAPI) serve(ctx context.Context) {
 		// exports), the admin only closes what it opened itself.
 	}()
 	a.logger.Printf("admin http on %s", a.srv.Addr)
-	if err := a.srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+	serve := func() error { return a.srv.ListenAndServe() }
+	if a.srv.TLSConfig != nil {
+		serve = func() error { return a.srv.ListenAndServeTLS("", "") }
+	}
+	if err := serve(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		a.logger.Printf("admin http: %v", err)
 	}
 }
@@ -619,6 +641,188 @@ func (a *adminAPI) handleVolumeResize(w http.ResponseWriter, r *http.Request) {
 	}
 	a.logger.Printf("admin: volume %q resized to %s (%d extent(s))", name, humanSize(size), len(spec.Extents))
 	writeJSON(w, http.StatusOK, a.volumeView(r.Context(), spec))
+}
+
+// ---------- snapshot routes (M3) ----------
+
+// openVolumeVol opens a volume handle for one control-plane call. The
+// data plane is not touched: Snapshot/Rollback only flush and swap meta
+// (plus hand discarded ranges to the vacuum).
+func (a *adminAPI) openVolumeVol(w http.ResponseWriter, r *http.Request, name string) (*client.Volume, bool) {
+	vol, err := a.openAdmin(r.Context(), name)
+	if err != nil {
+		if errors.Is(err, meta.ErrNotFound) {
+			jsonError(w, http.StatusNotFound, "volume %q not found", name)
+			return nil, false
+		}
+		jsonError(w, http.StatusInternalServerError, "open: %v", err)
+		return nil, false
+	}
+	return vol, true
+}
+
+// handleSnapshotCreate freezes the volume's current data as a new
+// read-only generation (no object data moves). The guest should be
+// quiesced by the caller; Snapshot flushes the OSDs first.
+func (a *adminAPI) handleSnapshotCreate(w http.ResponseWriter, r *http.Request) {
+	name := volumeName(r)
+	if name == "" {
+		jsonError(w, http.StatusBadRequest, "bad volume name")
+		return
+	}
+	vol, ok := a.openVolumeVol(w, r, name)
+	if !ok {
+		return
+	}
+	defer vol.Close()
+	info, err := vol.Snapshot(r.Context())
+	if err != nil {
+		if a.readOnlyGate(w, err) {
+			return
+		}
+		if errors.Is(err, meta.ErrTooManySnapshots) {
+			jsonError(w, http.StatusConflict, "volume %q: %v", name, err)
+			return
+		}
+		jsonError(w, http.StatusInternalServerError, "snapshot: %v", err)
+		return
+	}
+	a.logger.Printf("admin: volume %q snapshot gen %d (%d objects)", name, info.Gen, info.Objects)
+	writeJSON(w, http.StatusCreated, info)
+}
+
+// handleSnapshotList answers GET /v1/volumes/{name}/snapshots.
+func (a *adminAPI) handleSnapshotList(w http.ResponseWriter, r *http.Request) {
+	name := volumeName(r)
+	if name == "" {
+		jsonError(w, http.StatusBadRequest, "bad volume name")
+		return
+	}
+	vol, ok := a.openVolumeVol(w, r, name)
+	if !ok {
+		return
+	}
+	defer vol.Close()
+	list, err := vol.Snapshots(r.Context())
+	if err != nil {
+		jsonError(w, http.StatusInternalServerError, "snapshots: %v", err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"volume": name, "snapshots": list})
+}
+
+// handleSnapshotDelete drops one frozen generation; its private OID
+// ranges go to the vacuum. The live data is untouched.
+func (a *adminAPI) handleSnapshotDelete(w http.ResponseWriter, r *http.Request) {
+	name := volumeName(r)
+	gen, err := strconv.ParseUint(r.PathValue("gen"), 10, 32)
+	if name == "" || err != nil {
+		jsonError(w, http.StatusBadRequest, "bad volume name or gen")
+		return
+	}
+	vol, ok := a.openVolumeVol(w, r, name)
+	if !ok {
+		return
+	}
+	defer vol.Close()
+	if err := vol.DeleteSnapshot(r.Context(), uint32(gen)); err != nil {
+		if a.readOnlyGate(w, err) {
+			return
+		}
+		if errors.Is(err, meta.ErrSnapshotNotFound) {
+			jsonError(w, http.StatusNotFound, "volume %q has no snapshot gen %d", name, gen)
+			return
+		}
+		jsonError(w, http.StatusInternalServerError, "snapshot rm: %v", err)
+		return
+	}
+	a.logger.Printf("admin: volume %q snapshot gen %d dropped", name, gen)
+	writeJSON(w, http.StatusOK, map[string]any{"volume": name, "gen": gen, "dropped": true})
+}
+
+// handleRollback makes snapshot gen the live generation: newer
+// snapshots are discarded (rolling back discards the future) and every
+// dropped OID range goes to the vacuum.
+func (a *adminAPI) handleRollback(w http.ResponseWriter, r *http.Request) {
+	name := volumeName(r)
+	if name == "" {
+		jsonError(w, http.StatusBadRequest, "bad volume name")
+		return
+	}
+	var req struct {
+		Gen uint32 `json:"gen"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		jsonError(w, http.StatusBadRequest, "bad json: %v", err)
+		return
+	}
+	vol, ok := a.openVolumeVol(w, r, name)
+	if !ok {
+		return
+	}
+	defer vol.Close()
+	spec, err := vol.Rollback(r.Context(), req.Gen)
+	if err != nil {
+		if a.readOnlyGate(w, err) {
+			return
+		}
+		if errors.Is(err, meta.ErrSnapshotNotFound) {
+			jsonError(w, http.StatusNotFound, "volume %q has no snapshot gen %d", name, req.Gen)
+			return
+		}
+		jsonError(w, http.StatusInternalServerError, "rollback: %v", err)
+		return
+	}
+	a.logger.Printf("admin: volume %q rolled back to gen %d", name, req.Gen)
+	writeJSON(w, http.StatusOK, a.volumeView(r.Context(), spec))
+}
+
+// handleClone creates a copy-on-write clone of the volume (plan M3):
+// POST /v1/volumes/{name}/clone {"name":"dst","quota":N}. The source
+// is flushed and frozen; the clone gets a fresh live range and reads
+// the shared chain. 201 with the destination's view on success, 404
+// when the source is missing, 409 when the destination name is taken
+// or the source chain is at the snapshot limit.
+func (a *adminAPI) handleClone(w http.ResponseWriter, r *http.Request) {
+	src := volumeName(r)
+	if src == "" {
+		jsonError(w, http.StatusBadRequest, "bad volume name")
+		return
+	}
+	var req struct {
+		Name  string `json:"name"`
+		Quota uint64 `json:"quota"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		jsonError(w, http.StatusBadRequest, "bad json: %v", err)
+		return
+	}
+	if req.Name == "" {
+		jsonError(w, http.StatusBadRequest, "clone destination name required")
+		return
+	}
+	spec, err := a.cl.CloneVolume(r.Context(), src, req.Name, req.Quota)
+	if err != nil {
+		if a.readOnlyGate(w, err) {
+			return
+		}
+		if errors.Is(err, meta.ErrNotFound) {
+			jsonError(w, http.StatusNotFound, "volume %q not found", src)
+			return
+		}
+		if errors.Is(err, meta.ErrVolumeExists) {
+			jsonError(w, http.StatusConflict, "clone destination %q: volume already exists", req.Name)
+			return
+		}
+		if errors.Is(err, meta.ErrTooManySnapshots) {
+			jsonError(w, http.StatusConflict, "clone %q of %q: source chain at the snapshot limit", req.Name, src)
+			return
+		}
+		jsonError(w, http.StatusInternalServerError, "clone: %v", err)
+		return
+	}
+	a.logger.Printf("admin: volume %q cloned from %q (%d shared gen(s))", req.Name, src, len(spec.Snapshots))
+	writeJSON(w, http.StatusCreated, a.volumeView(r.Context(), spec))
 }
 
 // ---------- QoS class routes ----------
@@ -1175,6 +1379,7 @@ func (a *adminAPI) handleRecoveryRepair(w http.ResponseWriter, r *http.Request) 
 	opts := client.RecoveryOpts{Logf: func(f string, args ...any) {
 		a.logger.Printf("recovery "+f, args...)
 	}}
+	opts.Record = a.recoveryRecord
 	opts.Limit = qos.NewPair(0, 0, iops, bps)
 	defer opts.Limit.Close()
 	st, err := vol.Recover(r.Context(), rep, opts)

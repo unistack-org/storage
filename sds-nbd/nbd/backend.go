@@ -62,7 +62,23 @@ func NewFileBackend(path string, size uint64) (*FileBackend, error) {
 	return &FileBackend{f: f, size: cur}, nil
 }
 
-func (b *FileBackend) Size() uint64 { return b.size }
+// Size reports the live file size. The file can be grown out-of-band
+// (e.g. `truncate -s +1G disk.img` to resize a single-node export), and
+// the NBD server reads Size() per connection at handshake, so a grown
+// file is served with its new capacity after the guest reconnects (or
+// rescans) the device. If the stat fails (closed file) the cached size
+// is returned.
+func (b *FileBackend) Size() uint64 {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	if b.f == nil {
+		return b.size
+	}
+	if st, err := b.f.Stat(); err == nil && st.Size() > 0 {
+		return uint64(st.Size())
+	}
+	return b.size
+}
 
 func (b *FileBackend) ReadAt(p []byte, off int64) (int, error) {
 	b.mu.RLock()

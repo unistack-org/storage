@@ -11,6 +11,11 @@
 //	vol resize  <name> <size>                   (online grow; shrink is refused)
 //	vol import  <name> <file|url> [-offset N]   (streamed, 1 MiB chunks)
 //	vol export  <name> <file|->                (holes preserved)
+//	vol snap    create <name>                   (freeze a read-only generation)
+//	vol snap    ls     <name>                   (list generations, newest last)
+//	vol snap    rm     <name> <gen>             (drop one generation)
+//	vol snap    rollback <name> <gen>           (live = gen; newer ones are discarded)
+//	vol clone   <src> <dst> [-quota S]          (copy-on-write clone over the shared chain)
 //	qos ls
 //	qos put     <class> <riops:rbps:wiops:wbps>
 //	qos rm      <class>
@@ -44,12 +49,16 @@ import (
 	"github.com/unistack-org/storage/pkg/meta"
 	"github.com/unistack-org/storage/pkg/object"
 	"github.com/unistack-org/storage/pkg/qos"
+	"github.com/unistack-org/storage/pkg/tlsconf"
 )
 
 const chunk = 1 << 20 // import/export streaming granularity
 
 func main() {
 	metaDir := flag.String("meta-dir", "/var/lib/unistord/meta", "cluster meta directory (shared with unistord)")
+	tlsCert := flag.String("tls-cert", "", "with a TLS-enabled cluster: PEM client certificate for the OSD data plane (with -tls-key, -tls-ca)")
+	tlsKey := flag.String("tls-key", "", "PEM private key for -tls-cert")
+	tlsCA := flag.String("tls-ca", "", "PEM CA certificate(s): verify server certificates (OSD data plane, admin -http https URLs)")
 	flag.Usage = usage
 	flag.Parse()
 	args := flag.Args()
@@ -66,11 +75,32 @@ func main() {
 	}
 	defer ms.Close()
 	cl := client.NewCluster(ms)
+	if *tlsCA != "" {
+		cfg, err := tlsconf.CAOnlyConfig(*tlsCA, "")
+		if err != nil {
+			fatal("tls: %v", err)
+		}
+		if *tlsCert != "" || *tlsKey != "" {
+			if *tlsCert == "" || *tlsKey == "" {
+				fatal("-tls-cert and -tls-key must be set together")
+			}
+			cfg, err = tlsconf.Config{CertFile: *tlsCert, KeyFile: *tlsKey, CAFile: *tlsCA}.ClientConfig()
+			if err != nil {
+				fatal("tls: %v", err)
+			}
+		}
+		cl.SetTLS(cfg)
+		httpClient = &http.Client{Timeout: 30 * time.Minute, Transport: &http.Transport{TLSClientConfig: cfg}}
+	}
 
 	if err := dispatch(ctx, cl, ms, args); err != nil {
 		fatal("%v", err)
 	}
 }
+
+// httpClient is used by the HTTP-speaking commands (status, import from
+// URL); it is replaced with a TLS-configured client when -tls-ca is set.
+var httpClient = http.DefaultClient
 
 func dispatch(ctx context.Context, cl *client.Cluster, ms meta.Store, args []string) error {
 	switch args[0] {
@@ -97,7 +127,7 @@ func dispatch(ctx context.Context, cl *client.Cluster, ms meta.Store, args []str
 func volCmd(ctx context.Context, cl *client.Cluster, ms meta.Store, args []string) error {
 	if len(args) == 0 {
 		usage()
-		return errors.New("vol: subcommand required (create/ls/rm/info/qos/quota/import/export)")
+		return errors.New("vol: subcommand required (create/ls/rm/info/qos/quota/resize/import/export/snap/clone)")
 	}
 	sub, rest := args[0], args[1:]
 	switch sub {
@@ -245,6 +275,32 @@ func volCmd(ctx context.Context, cl *client.Cluster, ms meta.Store, args []strin
 		}
 		return volExport(ctx, cl, rest[0], rest[1])
 
+	case "snap":
+		return volSnap(ctx, cl, rest)
+
+	case "clone":
+		fs := flag.NewFlagSet("vol clone", flag.ExitOnError)
+		quotaStr := fs.String("quota", "", "clone allocation cap (0/omitted = inherit the source's)")
+		mustParse(fs, rearg(rest))
+		if fs.NArg() != 2 {
+			fs.Usage()
+			return errors.New(`vol clone: <src> <dst> e.g. "vol clone base vm7"`)
+		}
+		var quota uint64
+		if *quotaStr != "" {
+			var perr error
+			if quota, perr = sizeSuffix(*quotaStr); perr != nil {
+				return fmt.Errorf("vol clone: quota: %w", perr)
+			}
+		}
+		spec, err := cl.CloneVolume(ctx, fs.Arg(0), fs.Arg(1), quota)
+		if err != nil {
+			return err
+		}
+		fmt.Printf("volume %q: cloned from %q (size=%s quota=%s, %d snapshot generation(s) in the shared chain)\n",
+			spec.Name, fs.Arg(0), humanSize(spec.Size), quotaLabel(spec), len(spec.Snapshots))
+		return nil
+
 	default:
 		usage()
 		return fmt.Errorf("vol: unknown subcommand %q", sub)
@@ -308,6 +364,92 @@ func volQoS(ctx context.Context, cl *client.Cluster, rest []string) error {
 	return nil
 }
 
+func volSnap(ctx context.Context, cl *client.Cluster, args []string) error {
+	if len(args) == 0 {
+		return errors.New(`vol snap: subcommand required (create/ls/rm/rollback)`)
+	}
+	sub, rest := args[0], args[1:]
+	if len(rest) < 1 {
+		return errors.New(`vol snap: <name> required`)
+	}
+	name := rest[0]
+	open := func() (*client.Volume, error) { return cl.OpenVolume(ctx, name) }
+	switch sub {
+	case "create":
+		if len(rest) != 1 {
+			return errors.New("vol snap create: <name>")
+		}
+		v, err := open()
+		if err != nil {
+			return err
+		}
+		defer v.Close()
+		info, err := v.Snapshot(ctx)
+		if err != nil {
+			return err
+		}
+		fmt.Printf("volume %q: snapshot gen %d created at %s (size %s, %d objects)\n",
+			name, info.Gen, time.Unix(info.CreatedAt, 0).UTC().Format(time.RFC3339),
+			humanSize(info.Size), info.Objects)
+		return nil
+
+	case "ls":
+		if len(rest) != 1 {
+			return errors.New("vol snap ls: <name>")
+		}
+		v, err := open()
+		if err != nil {
+			return err
+		}
+		defer v.Close()
+		list, err := v.Snapshots(ctx)
+		if err != nil {
+			return err
+		}
+		if len(list) == 0 {
+			fmt.Printf("volume %q: (no snapshots)\n", name)
+			return nil
+		}
+		fmt.Printf("%-6s %-22s %10s %10s\n", "GEN", "CREATED", "SIZE", "OBJECTS")
+		for _, g := range list {
+			fmt.Printf("%-6d %-22s %10s %10d\n", g.Gen,
+				time.Unix(g.CreatedAt, 0).UTC().Format(time.RFC3339), humanSize(g.Size), g.Objects)
+		}
+		return nil
+
+	case "rm", "rollback":
+		if len(rest) != 2 {
+			return fmt.Errorf("vol snap %s: <name> <gen>", sub)
+		}
+		gen, err := strconv.ParseUint(rest[1], 10, 32)
+		if err != nil {
+			return fmt.Errorf("vol snap %s: gen: %w", sub, err)
+		}
+		v, err := open()
+		if err != nil {
+			return err
+		}
+		defer v.Close()
+		if sub == "rm" {
+			if err := v.DeleteSnapshot(ctx, uint32(gen)); err != nil {
+				return err
+			}
+			fmt.Printf("volume %q: snapshot gen %d dropped (its objects go to vacuum)\n", name, gen)
+			return nil
+		}
+		spec, err := v.Rollback(ctx, uint32(gen))
+		if err != nil {
+			return err
+		}
+		fmt.Printf("volume %q: rolled back to gen %d (live gen is %d; discarded ranges go to vacuum)\n",
+			name, gen, spec.Gen)
+		return nil
+
+	default:
+		return fmt.Errorf("vol snap: unknown subcommand %q (create/ls/rm/rollback)", sub)
+	}
+}
+
 func volImport(ctx context.Context, cl *client.Cluster, name, src string, offset uint64) error {
 	v, err := cl.OpenVolume(ctx, name)
 	if err != nil {
@@ -323,7 +465,7 @@ func volImport(ctx context.Context, cl *client.Cluster, name, src string, offset
 		if err != nil {
 			return err
 		}
-		resp, err := http.DefaultClient.Do(req)
+		resp, err := httpClient.Do(req)
 		if err != nil {
 			return fmt.Errorf("import: fetch %s: %w", src, err)
 		}
@@ -740,7 +882,7 @@ func statusCmd(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := httpClient.Do(req)
 	if err != nil {
 		return fmt.Errorf("status: GET %s: %w", url, err)
 	}
@@ -825,6 +967,7 @@ vol qos <name> [-class c] [-r iops[:Bps]] [-w iops[:Bps]]
 vol quota <name> <size|0>  (allocation cap; open volumes pick it up live)
 vol import <name> <file|http(s)://url> [-offset N]
 vol export <name> <file|->
+vol snap create <name> | vol snap ls <name> | vol snap rm <name> <gen> | vol snap rollback <name> <gen>
 qos ls | qos put <class> <riops:rbps:wiops:wbps> | qos rm <class>
 osd ls
 vacuum [ls|run [vol]]  (M1.4: free deleted volumes' objects; run <vol> = targeted tombstone, live volume = punch out all-zero objects)

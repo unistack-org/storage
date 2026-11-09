@@ -34,6 +34,13 @@ func (r *diskRegistry) add(id int32, d *osd.Daemon) {
 	r.mu.Unlock()
 }
 
+// disk returns the daemon hosted here for one OSD id (nil = not local).
+func (r *diskRegistry) disk(id int32) *osd.Daemon {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.m[id]
+}
+
 // stats returns per-OSD disk stats for the OSDs hosted here, sorted by id.
 func (r *diskRegistry) stats() []diskStatView {
 	r.mu.Lock()

@@ -7,10 +7,12 @@
 //
 //	unistord -listen :10809 -export vol0=/var/lib/unistord/vol0.img:10G [-readonly vol0] [-trim] [-write-zeroes]
 //	unistord ... -export vol0 -vduse vol0=sds-vol0   # VDUSE virtio-blk device (Linux)
+//	unistord ... -cluster ... -metrics 0.0.0.0:8080  # Prometheus /metrics endpoint
 package main
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"flag"
 	"fmt"
@@ -32,7 +34,9 @@ import (
 	"github.com/unistack-org/storage/pkg/meta"
 	"github.com/unistack-org/storage/pkg/osd"
 	"github.com/unistack-org/storage/pkg/qos"
+	"github.com/unistack-org/storage/pkg/sdsnet"
 	"github.com/unistack-org/storage/pkg/store"
+	"github.com/unistack-org/storage/pkg/tlsconf"
 )
 
 // sizeSuffix parses sizes like 512M, 10G, 1T, 4096.
@@ -182,12 +186,20 @@ func main() {
 	flag.Var(&qosClasses, "qos-class", "with -cluster: register a QoS class name=riops:rbps:wiops:wbps in meta (volumes reference it via QoSTemplate), repeatable")
 	osdQoS := flag.String("osd-qos", "", "with -cluster: aggregate limits per in-process OSD riops:rbps:wiops:wbps (the per-disk ceiling shared by all volumes on it; 0/empty = unlimited)")
 	httpAddr := flag.String("http", "", "with -cluster: admin HTTP API on this address (e.g. 127.0.0.1:8443; empty = disabled): volumes, QoS, import/export over octet-stream")
+	metricsAddr := flag.String("metrics", "", "with -cluster: Prometheus metrics endpoint (VictoriaMetrics scrape target) on this address, served at http://<addr>/metrics (e.g. 0.0.0.0:8080; empty = disabled). Independent of -http: metrics are served only here, never on the admin API")
+	commit := flag.String("commit", "none", "durability of OSD/-store writes: none (page cache; a guest FLUSH/FUA syncs the disk), flush (fsync every write/punch), sync (O_SYNC at open; on macOS degrades to flush semantics), journal (append to a write-ahead log + fsync per write, background flattening into objects; fastest safe mode for small random writes)")
+	fsyncBatch := flag.Duration("fsync-batch", 0, "with -commit none: coalesce Sync() calls that land within this window (e.g. 2ms) into one fsync pass (0 = fsync disk on every sync request)")
 	vacuumInterval := flag.Int("vacuum-interval", 0, "with -cluster: seconds between background vacuums that unlink deleted volumes' objects from the OSDs (0 = off; the admin API and unistorctl vacuum run are the manual triggers)")
 	raftAddr := flag.String("raft", "", "with -cluster: replicate meta over raft on this bind address (host:port). Reads always work; writes need a quorum, without one the meta is read-only (503 on the admin API). A node with -raft but no -osd/-export is a storage-less witness voter")
 	raftPeers := flag.String("raft-peers", "", "with -raft: FULL voter set as comma-separated host:port (including this node), e.g. 10.0.0.1:9401,10.0.0.2:9401,10.0.0.3:9401")
 	raftDir := flag.String("raft-dir", "", "with -raft: raft data directory (default: <cluster>/raft)")
 	raftProxy := flag.String("raft-proxy", "", "with -raft: serve write forwarding on this host:port, so writes that reach a follower are relayed to the leader (recommended; use the storage net)")
 	raftProxyPeers := flag.String("raft-proxy-peers", "", "with -raft-proxy: proxy addresses parallel to -raft-peers (same order, including this node), e.g. 10.0.0.1:9501,10.0.0.2:9501,10.0.0.3:9501")
+	tlsCert := flag.String("tls-cert", "", "PEM certificate (with -tls-key): enables mutual TLS on the OSD data plane, raft transport and the admin API; the certificate must list the node's dial addresses (IPs included) as SANs")
+	tlsKey := flag.String("tls-key", "", "PEM private key for -tls-cert")
+	tlsCA := flag.String("tls-ca", "", "PEM CA certificate(s) that signed the peers'/clients' certificates; required for the OSD/raft planes; it is also used to verify admin API clients unless -tls-client-ca-file is set")
+	tlsClientCA := flag.String("tls-client-ca-file", "", "with -tls-ca: require admin API client certificates signed by this CA (by default the admin API presents a certificate but does not demand client certificates, so plain 'curl --cacert' works)")
+	tlsMinVer := flag.String("tls-min-version", "1.2", "minimum TLS version: 1.2 or 1.3")
 	flag.Parse()
 
 	if *gogc > 0 {
@@ -205,6 +217,50 @@ func main() {
 	}
 
 	logger := log.New(os.Stderr, "unistord: ", log.LstdFlags|log.Lmsgprefix)
+
+	commitMode, err := store.ParseCommitMode(*commit)
+	if err != nil {
+		logger.Fatalf("commit: %v", err)
+	}
+
+	// TLS material: when any -tls-* flag is given, every network plane
+	// (OSD data, raft transport and write proxy, admin HTTP) switches to
+	// mutual TLS at once - a mixed plain/TLS fleet is not supported.
+	tlsMaterial := tlsconf.Config{
+		CertFile:   *tlsCert,
+		KeyFile:    *tlsKey,
+		CAFile:     *tlsCA,
+		MinVersion: *tlsMinVer,
+	}
+	var tlsServer, tlsClient, tlsAdmin *tls.Config
+	if tlsMaterial.Any() {
+		if !tlsMaterial.Complete() {
+			logger.Fatalf("-tls-cert, -tls-key and -tls-ca must all be set together")
+		}
+		scfg, err := tlsMaterial.ServerConfig()
+		if err != nil {
+			logger.Fatalf("tls: %v", err)
+		}
+		ccfg, err := tlsMaterial.ClientConfig()
+		if err != nil {
+			logger.Fatalf("tls: %v", err)
+		}
+		// The admin API presents the certificate and, unlike the
+		// storage planes, does not demand client certificates by
+		// default: operators use plain "curl --cacert ca.pem".
+		// -tls-client-ca-file (a CA for operator/client certs) turns
+		// mutual TLS on for the admin API too.
+		adminCA := *tlsClientCA
+		if adminCA == "" {
+			adminCA = *tlsCA
+		}
+		acf, err := tlsconf.Config{CertFile: *tlsCert, KeyFile: *tlsKey, CAFile: adminCA, MinVersion: *tlsMinVer}.HTTPServerConfig()
+		if err != nil {
+			logger.Fatalf("tls: %v", err)
+		}
+		tlsServer, tlsClient, tlsAdmin = scfg, ccfg, acf
+		logger.Printf("tls: mutual TLS enabled (min %s, cert %s, ca %s)", *tlsMinVer, *tlsCert, *tlsCA)
+	}
 
 	// QoS: per-export limits (client side) and an optional per-OSD
 	// aggregate (the disk-side ceiling). An export with no -qos entry
@@ -274,6 +330,8 @@ func main() {
 				ProxyAddr:  *raftProxy,
 				ProxyPeers: proxyPeers,
 				Logger:     log.New(os.Stderr, "raft: ", log.LstdFlags|log.Lmsgprefix),
+				TLS:        tlsServer,
+				ProxyTLS:   tlsClient,
 			})
 			if err != nil {
 				logger.Fatalf("raft meta: %v", err)
@@ -298,6 +356,9 @@ func main() {
 		// admin API and unistorctl remain the manual triggers).
 		if *vacuumInterval > 0 {
 			cl := client.NewCluster(ms)
+			if tlsClient != nil {
+				cl.SetTLS(tlsClient)
+			}
 			go cl.VacuumLoop(ctx, time.Duration(*vacuumInterval)*time.Second,
 				func(f string, a ...any) { logger.Printf(f, a...) })
 			logger.Printf("vacuum: autovacuum every %vs", *vacuumInterval)
@@ -309,15 +370,39 @@ func main() {
 		witness := len(osds) == 0 && len(exports) == 0 && raftSt != nil
 		var es []*nbd.Export
 		disks := newDiskRegistry()
+		// One metrics registry per process. The standalone endpoint
+		// (-metrics) is the only place metrics are exposed: the admin
+		// API never serves them. The same registry feeds the OSD/export
+		// hot-path hooks below.
+		var mreg *clusterMetrics
+		if *metricsAddr != "" {
+			mreg = newClusterMetrics()
+		}
+		if *metricsAddr != "" {
+			mcl := client.NewCluster(ms)
+			if tlsClient != nil {
+				mcl.SetTLS(tlsClient)
+			}
+			defer mcl.Close()
+			msrc := metricsSource{cl: mcl, ms: ms, raft: raftSt, disks: disks}
+			go func() {
+				if err := mreg.serveMetrics(ctx, *metricsAddr, msrc, logger); err != nil {
+					logger.Printf("metrics http: %v", err)
+				}
+			}()
+		}
 		if *httpAddr != "" {
 			// Start the admin API before the exports: on a raft cluster
 			// the export setup may block waiting for OSD registration
 			// (which needs a quorum), and the operator needs the status
 			// and write endpoints available throughout.
-			admin, err := newAdminServer(ms, *httpAddr, logger, raftSt, disks)
+			admin, err := newAdminServer(ms, *httpAddr, logger, raftSt, disks, tlsAdmin, tlsClient)
 			if err != nil {
 				logger.Fatalf("admin http: %v", err)
 			}
+			// Recovery runs started over the admin API feed the metrics
+			// registry (nil-safe); the admin itself never serves them.
+			admin.recoveryRecord = mreg.recoveryRecorder()
 			go admin.serve(ctx)
 		}
 		if !witness {
@@ -337,7 +422,12 @@ func main() {
 				qosMap:     qosMap,
 				qosClasses: qosClasses,
 				osdQoS:     *osdQoS,
+				commit:     commitMode,
+				fsyncBatch: *fsyncBatch,
+				tlsServer:  tlsServer,
+				tlsClient:  tlsClient,
 				disks:      disks,
+				metrics:    mreg,
 				logger:     logger,
 			})
 			if err != nil {
@@ -394,7 +484,7 @@ func main() {
 				logger.Fatalf("bad size in -export %q: %v", spec, err)
 			}
 		}
-		b, err := newBackend(*storeMode, path, size, *direct, *prealloc)
+		b, err := newBackend(*storeMode, path, size, *direct, *prealloc, commitMode, *fsyncBatch)
 		if err != nil {
 			logger.Fatalf("export %s: %v", name, err)
 		}
@@ -477,7 +567,12 @@ type clusterParams struct {
 	qosMap     map[string]string // export name -> rates spec
 	qosClasses []string          // -qos-class name=rates registrations
 	osdQoS     string            // per-OSD aggregate rates spec ("" = none)
+	commit     store.CommitMode  // OSD commit mode
+	fsyncBatch time.Duration     // OSD fsync coalescing window
+	tlsServer  *tls.Config       // mutual TLS for the OSD data plane (nil = plain)
+	tlsClient  *tls.Config       // client side for cluster pools (nil = plain)
 	disks      *diskRegistry     // hosted OSDs publish disk stats here (admin status)
+	metrics    *clusterMetrics   // prometheus registry (nil = metrics disabled)
 	logger     *log.Logger
 }
 
@@ -497,6 +592,9 @@ func clusterExports(ctx context.Context, p clusterParams) ([]*nbd.Export, error)
 	// connections, so the default 64-per-OSD pool cap would queue ops
 	// inside the pool. Raise it; each connection is 256KB of bufio.
 	cl.SetPoolLimit(256)
+	if p.tlsClient != nil {
+		cl.SetTLS(p.tlsClient)
+	}
 
 	// writeMeta runs a meta write that must land before the cluster is
 	// usable (class registration, map publish, volume create). On a raft
@@ -566,12 +664,16 @@ func clusterExports(ctx context.Context, p clusterParams) ([]*nbd.Export, error)
 			return nil, fmt.Errorf("-osd %q: %w", spec, err)
 		}
 		d, err := osd.New(osd.Options{
-			ID:        id,
-			Addr:      addr,
-			DataDir:   dataDir,
-			Meta:      ms,
-			Aggregate: aggSpec.pair(),
-			Logf:      func(f string, a ...any) { p.logger.Printf("osd %d: %s", id, fmt.Sprintf(f, a...)) },
+			ID:         id,
+			Addr:       addr,
+			DataDir:    dataDir,
+			Meta:       ms,
+			Aggregate:  aggSpec.pair(),
+			CommitMode: p.commit,
+			FsyncBatch: p.fsyncBatch,
+			TLS:        p.tlsServer,
+			Metrics:    p.metrics.osdServerMetrics(id),
+			Logf:       func(f string, a ...any) { p.logger.Printf("osd %d: %s", id, fmt.Sprintf(f, a...)) },
 		})
 		if err != nil {
 			return nil, fmt.Errorf("osd %d: %w", id, err)
@@ -611,6 +713,37 @@ func clusterExports(ctx context.Context, p clusterParams) ([]*nbd.Export, error)
 	}
 	if err := waitRegistered(); err != nil {
 		return nil, err
+	}
+
+	// Local-direct transport: this process hosts OSDs and acts as their
+	// client (the VDUSE/NBD export path), so every op used to pay a
+	// loopback TCP round trip (two syscall pairs, TCP state machine)
+	// per replica. Hand the cluster a dialer that returns in-process
+	// socketpairs served by each hosted OSD's own server: the wire
+	// protocol, fencing, QoS and metrics are unchanged, the TCP stack
+	// is gone.
+	{
+		byID := make(map[int32]*osd.Daemon, len(running))
+		for _, h := range running {
+			byID[h.id] = h.d
+		}
+		cl.SetLocalDial(func(osdID int32) (net.Conn, error) {
+			d := byID[osdID]
+			if d == nil {
+				return nil, fmt.Errorf("unistord: osd %d is not hosted here", osdID)
+			}
+			srv := d.Server()
+			if srv == nil {
+				return nil, fmt.Errorf("unistord: osd %d is not serving yet", osdID)
+			}
+			mine, peer, err := sdsnet.Socketpair()
+			if err != nil {
+				return nil, fmt.Errorf("unistord: socketpair: %w", err)
+			}
+			go srv.ServeConn(peer)
+			return mine, nil
+		})
+		p.logger.Printf("local-direct transport enabled for %d hosted OSD(s)", len(byID))
 	}
 
 	// Publish the crush map if asked and not already present at this
@@ -682,6 +815,8 @@ func clusterExports(ctx context.Context, p clusterParams) ([]*nbd.Export, error)
 			})
 			p.logger.Printf("export %q: qos r=%d/%s w=%d/%s", volName, r.readIOPS, humanSize(r.readBPS), r.writeIOPS, humanSize(r.writeBPS))
 		}
+		// QoS sustained/limit gauges + per-op counters need the export.
+		backend = p.metrics.trackExport(volName, vol, backend)
 		p.logger.Printf("export %q -> cluster volume %q (%s)", volName, volName, humanSize(vol.Size()))
 		es = append(es, &nbd.Export{Name: volName, Backend: backend})
 	}
@@ -707,7 +842,7 @@ func parseOSDSpec(spec string) (id int32, dataDir, addr string, err error) {
 
 // newBackend builds the export backend: a plain sparse file (MVP
 // default) or, with -store, the phase-1 object-store data path.
-func newBackend(storeMode bool, path string, size uint64, direct, prealloc bool) (nbd.Backend, error) {
+func newBackend(storeMode bool, path string, size uint64, direct, prealloc bool, commitMode store.CommitMode, fsyncBatch time.Duration) (nbd.Backend, error) {
 	if !storeMode {
 		return nbd.NewFileBackend(path, size)
 	}
@@ -717,6 +852,8 @@ func newBackend(storeMode bool, path string, size uint64, direct, prealloc bool)
 	return nbd.NewStoreBackend(path, size, store.Options{
 		Direct:      direct,
 		Preallocate: prealloc,
+		CommitMode:  commitMode,
+		FsyncBatch:  fsyncBatch,
 	})
 }
 

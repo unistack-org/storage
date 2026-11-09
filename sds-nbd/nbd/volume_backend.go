@@ -14,16 +14,21 @@ import (
 // replication and epoch-fencing logic lives in pkg/client; this file is
 // a thin protocol adapter.
 type VolumeBackend struct {
-	vol  *sdsclient.Volume
-	size uint64
+	vol *sdsclient.Volume
 }
 
 // NewVolumeBackend wraps an open cluster volume.
 func NewVolumeBackend(vol *sdsclient.Volume) *VolumeBackend {
-	return &VolumeBackend{vol: vol, size: vol.Size()}
+	return &VolumeBackend{vol: vol}
 }
 
-func (b *VolumeBackend) Size() uint64 { return b.size }
+// Size reports the volume's live size: online resize (unistorctl vol
+// resize / PUT /v1/volumes/{name}/resize) is picked up here without
+// restarting the export. The NBD server reads Size() per connection at
+// handshake, so a guest sees the new capacity after reconnecting the
+// device (or an nbd size rescan); in-flight connections keep the size
+// they negotiated.
+func (b *VolumeBackend) Size() uint64 { return b.vol.Size() }
 
 func (b *VolumeBackend) ReadAt(p []byte, off int64) (int, error) {
 	if off < 0 {

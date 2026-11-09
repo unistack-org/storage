@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"sync/atomic"
 
 	"github.com/unistack-org/storage/pkg/object"
 	"github.com/unistack-org/storage/pkg/store"
@@ -16,8 +17,11 @@ import (
 //
 // Object OID = object index + 1 (OID 0 is reserved as NilOID).
 type StoreBackend struct {
-	st   *store.Store
-	size uint64
+	st *store.Store
+	// size is the live export size: SetSize can grow it online (the
+	// object range simply widens), and Size() serves the current value
+	// to the NBD handshake of every new connection.
+	size atomic.Uint64
 }
 
 // NewStoreBackend opens (creating if needed) the object store directory
@@ -34,10 +38,22 @@ func NewStoreBackend(dir string, size uint64, opts store.Options) (*StoreBackend
 		st.Close()
 		return nil, err
 	}
-	return &StoreBackend{st: st, size: size}, nil
+	b := &StoreBackend{st: st}
+	b.size.Store(size)
+	return b, nil
 }
 
-func (b *StoreBackend) Size() uint64 { return b.size }
+func (b *StoreBackend) Size() uint64 { return b.size.Load() }
+
+// SetSize changes the exported size online. Growing is always safe
+// (objects are created lazily); shrinking clips new requests at the
+// new end (connections keep the size they negotiated at handshake).
+func (b *StoreBackend) SetSize(size uint64) {
+	if object.NumObjects(size) == 0 {
+		return
+	}
+	b.size.Store(size)
+}
 
 // ReadAt reads across object boundaries, forwarding the caller's buffer
 // to the store without copying.
@@ -51,11 +67,11 @@ func (b *StoreBackend) WriteAt(p []byte, off int64) (int, error) {
 }
 
 func (b *StoreBackend) doIO(p []byte, off int64, write bool) (int, error) {
-	if off < 0 || uint64(off) >= b.size {
+	if off < 0 || uint64(off) >= b.size.Load() {
 		return 0, io.EOF
 	}
-	if uint64(off)+uint64(len(p)) > b.size {
-		p = p[:b.size-uint64(off)] // tail clip; NBD never sends this
+	if uint64(off)+uint64(len(p)) > b.size.Load() {
+		p = p[:b.size.Load()-uint64(off)] // tail clip; NBD never sends this
 	}
 	var done int
 	for len(p) > 0 {
@@ -119,11 +135,11 @@ func (b *StoreBackend) WriteZeroes(off int64, length uint32, punchHole bool) err
 func (b *StoreBackend) Close() error { return b.st.Close() }
 
 func (b *StoreBackend) writeZeroes(off, length int64) error {
-	if off < 0 || uint64(off) >= b.size {
+	if off < 0 || uint64(off) >= b.size.Load() {
 		return io.EOF
 	}
-	if uint64(off)+uint64(length) > b.size {
-		length = int64(b.size - uint64(off))
+	if uint64(off)+uint64(length) > b.size.Load() {
+		length = int64(b.size.Load() - uint64(off))
 	}
 	for length > 0 {
 		n := length
@@ -140,11 +156,30 @@ func (b *StoreBackend) writeZeroes(off, length int64) error {
 }
 
 func (b *StoreBackend) punch(off, length int64) error {
-	if off < 0 || uint64(off) >= b.size {
+	if off < 0 || uint64(off) >= b.size.Load() {
 		return io.EOF
 	}
-	if uint64(off)+uint64(length) > b.size {
-		length = int64(b.size - uint64(off))
+	if uint64(off)+uint64(length) > b.size.Load() {
+		length = int64(b.size.Load() - uint64(off))
+	}
+	// Journal mode: punching the raw file via Lookup would bypass the
+	// write-ahead log, and un-applied overlay records would resurrect
+	// the punched bytes on the next read. Route the discard through the
+	// store so it lands in the log as a sparse-zeroes record.
+	if b.st.JournalMode() {
+		for length > 0 {
+			idx, inObj := object.Split(uint64(off))
+			n := length
+			if room := int64(object.Size - inObj); n > room {
+				n = room
+			}
+			if err := b.st.WriteZeroes(object.OID(idx+1), inObj, uint64(n), true); err != nil {
+				return err
+			}
+			off += n
+			length -= n
+		}
+		return nil
 	}
 	for length > 0 {
 		idx, inObj := object.Split(uint64(off))
