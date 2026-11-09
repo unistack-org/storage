@@ -150,6 +150,7 @@ func (v *Volume) runBatchGroup(bg *batchGroup) {
 	var win []*batchSlot
 	var timer *time.Timer
 	var fire <-chan time.Time
+	lastArrival := time.Now().Add(-2 * batchWindowDelay)
 	for {
 		select {
 		case <-bg.done:
@@ -163,10 +164,30 @@ func (v *Volume) runBatchGroup(bg *batchGroup) {
 				}
 			}
 		case s := <-bg.intake:
+			isolated := time.Since(lastArrival) > batchWindowDelay
+			lastArrival = time.Now()
 			win = append(win, s)
 			if timer == nil {
 				timer = time.NewTimer(batchWindowDelay)
 				fire = timer.C
+			}
+			// Opportunistic dispatch: an arrival that is isolated in
+			// time (a quiet stream, e.g. queue-depth 1) has nothing to
+			// coalesce with, so sending it now is pure latency saved —
+			// the timer window only pays off when arrivals are dense.
+			// len(intake)==0 keeps bursts together: the collector must
+			// not cut a window while more slots are already queued.
+			if isolated && len(bg.intake) == 0 && len(win) < batchWindow {
+				if !timer.Stop() {
+					select {
+					case <-timer.C:
+					default:
+					}
+				}
+				timer, fire = nil, nil
+				v.launch(bg, win)
+				win = make([]*batchSlot, 0, batchWindow)
+				continue
 			}
 			if len(win) >= batchWindow {
 				if !timer.Stop() {
