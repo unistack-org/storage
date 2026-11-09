@@ -625,10 +625,16 @@ func (d *Device) refreshAndDrain(drain bool) {
 	d.mu.Unlock()
 	d.refreshLocked()
 	if !drain {
-		// Reconnect: vqRefresh set lastAvail to the kernel's stored
-		// avail_index (the entries it counts as submitted). Align
-		// lastUsed with what the driver consumed, then fall through
-		// and drain — completing requests the guest is blocked on.
+		// Reconnect. The entries the device owes the driver are
+		// exactly avail[used.idx .. avail.idx-1]: the driver adds
+		// one avail slot per submission and releases DMA only when
+		// it consumes the matching used slot, so everything from
+		// its used.idx up to avail.idx is in flight and must be
+		// completed (virtio-blk has no blk-mq timeout). The
+		// kernel's stored avail_index is always 0 on the VDUSE
+		// path — it is a fresh-device initial value, not a
+		// reconnect source of truth. Drain from used.idx, push
+		// used from used.idx too.
 		for _, q := range d.vqs {
 			d.mu.Lock()
 			ring := q.ring
@@ -636,15 +642,19 @@ func (d *Device) refreshAndDrain(drain bool) {
 			if ring == nil {
 				continue
 			}
-			used, uerr := ring.UsedIdx()
-			if uerr != nil {
-				d.logf("attach q%d used idx read: %v\n", q.idx, uerr)
-				continue
+			kAvail, _ := ring.State() // fresh-device cursor (0)
+			start, end := kAvail, kAvail
+			if av, okA := d.readAvailIdx(q, ring); okA {
+				end = av
+				if us, okU := d.readUsedIdx(q, ring); okU {
+					start = us
+				} else {
+					start = end // nothing known outstanding
+				}
 			}
-			lastA, lastU := ring.State()
-			ring.SetState(lastA, used)
-			d.logf("attach q%d: replaying avail from %d, used %d->%d\n",
-				q.idx, lastA, lastU, used)
+			ring.SetState(start, start)
+			d.logf("attach q%d: replaying avail[%d..%d) (used from %d)\n",
+				q.idx, start, end, start)
 		}
 	}
 	d.lockDrains()
@@ -657,6 +667,37 @@ func (d *Device) refreshAndDrain(drain bool) {
 		}
 	}
 	d.unlockDrains()
+}
+
+// readUsedIdx / readAvailIdx read the guest ring indices for cursor
+// alignment on reconnect. Ring pages may have been unmapped when the
+// previous daemon died, so the reads run under the same SIGBUS guard as
+// drains; ok=false means the page is dead — the caller keeps the
+// fresh-device cursor and the drain's own guard handles the rest.
+func (d *Device) readUsedIdx(q *queueState, ring *SplitRing) (used uint16, ok bool) {
+	return d.readIdx(q, "used", ring.UsedIdx)
+}
+
+func (d *Device) readAvailIdx(q *queueState, ring *SplitRing) (avail uint16, ok bool) {
+	return d.readIdx(q, "avail", ring.AvailIdx)
+}
+
+func (d *Device) readIdx(q *queueState, what string, fn func() (uint16, error)) (v uint16, ok bool) {
+	prev := debug.SetPanicOnFault(true)
+	defer func() {
+		if r := recover(); r != nil {
+			fmt.Fprintf(os.Stderr, "sdsd: vduse %s q%d: %s idx read fault (%v) — ring pages dead\n",
+				d.name, q.idx, what, r)
+			v, ok = 0, false
+		}
+		debug.SetPanicOnFault(prev)
+	}()
+	x, err := fn()
+	if err != nil {
+		d.logf("attach q%d %s idx read: %v\n", q.idx, what, err)
+		return 0, false
+	}
+	return x, true
 }
 
 // iotlbApply (re)maps every IOVA region overlapping [start,last]; the
