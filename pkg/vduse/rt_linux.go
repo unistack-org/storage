@@ -10,6 +10,7 @@ import (
 	"os"
 	"runtime/debug"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 	"unsafe"
@@ -130,9 +131,186 @@ type queueState struct {
 	ring   *SplitRing
 	irqs   uint64
 
-	// drainMu serialises consumers of the ring: a kick and the
-	// post-DRIVER_OK flush can run at the same time.
+	// drainMu serialises dispatchers of the ring: a kick, the
+	// post-DRIVER_OK flush, and the watchdog can run at the same time.
+	// Holding it means "no new work is being claimed"; it does NOT mean
+	// the queue is idle — in-flight work lives in the worker pool and
+	// is tracked by inflight (see quiesce).
 	drainMu sync.Mutex
+
+	// Parallel data path. The dispatcher (the goroutine holding
+	// drainMu) claims avail entries serially (NextAvail is
+	// single-consumer by construction), pins their guest buffers, and
+	// hands ready-to-run jobs to the worker pool. Workers execute the
+	// backend round-trips concurrently — that round-trip is ~50-100us
+	// of loopback TCP, and doing it serially capped us at ~18K IOPS —
+	// then complete (status + used + IRQ) and release their pins.
+	jobs     chan *job
+	inflight int           // claimed jobs not fully finished
+	cond     *sync.Cond    // signals inflight == 0 (guards ctrlMu)
+	ctrlMu   sync.Mutex    // guards inflight/cond/closed
+	closed   bool          // Close: dispatcher must not enqueue
+	workers  sync.WaitGroup
+
+	// irqPending coalesces interrupt requests: completions set it, and
+	// it is flushed (one injectIRQ ioctl) when the queue goes idle
+	// (last worker out in releaseJob) and at the end of each dispatch
+	// cycle. Correctness: a completion sets the flag before it
+	// decrements inflight, so the decrement that reaches zero sees
+	// every completion of the burst; and any completion while the
+	// dispatcher runs is flushed by the dispatcher's tail.
+	irqPending atomic.Bool
+}
+
+// job is one validated virtio-blk request: chain parsed, header read,
+// and every guest buffer it touches pinned (refs) so a concurrent
+// IOTLB evict/refresh cannot pull the mappings out from under the
+// worker (an unpinned Slice that lands on a munmapped page is SIGBUS).
+type job struct {
+	br   *BlkReq
+	hdr  BlkReqHeader
+	refs []*RegionRef
+	ring *SplitRing // ring the request was claimed from (completion target)
+}
+
+// queueWorkers is the per-queue worker pool size: enough concurrency
+// to keep ~qd128 of loopback backend round-trips in flight. Workers
+// are pure goroutines parked on a channel — idle cost is nil.
+const queueWorkers = 64
+
+// queueJobs bounds the dispatch window; a full channel throttles the
+// dispatcher (and the ring naturally fills at num entries).
+const queueJobs = 256
+
+func (q *queueState) startWorkers(d *Device) {
+	q.jobs = make(chan *job, queueJobs)
+	q.cond = sync.NewCond(&q.ctrlMu)
+	for i := 0; i < queueWorkers; i++ {
+		q.workers.Add(1)
+		go func() {
+			defer q.workers.Done()
+			// Guest-memory faults (touching a DMA-unmapped region)
+			// become recoverable panics on this goroutine; execJob's
+			// recover turns them into I/O-error completions.
+			debug.SetPanicOnFault(true)
+			for j := range q.jobs {
+				d.execJob(q, j)
+			}
+		}()
+	}
+}
+
+// quiesce waits until no claimed work remains on the queue. Callers
+// must hold q.drainMu (which excludes the dispatcher), so after
+// quiesce returns the IOTLB/ring can be mutated with no worker
+// touching guest memory. Queues whose workers never started (Serve
+// not reached) have nothing in flight and return immediately.
+func (d *Device) quiesce(q *queueState) {
+	if q.cond == nil {
+		return
+	}
+	q.cond.L.Lock()
+	for q.inflight > 0 {
+		q.cond.Wait()
+	}
+	q.cond.L.Unlock()
+}
+
+// releaseJob unpins the request's guest regions, drops the driver's
+// per-request mappings (the driver DMA-unmaps them as soon as it sees
+// our used entry), and reports completion to quiesce.
+func (d *Device) releaseJob(q *queueState, j *job) {
+	for _, p := range j.refs {
+		p.Release()
+	}
+	j.refs = nil
+	for _, sg := range j.br.DataSegs {
+		d.iotlb.Evict(sg.Addr, evictMaxSize)
+	}
+	q.cond.L.Lock()
+	q.inflight--
+	idle := q.inflight == 0
+	if idle {
+		q.cond.Broadcast()
+	}
+	q.cond.L.Unlock()
+	if idle {
+		// Last worker out: the burst's completions are all in the used
+		// ring now, so one interrupt covers them.
+		d.flushIRQ(q)
+	}
+}
+
+// execJob runs one job: backend I/O, status byte, used-ring entry. Any
+// guest-memory fault (buffer DMA-unmapped under us: driver timeout
+// racing our completion, reconnect leftovers) is turned into an
+// I/O-error completion, which is exactly what unblocks the guest —
+// virtio-blk has no blk-mq timeout, so an abandoned request would
+// wedge everything.
+func (d *Device) execJob(q *queueState, j *job) {
+	completed := false
+	complete := func(status uint8, written uint32) {
+		if completed {
+			return
+		}
+		completed = true
+		d.completeSafe(q, j.ring, j.br, status, written)
+	}
+	defer func() {
+		if r := recover(); r != nil {
+			fmt.Fprintf(os.Stderr, "sdsd: vduse %s q%d: guest memory fault in worker (%v) head=%d — completing with I/O error\n",
+				d.name, q.idx, r, j.br.Head)
+			d.faultEvict(j.br.DataSegs)
+			complete(StatusIOErr, 0)
+		}
+		d.releaseJob(q, j)
+	}()
+	status, written := d.exec(j.br, j.hdr)
+	complete(status, written)
+}
+
+// completeSafe writes the status byte and publishes the used entry.
+// It runs under its own fault guard: it is called from recover
+// handlers, where a second fault (status page itself unmapped) must
+// degrade to "completion lost" (the watchdog/next kick picks it up)
+// rather than crashing the daemon.
+func (d *Device) completeSafe(q *queueState, ring *SplitRing, br *BlkReq, status uint8, written uint32) (ok bool) {
+	prev := debug.SetPanicOnFault(true)
+	defer func() {
+		if recover() != nil {
+			ok = false
+		}
+		debug.SetPanicOnFault(prev)
+	}()
+	if err := br.WriteStatus(d.gm, status); err != nil {
+		d.logf("q%d: write status head=%d: %v\n", q.idx, br.Head, err)
+		return false
+	}
+	if irq, err := ring.PushUsed(br.Head, written); err != nil {
+		d.logf("q%d: push used head=%d: %v\n", q.idx, br.Head, err)
+		return false
+	} else if irq {
+		q.irqPending.Store(true)
+	}
+	return true
+}
+
+// flushIRQ injects at most one pending interrupt for the queue.
+func (d *Device) flushIRQ(q *queueState) {
+	if q.irqPending.Swap(false) {
+		d.injectIRQ(q.idx)
+	}
+}
+
+// faultEvict drops the per-request mappings covering the buffers we
+// were touching, so the faulting IOVA is never used again; the driver
+// re-maps (with a fresh IOVA) on the next submission. Large permanent
+// mappings (QEMU-style whole-RAM) are kept, matching the pre-parallel
+// drain guard's behaviour.
+func (d *Device) faultEvict(segs []Seg) {
+	for _, sg := range segs {
+		d.iotlb.Evict(sg.Addr, evictMaxSize)
+	}
 }
 
 // Device is a running VDUSE virtio-blk device backed by be.
@@ -150,6 +328,7 @@ type Device struct {
 
 	lastFull int64      // unix nanos of last full IOTLB pull (kick gate)
 	attached bool       // reconnected to a pre-existing kernel device
+	watchdog bool       // kick-loss watchdog armed (reconnect session only)
 	pullMu   sync.Mutex // serialises VDUSE_IOTLB_GET_FD pulls
 	trim     bool
 	wz       bool
@@ -281,6 +460,7 @@ func (d *Device) setupVQs() error {
 func (d *Device) Serve() {
 	go d.msgLoop()
 	for _, q := range d.vqs {
+		q.startWorkers(d)
 		go d.kickLoop(q)
 	}
 	// On reconnect the driver is already live: requests it submitted
@@ -300,19 +480,37 @@ func (d *Device) Close() error {
 		close(d.stop)
 	}
 	if d.devFD != nil {
-		// Deassign kick fds, then closing the dev fd detaches the device.
+		// Stop producers: kickLoop exits when its eventfd closes;
+		// q.closed refuses late enqueues. lockDrains then waits for
+		// every dispatcher to leave dispatchLocked, quiesce drains the
+		// worker pool (in-flight jobs release their pins and touch
+		// guest memory), and only after workers.Stop may we close the
+		// dev fd (completions inject IRQs through it) and unmap.
 		for _, q := range d.vqs {
 			var ea [8]byte
 			binary.LittleEndian.PutUint32(ea[0:], q.idx)
 			binary.LittleEndian.PutUint32(ea[4:], 0xFFFFFFFF) // VDUSE_EVENTFD_DEASSIGN
 			ioctl(d.devFD.Fd(), iocVQSetupKickFD, unsafe.Pointer(&ea[0]))
 			q.kickFD.Close()
+			if q.jobs != nil {
+				q.ctrlMu.Lock()
+				q.closed = true
+				q.ctrlMu.Unlock()
+			}
 		}
+		d.lockDrains()
+		for _, q := range d.vqs {
+			if q.jobs == nil {
+				continue
+			}
+			d.quiesce(q)
+			close(q.jobs)
+			q.workers.Wait()
+		}
+		d.unlockDrains()
 		d.devFD.Close()
 	}
-	for _, r := range d.iotlb.Snapshot() {
-		syscall.Munmap(r.Mem)
-	}
+	d.iotlb.ReleaseAll()
 	// Deliberately NOT destroyed: the kernel keeps a VDUSE device alive
 	// while no daemon is connected, so a restarted daemon reattaches and
 	// I/O resumes (kicks accumulated while we were gone are replayed).
@@ -465,9 +663,7 @@ func (d *Device) iotlbPullRange(start, last uint64) error {
 		if err != nil {
 			return fmt.Errorf("vduse: mmap iotlb [%x,%x]: %w", mstart, mlast, err)
 		}
-		for _, old := range d.iotlb.Add(Region{Start: mstart, Last: mlast, Mem: base}) {
-			syscall.Munmap(old.Mem)
-		}
+		d.iotlb.Add(Region{Start: mstart, Last: mlast, Mem: base})
 		if mlast >= last {
 			break
 		}
@@ -534,10 +730,10 @@ func (d *Device) iotlbRefresh() error {
 		start = mlast + 1
 	}
 
-	var drop []Region
+	dropCount := 0
 	for _, r := range d.iotlb.Snapshot() {
 		if _, ok := fresh[r.Start]; !ok {
-			drop = append(drop, r)
+			dropCount++
 		}
 	}
 	d.iotlb.Replace(fresh)
@@ -554,16 +750,13 @@ func (d *Device) iotlbRefresh() error {
 			return fmt.Errorf("vduse: mmap iotlb [%x,%x]: %w", mstart, mlast, err)
 		}
 		// Regions starting at mstart are already accounted for in
-		// fresh/drop; Add only trims foreign overlaps.
-		for _, old := range d.iotlb.Add(Region{Start: mstart, Last: mlast, Mem: base}) {
-			syscall.Munmap(old.Mem)
-		}
+		// fresh/drop; Add only trims foreign overlaps. The table
+		// owns removed mappings and unmaps them (pinned ones are
+		// parked until their last release).
+		d.iotlb.Add(Region{Start: mstart, Last: mlast, Mem: base})
 	}
-	for _, r := range drop {
-		syscall.Munmap(r.Mem)
-	}
-	if len(want) > 0 || len(drop) > 0 {
-		d.logf("iotlb: %d regions (+%d -%d)\n", len(fresh)+len(want), len(want), len(drop))
+	if len(want) > 0 || dropCount > 0 {
+		d.logf("iotlb: %d regions (+%d -%d)\n", len(fresh)+len(want), len(want), dropCount)
 	}
 	return nil
 }
@@ -585,10 +778,15 @@ func (d *Device) unlockDrains() {
 	}
 }
 
-// refreshLocked re-pulls the IOTLB with all drains frozen. Caller must
-// not hold any drainMu.
+// refreshLocked re-pulls the IOTLB with all queue work frozen. Caller
+// must not hold any drainMu.
 func (d *Device) refreshLocked() {
 	d.lockDrains()
+	for _, q := range d.vqs {
+		if q.jobs != nil {
+			d.quiesce(q)
+		}
+	}
 	d.pullMu.Lock()
 	err := d.iotlbRefresh()
 	d.pullMu.Unlock()
@@ -663,10 +861,73 @@ func (d *Device) refreshAndDrain(drain bool) {
 		ring := q.ring
 		d.mu.Unlock()
 		if ring != nil {
-			d.drainLocked(q, ring)
+			d.dispatchLocked(q, ring)
+			d.flushIRQ(q)
 		}
 	}
 	d.unlockDrains()
+	if !drain {
+		// Reconnect: the kick we may have missed is the one the driver
+		// rang between the old daemon's death and our kickfd assignment
+		// (kicks are replayed by the kernel, but a kick that arrived
+		// while no fd existed and before `kicked` was consulted can be
+		// lost). Poll the avail ring for a while so the guest's pending
+		// request is served even if its kick never reaches us.
+		go d.watchdogDrain()
+	}
+}
+
+// watchdogDrain polls every queue's avail ring for a few seconds after a
+// reconnect and drains anything that shows up late; it stops as soon as a
+// real kick arrives (kickLoop sets q.kicked).
+func (d *Device) watchdogDrain() {
+	deadline := time.Now().Add(30 * time.Second)
+	type snap struct {
+		a, u uint16
+		err  string
+	}
+	prev := map[uint32]snap{}
+	for time.Now().Before(deadline) {
+		select {
+		case <-d.stop:
+			return
+		case <-time.After(250 * time.Millisecond):
+		}
+		// Wake the driver for completions the previous session pushed
+		// to the used ring whose interrupt never landed (the IRQ was
+		// injected while no fd/callback was assigned). A spurious
+		// interrupt is harmless: vring_interrupt finds nothing new.
+		for _, q := range d.vqs {
+			d.injectIRQ(q.idx)
+		}
+		// lockDrains holds every q.drainMu, so the ring is ours
+		// exclusively (a concurrent kick drains after we release).
+		d.lockDrains()
+		for _, q := range d.vqs {
+			d.mu.Lock()
+			ring := q.ring
+			d.mu.Unlock()
+			if ring == nil {
+				continue
+			}
+			pending, err := ring.HasPending()
+			la, lu := ring.State()
+			ai, aierr := ring.AvailIdx()
+			ui, uier := ring.UsedIdx()
+			// Log only on state change to keep the reconnect trace
+			// readable (the watchdog fires 4x/second otherwise).
+			cur := snap{ai, ui, fmt.Sprint(aierr, uier)}
+			if d.dbg && cur != prev[q.idx] {
+				prev[q.idx] = cur
+				d.logf("watchdog q%d: pending=%v err=%v last=(%d,%d) live=(%d,%d) liveerr=(%v,%v)\n",
+					q.idx, pending, err, la, lu, ai, ui, aierr, uier)
+			}
+			if err == nil && pending {
+				d.dispatchLocked(q, ring)
+			}
+		}
+		d.unlockDrains()
+	}
 }
 
 // readUsedIdx / readAvailIdx read the guest ring indices for cursor
@@ -704,9 +965,7 @@ func (d *Device) readIdx(q *queueState, what string, fn func() (uint16, error)) 
 // loop shape mirrors QEMU libvduse. Old overlapping regions are removed
 // and unmapped.
 func (d *Device) iotlbApply(start, last uint64) error {
-	for _, r := range d.iotlb.RemoveRange(start, last) {
-		syscall.Munmap(r.Mem)
-	}
+	d.iotlb.RemoveRange(start, last)
 	for start <= last {
 		var e [32]byte
 		binary.LittleEndian.PutUint64(e[8:], start)
@@ -730,9 +989,7 @@ func (d *Device) iotlbApply(start, last uint64) error {
 		if err != nil {
 			return fmt.Errorf("vduse: mmap iotlb [%x,%x]: %w", mstart, mlast, err)
 		}
-		for _, old := range d.iotlb.Add(Region{Start: mstart, Last: mlast, Mem: base}) {
-			syscall.Munmap(old.Mem)
-		}
+		d.iotlb.Add(Region{Start: mstart, Last: mlast, Mem: base})
 		if mlast >= last {
 			break
 		}
@@ -808,18 +1065,22 @@ func (d *Device) kickLoop(q *queueState) {
 		}
 		q.drainMu.Lock()
 		if stale {
-			// Hold drainMu so the refresh cannot unmap buffers of a
-			// request being served: the queue must be fully drained
-			// first (newly arrived requests pull their own mapping
-			// on a lookup miss).
+			// Hold drainMu (no new claims) and quiesce (in-flight
+			// jobs finish and release pins) so the refresh cannot
+			// yank mappings out from under served requests.
+			d.quiesce(q)
 			d.pullMu.Lock()
 			if err := d.iotlbRefresh(); err != nil {
 				d.logf("iotlb refresh: %v\n", err)
 			}
 			d.pullMu.Unlock()
 		}
-		d.drainLocked(q, ring)
+		d.dispatchLocked(q, ring)
 		q.drainMu.Unlock()
+		// One interrupt per kick cycle: workers that completed during
+		// dispatch left irqPending set; stragglers completing later
+		// flush at the idle transition in releaseJob.
+		d.flushIRQ(q)
 	}
 }
 
@@ -833,144 +1094,131 @@ const kickRefreshInterval = 5 * time.Millisecond
 // huge, permanent, and must not be torn down per request.
 const evictMaxSize = 8 << 20
 
-// evict drops the mappings covering the request's data buffers, which
-// the driver unmaps as soon as it observes the used entry: keeping them
-// risks touching pages the guest has already recycled.
-func (d *Device) evict(segs []Seg) {
-	for _, sg := range segs {
-		r, ok := d.iotlb.Evict(sg.Addr)
-		if !ok {
-			continue
-		}
-		if uint64(len(r.Mem)) > evictMaxSize {
-			d.iotlb.Add(r) // big permanent mapping: keep it
-			continue
-		}
-		syscall.Munmap(r.Mem)
-	}
-}
-
-func (d *Device) drain(q *queueState, ring *SplitRing) {
-	q.drainMu.Lock()
-	defer q.drainMu.Unlock()
-	d.drainLocked(q, ring)
-}
-
-// drainLocked serves avail-ring requests; caller must hold q.drainMu.
+// dispatchLocked is the queue dispatcher: it claims avail entries
+// serially (NextAvail is single-consumer), parses and validates each
+// chain, pins every guest buffer the request touches, and hands the
+// job to the worker pool. All guest-memory reads it performs (chain,
+// header) happen here, inline, under the dispatcher's fault guard: a
+// fault on these pages means the ring/buffer pages are gone, which
+// keeps the original queue-kill semantics (a broken guest is not worth
+// an infinite error loop).
 //
-// A request whose guest buffer was DMA-unmapped under us (driver
-// timeout racing our completion path, reconnect leftovers) faults on
-// touch: a SIGBUS inside the mmap'd regions. debug.SetPanicOnFault
-// turns that into a recoverable panic; we evict the suspect region,
-// complete the request with an I/O error, and keep the queue — and
-// the daemon — alive.
-func (d *Device) drainLocked(q *queueState, ring *SplitRing) {
-	// Guest-memory faults (touching a DMA-unmapped region) become
-	// recoverable panics on this goroutine; see the recover below.
-	debug.SetPanicOnFault(true)
-	gm := d.gm
-	var doneAddrs []Seg
-	var curHead int = -1
-	var statusAddr uint64
-	var hasStatus bool
-	var pending []Seg
-	var stage string
+// Caller must hold q.drainMu (serialises dispatchers) and q.ring must
+// be the queue's current ring.
+func (d *Device) dispatchLocked(q *queueState, ring *SplitRing) {
+	prev := debug.SetPanicOnFault(true)
 	defer func() {
-		r := recover()
-		d.evict(doneAddrs)
-		if r == nil {
-			return
+		if r := recover(); r != nil {
+			fmt.Fprintf(os.Stderr, "sdsd: vduse %s q%d: guest memory fault in dispatcher (%v) — mappings for claimed entries are gone\n",
+				d.name, q.idx, r)
 		}
-		fmt.Fprintf(os.Stderr, "sdsd: vduse %s q%d: guest memory fault (%v) head=%d stage=%s — evicting mappings\n",
-			d.name, q.idx, r, curHead, stage)
-		if !hasStatus {
-			// Ring-level fault: the avail/used/desc pages themselves
-			// are gone. Dump the table for diagnosis.
-			rs := d.iotlb.Snapshot()
-			for i, reg := range rs {
-				if i >= 6 {
-					fmt.Fprintf(os.Stderr, "sdsd: vduse %s q%d: iotlb: ... %d more\n", d.name, q.idx, len(rs)-i)
-					break
-				}
-				fmt.Fprintf(os.Stderr, "sdsd: vduse %s q%d: iotlb: [%x,%x] mapped=%v\n",
-					d.name, q.idx, reg.Start, reg.Last, len(reg.Mem) > 0)
-			}
-		}
-		// Drop the per-request mappings covering the buffers we were
-		// touching, so the faulting IOVA is never used again; the
-		// driver re-maps (with a fresh IOVA) on the next submission.
-		for _, sg := range pending {
-			if reg, ok := d.iotlb.Evict(sg.Addr); ok {
-				if uint64(len(reg.Mem)) <= evictMaxSize {
-					syscall.Munmap(reg.Mem)
-				} else {
-					d.iotlb.Add(reg)
-				}
-			}
-		}
-		// Complete the request with an I/O error so the guest is not
-		// left waiting: the status segment is device-writeable and
-		// normally mapped fine (faults hit the data buffers).
-		if hasStatus && curHead >= 0 {
-			if werr := gm.Write([]byte{StatusIOErr}, statusAddr); werr == nil {
-				if irq, err := ring.PushUsed(uint16(curHead), 0); err == nil && irq {
-					d.injectIRQ(q.idx)
-				}
-			} else {
-				fmt.Fprintf(os.Stderr, "sdsd: vduse %s q%d: status write after fault: %v\n", d.name, q.idx, werr)
-			}
-		}
+		debug.SetPanicOnFault(prev)
 	}()
+	gm := d.gm
 	for {
-		stage = "next-avail"
 		head, err := ring.NextAvail()
 		if err != nil || head < 0 {
 			return
 		}
-		curHead = head
-		var irq bool
-		stage = "read-chain"
-		segs, err := ReadChain(gm, int(ring.Size()), uint16(head))
+		segs, err := ReadChain(gm, ring.DescBase(), int(ring.Size()), uint16(head))
+		var br *BlkReq
+		var hdr BlkReqHeader
 		if err == nil {
-			var br *BlkReq
 			br, err = ParseBlkChain(segs, uint16(head))
 			if err == nil {
-				pending = br.DataSegs
-				statusAddr, hasStatus = br.StatusSeg.Addr, true
-				var hdr BlkReqHeader
-				var written uint32
-				stage = "read-header"
 				hdr, err = br.ReadHeader(gm)
-				var status uint8
-				if err == nil {
-					stage = "exec"
-					status, written = d.exec(br, hdr)
-					stage = "write-status"
-					err = br.WriteStatus(gm, status)
-				}
-				hasStatus = false
-				stage = "push-used"
-				if irq, err = ring.PushUsed(uint16(head), written); err == nil {
-					if irq {
-						d.injectIRQ(q.idx)
-					}
-					doneAddrs = append(doneAddrs, br.DataSegs...)
-				}
 			}
 		}
 		if err != nil {
 			// Malformed chain: log once and stop the queue; a broken
-			// guest is not worth an infinite error loop.
+			// guest is not worth an infinite error loop. With debug on,
+			// dump the raw head descriptor and the chain so the
+			// offending segment is visible.
+			if d.dbg {
+				var raw [16]byte
+				if rerr := d.gm.Read(raw[:], ring.DescBase()+uint64(head)*16); rerr == nil {
+					d.logf("q%d: head=%d desc=%x\n", q.idx, head, raw[:])
+				} else {
+					d.logf("q%d: head=%d desc read: %v\n", q.idx, head, rerr)
+				}
+				ai, aerr := ring.AvailIdx()
+				ui, uerr := ring.UsedIdx()
+				d.logf("q%d: availIdx=%d (lastAvail=%d, err=%v) usedIdx=%d (err=%v) segs:",
+					q.idx, ai, ring.lastAvail-1, aerr, ui, uerr)
+				for i, sg := range segs {
+					d.logf(" [%d %x len=%d w=%v]", i, sg.Addr, sg.Len, sg.Write)
+				}
+				d.logf("\n")
+			}
 			fmt.Fprintf(os.Stderr, "sdsd: vduse %s q%d: %v\n", d.name, q.idx, err)
 			return
 		}
+		// Pin every buffer the worker will touch (header copy is done;
+		// data segments and status byte are touched in the worker).
+		// Pinning a segment whose mapping vanished under us is fatal to
+		// this request only: complete it with I/O error and keep going.
+		nsegs := len(br.DataSegs) + 1
+		refs := make([]*RegionRef, 0, nsegs)
+		pin := func(addr uint64, length int) bool {
+			p, perr := gm.Acquire(addr, length)
+			if perr != nil {
+				if d.dbg {
+					d.logf("q%d: pin(%x,%d): %v\n", q.idx, addr, length, perr)
+				}
+				return false
+			}
+			refs = append(refs, p)
+			return true
+		}
+		ok := true
+		for _, sg := range br.DataSegs {
+			if !pin(sg.Addr, int(sg.Len)) {
+				ok = false
+				break
+			}
+		}
+		if ok && !pin(br.StatusSeg.Addr, 1) {
+			ok = false
+		}
+		if !ok {
+			for _, p := range refs {
+				p.Release()
+			}
+			// Data-seg mappings are already partly gone: drop what we
+			// can so the faulting IOVAs are not reused.
+			d.faultEvict(br.DataSegs)
+			if !d.completeSafe(q, ring, br, StatusIOErr, 0) && d.dbg {
+				d.logf("q%d: head=%d: pin failed and completion lost\n", q.idx, head)
+			}
+			continue
+		}
+		j := &job{br: br, hdr: hdr, refs: refs, ring: ring}
+		// inflight accounting must be incremented before the job is
+		// visible to workers (releaseJob decrements): take ctrlMu
+		// first, publish under it, so quiesce can never observe
+		// "inflight==0" with a job still in flight.
+		q.ctrlMu.Lock()
+		if q.closed {
+			q.ctrlMu.Unlock()
+			for _, p := range refs {
+				p.Release()
+			}
+			d.completeSafe(q, ring, br, StatusIOErr, 0)
+			return
+		}
+		q.inflight++
+		q.ctrlMu.Unlock()
+		q.jobs <- j
 	}
 }
 
 func (d *Device) injectIRQ(idx uint32) {
 	var b [4]byte
 	binary.LittleEndian.PutUint32(b[:], idx)
-	ioctl(d.devFD.Fd(), iocVQInjectIRQ, unsafe.Pointer(&b[0]))
+	if _, _, errno := syscall.Syscall(syscall.SYS_IOCTL, d.devFD.Fd(),
+		iocVQInjectIRQ, uintptr(unsafe.Pointer(&b[0]))); errno != 0 && d.dbg {
+		d.logf("injectIRQ q%d: %v\n", idx, errno)
+	}
 }
 
 // exec runs one virtio-blk request and returns (status, bytes-written-
@@ -982,19 +1230,33 @@ func (d *Device) exec(br *BlkReq, hdr BlkReqHeader) (uint8, uint32) {
 	off := int64(hdr.Sector) * 512
 	switch hdr.Type {
 	case ReqIn:
+		// VIRTIO_BLK_T_IN: the guest receives data, so every data
+		// segment is device-writeable (VRING_DESC_F_WRITE set).
 		var n uint32
 		for _, sg := range br.DataSegs {
-			if sg.Write {
+			if !sg.Write {
+				if d.dbg {
+					d.logf("exec IN: data seg %x not device-writeable\n", sg.Addr)
+				}
 				return StatusIOErr, 0
 			}
 			b, err := gm.Slice(sg.Addr, int(sg.Len))
 			if err != nil {
+				if d.dbg {
+					d.logf("exec IN: slice(%x,%d): %v\n", sg.Addr, sg.Len, err)
+				}
 				return StatusIOErr, 0
 			}
 			if off+int64(len(b)) > int64(d.be.Size()) {
+				if d.dbg {
+					d.logf("exec IN: sector %d len %d past size %d\n", hdr.Sector, len(b), d.be.Size())
+				}
 				return StatusIOErr, 0
 			}
 			if _, err := d.be.ReadAt(b, off); err != nil {
+				if d.dbg {
+					d.logf("exec IN: readat(%d,%d): %v\n", off, len(b), err)
+				}
 				return StatusIOErr, 0
 			}
 			off += int64(len(b))
@@ -1082,6 +1344,9 @@ func (d *Device) exec(br *BlkReq, hdr BlkReqHeader) (uint8, uint32) {
 		}
 		return StatusOK, 0
 	default:
+		if d.dbg {
+			d.logf("exec: unsupported request type=%d\n", hdr.Type)
+		}
 		return StatusUnsupp, 0
 	}
 }

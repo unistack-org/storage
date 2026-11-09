@@ -6,6 +6,7 @@ package vduse
 import (
 	"encoding/binary"
 	"errors"
+	"sync"
 )
 
 // Descriptor flags (virtio 1.x, vring_desc.flags).
@@ -65,7 +66,14 @@ func DecodeDesc(b []byte) (Desc, error) {
 // segments in chain order. It bounds total descriptors (MaxChainLen) and
 // per-segment length (1 GiB) so a malicious/buggy ring cannot hang or
 // over-allocate the device.
-func ReadChain(gm GuestMem, ringSize int, head uint16) ([]Seg, error) {
+//
+// descBase is the IOVA of the descriptor table (vring.desc). It is a
+// parameter, not an implicit 0: the virtio-vDPA driver places the rings
+// wherever the DMA API gives them, and on kernel 7.2 the ring region
+// lives at a non-zero IOVA (e.g. 0x47ffc000) inside the bounce region,
+// so reading descriptors at head*16 from IOVA 0 touches an unrelated
+// (often unallocated) bounce page.
+func ReadChain(gm GuestMem, descBase uint64, ringSize int, head uint16) ([]Seg, error) {
 	if ringSize <= 0 || int(head) >= ringSize {
 		return nil, ErrBadDesc
 	}
@@ -80,7 +88,13 @@ func ReadChain(gm GuestMem, ringSize int, head uint16) ([]Seg, error) {
 				return ErrBadDesc // nested indirect is forbidden
 			}
 			n := int(d.Len / 16)
-			if n <= 0 || n > ringSize || n > MaxChainLen-total {
+			// No n <= ringSize bound: Linux builds indirect tables of
+			// up to queue-size + 2 descriptors (data segs plus the
+			// request header and status byte all live in the table),
+			// so a 256-entry ring legitimately carries a 258-entry
+			// table — e.g. the big DISCARD/WRITE_ZEROES mkfs.ext4
+			// issues. Bound by MaxChainLen only.
+			if n <= 0 || n > MaxChainLen-total {
 				return ErrBadDesc
 			}
 			tbl := make([]byte, n*16)
@@ -111,7 +125,7 @@ func ReadChain(gm GuestMem, ringSize int, head uint16) ([]Seg, error) {
 	cur := int(head)
 	for {
 		var dbuf [16]byte
-		if err := gm.Read(dbuf[:], uint64(cur)*16); err != nil {
+		if err := gm.Read(dbuf[:], descBase+uint64(cur)*16); err != nil {
 			return nil, err
 		}
 		d, err := DecodeDesc(dbuf[:])
@@ -145,8 +159,19 @@ type SplitRing struct {
 	descBase  uint64 // vring_desc[size]
 	availBase uint64 // vring_avail: flags, idx, ring[size], used_event
 	usedBase  uint64 // vring_used: flags, idx, ring[size](id,len), avail_event
-	lastAvail uint16 // next avail slot to consume
-	lastUsed  uint16 // next used slot to fill
+
+	// usedMu serialises the used-ring producer side. A parallel
+	// runtime completes requests from several worker goroutines, and
+	// PushUsed mutates lastUsed, publishes used.idx and samples the
+	// driver's interrupt flags: the sequence must be atomic per
+	// completion or used slots are overwritten and the index is
+	// published out of order. The consumer side stays lock-free: the
+	// driver single-produces the avail ring and one dispatcher thread
+	// consumes it (lastAvail is dispatcher-serial by construction).
+	usedMu sync.Mutex
+
+	lastAvail uint16 // next avail slot to consume (dispatcher-serial)
+	lastUsed  uint16 // next used slot to fill (guarded by usedMu)
 }
 
 // Split-ring layout offsets.
@@ -165,6 +190,9 @@ func NewSplitRing(gm GuestMem, size uint16, desc, avail, used uint64) *SplitRing
 
 // Size is the ring size (power of two).
 func (r *SplitRing) Size() uint16 { return r.size }
+
+// DescBase is the IOVA of the descriptor table (vring.desc).
+func (r *SplitRing) DescBase() uint64 { return r.descBase }
 
 // SetState restores device-side cursors (VDUSE_GET_VQ_STATE answer and
 // post-RESET initialisation).
@@ -197,6 +225,16 @@ func (r *SplitRing) AvailIdx() (uint16, error) {
 	return binary.LittleEndian.Uint16(b[:]), nil
 }
 
+// HasPending reports whether the driver published avail entries beyond
+// our cursor without kicking us (used by the reconnect watchdog).
+func (r *SplitRing) HasPending() (bool, error) {
+	var b [2]byte
+	if err := r.gm.Read(b[:], r.availBase+availIdxOff); err != nil {
+		return false, err
+	}
+	return binary.LittleEndian.Uint16(b[:]) != r.lastAvail, nil
+}
+
 // NextAvail returns the head of the next available descriptor chain, or
 // (-1, nil) when the queue is empty.
 func (r *SplitRing) NextAvail() (int, error) {
@@ -220,6 +258,8 @@ func (r *SplitRing) NextAvail() (int, error) {
 // the driver's VRING_AVAIL_F_NO_INTERRUPT suppression flag; we never set
 // used.flags (no EVENT_IDX reliance), so "no suppression" means IRQ.
 func (r *SplitRing) PushUsed(head uint16, written uint32) (bool, error) {
+	r.usedMu.Lock()
+	defer r.usedMu.Unlock()
 	slot := uint64(r.lastUsed % r.size)
 	var e [8]byte
 	binary.LittleEndian.PutUint32(e[0:], uint32(head))
@@ -248,10 +288,12 @@ type BlkReq struct {
 	Head      uint16
 }
 
-// ParseBlkChain validates a virtio-blk chain: >=3 segs, 16+-byte header
+// ParseBlkChain validates a virtio-blk chain: >=2 segs, 16+-byte header
 // (device-readable) first, exactly-1-byte status (device-writeable) last.
+// FLUSH (and a degenerate GET_ID) carry no data segments at all, so two
+// segments is legal — rejecting it kills the queue on the first fsync.
 func ParseBlkChain(segs []Seg, head uint16) (*BlkReq, error) {
-	if len(segs) < 3 {
+	if len(segs) < 2 {
 		return nil, ErrBadDesc
 	}
 	h, s := segs[0], segs[len(segs)-1]

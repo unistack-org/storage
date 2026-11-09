@@ -33,7 +33,13 @@ const (
 // virtio feature bits we advertise (kept to what we actually implement).
 const (
 	featRingIndirect  = 1 << 28 // indirect descriptor tables allowed
-	featRingEventIdx  = 1 << 29 // event indices (we ignore, driver may use)
+	// VIRTIO_RING_F_EVENT_IDX is deliberately NOT advertised: it lets the
+	// driver suppress kicks using used.avail_event, a field a split-ring
+	// device must write. We never do, so the threshold computed from the
+	// stale zero makes vring_need_event() false and the driver publishes
+	// requests without ever kicking the daemon (the request sits in the
+	// avail ring forever). Kicking on every publish is the correct
+	// behaviour for a device that does not maintain event indices.
 	featVersion1      = 1 << 32 // virtio 1.0 device, legacy not offered
 	featBlkSizeMax    = 1 << 1  // config.size_max valid
 	featBlkSegMax     = 1 << 2  // config.seg_max valid
@@ -52,7 +58,7 @@ const (
 // write-zeroes included; see Options to disable them per device).
 // VIRTIO_F_ACCESS_PLATFORM is mandatory (vduse features_is_valid()) and
 // CONFIG_WCE must stay off for the same reason.
-const Features = uint64(featVersion1 | featRingIndirect | featRingEventIdx |
+const Features = uint64(featVersion1 | featRingIndirect |
 	featAccessPlatform |
 	featBlkSizeMax | featBlkSegMax | featBlkBlkSize | featBlkFlush |
 	featBlkDiscard | featBlkTopology | featBlkWriteZeroe)

@@ -2,6 +2,7 @@ package vduse
 
 import (
 	"encoding/binary"
+	"sync"
 	"testing"
 )
 
@@ -42,6 +43,30 @@ func (g *memGuest) Write(src []byte, iova uint64) error {
 		g.pages[p][a%pgSize] = src[i]
 	}
 	return nil
+}
+
+// Slice implements SliceGuestMem for single-page regions (all tests use
+// page-aligned addresses that do not cross a page boundary).
+func (g *memGuest) Slice(iova uint64, length int) ([]byte, error) {
+	p := iova / pgSize
+	off := iova % pgSize
+	if off+uint64(length) > pgSize {
+		return nil, ErrNotMapped
+	}
+	if g.pages[p] == nil {
+		g.pages[p] = make([]byte, pgSize)
+	}
+	return g.pages[p][off : off+uint64(length)], nil
+}
+
+// Acquire implements SliceGuestMem. Tests exercise exec/ring logic
+// directly (no dispatcher), so a token that Release accepts is enough;
+// exec reads memory through Slice, which the stub serves fully.
+func (g *memGuest) Acquire(iova uint64, length int) (*RegionRef, error) {
+	if _, err := g.Slice(iova, length); err != nil {
+		return nil, err
+	}
+	return &RegionRef{}, nil
 }
 
 // putDesc writes one descriptor at table index i.
@@ -102,7 +127,7 @@ func TestReadChainSimple(t *testing.T) {
 	putDesc(g, descBase, 0, 0x1000, 16, DescFlagNext, 1)
 	putDesc(g, descBase, 1, 0x2000, 512, DescFlagNext, 2)
 	putDesc(g, descBase, 2, 0x3000, 1, DescFlagWrite, 0)
-	segs, err := ReadChain(g, 8, 0)
+	segs, err := ReadChain(g, descBase, 8, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -122,7 +147,7 @@ func TestReadChainIndirect(t *testing.T) {
 	putDesc(g, tblBase, 0, 0x1000, 16, DescFlagNext, 1)
 	putDesc(g, tblBase, 1, 0x2000, 512, DescFlagNext, 2)
 	putDesc(g, tblBase, 2, 0x3000, 1, DescFlagWrite, 0)
-	segs, err := ReadChain(g, 8, 0)
+	segs, err := ReadChain(g, descBase, 8, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -131,13 +156,61 @@ func TestReadChainIndirect(t *testing.T) {
 	}
 }
 
+// TestReadChainOversizedIndirect is the mkfs.ext4 regression: Linux
+// builds indirect tables with up to queue-size + 2 entries (256 data
+// segments plus header and status on a 256-entry ring, table len
+// 0x1020). The old n <= ringSize bound rejected these chains, killing
+// the queue on the first big DISCARD/WRITE_ZEROES.
+func TestReadChainOversizedIndirect(t *testing.T) {
+	g := newMemGuest()
+	const descBase, tblBase = 0, 0x9000
+	const ringSize, n = 256, 258
+	putDesc(g, descBase, 0, tblBase, n*16, DescFlagIndirect, 0)
+	for i := 0; i < n; i++ {
+		var f uint16
+		if i < n-1 {
+			f = DescFlagNext
+		}
+		if i == n-1 {
+			f = DescFlagWrite // status
+		}
+		putDesc(g, tblBase, i, 0x10000+uint64(i)*0x1000, 4096, f, uint16(i+1))
+	}
+	segs, err := ReadChain(g, descBase, ringSize, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(segs) != n {
+		t.Fatalf("len(segs) = %d, want %d", len(segs), n)
+	}
+}
+
 func TestReadChainRejectsNestedIndirect(t *testing.T) {
 	g := newMemGuest()
 	const descBase, tblBase = 0, 0x9000
 	putDesc(g, descBase, 0, tblBase, 16, DescFlagIndirect, 0)
 	putDesc(g, tblBase, 0, 0xA000, 16, DescFlagIndirect, 0)
-	if _, err := ReadChain(g, 8, 0); err == nil {
+	if _, err := ReadChain(g, descBase, 8, 0); err == nil {
 		t.Fatal("nested indirect accepted")
+	}
+}
+
+// TestReadChainNonZeroDescBase is the kernel-7.2 regression: the
+// virtio-vDPA driver places the rings at a non-zero IOVA inside the
+// bounce region (observed: desc=0x47ffc000). Reading descriptors from
+// IOVA 0 touches an unrelated (unallocated) bounce page and faults.
+func TestReadChainNonZeroDescBase(t *testing.T) {
+	g := newMemGuest()
+	const descBase = 0x47ffc000
+	putDesc(g, descBase, 3, 0x1000, 16, DescFlagNext, 4)
+	putDesc(g, descBase, 4, 0x2000, 512, DescFlagNext, 5)
+	putDesc(g, descBase, 5, 0x3000, 1, DescFlagWrite, 0)
+	segs, err := ReadChain(g, descBase, 8, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(segs) != 3 || segs[0].Addr != 0x1000 || !segs[2].Write {
+		t.Fatalf("segs = %+v", segs)
 	}
 }
 
@@ -223,6 +296,17 @@ func TestParseBlkChainAndData(t *testing.T) {
 	if r.Head != 7 || r.DataLen() != 512 {
 		t.Fatalf("req = %+v", r)
 	}
+	// FLUSH: header + status only, no data segment (legal — a queue
+	// that rejects it dies on the guest's first fsync).
+	flush := []Seg{
+		{Addr: 0x1000, Len: 16, Write: false},
+		{Addr: 0x3000, Len: 1, Write: true},
+	}
+	if fr, err := ParseBlkChain(flush, 9); err != nil {
+		t.Fatalf("flush chain: %v", err)
+	} else if fr.DataLen() != 0 {
+		t.Fatalf("flush DataLen = %d, want 0", fr.DataLen())
+	}
 	// bad: status not 1 byte
 	bad := append([]Seg{}, segs...)
 	bad[2].Len = 2
@@ -245,4 +329,100 @@ func TestParseBlkChainAndData(t *testing.T) {
 			t.Fatalf("data mismatch at %d", i)
 		}
 	}
+}
+
+// syncGuest makes memGuest safe for concurrent use so the PushUsed
+// contention test can race real workers on the used ring (the plain
+// map stub is not race-safe).
+type syncGuest struct {
+	mu sync.Mutex
+	g  *memGuest
+}
+
+func (s *syncGuest) Read(dst []byte, iova uint64) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.g.Read(dst, iova)
+}
+
+func (s *syncGuest) Write(src []byte, iova uint64) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.g.Write(src, iova)
+}
+
+func (s *syncGuest) Slice(iova uint64, length int) ([]byte, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.g.Slice(iova, length)
+}
+
+func (s *syncGuest) Acquire(iova uint64, length int) (*RegionRef, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.g.Acquire(iova, length)
+}
+
+// TestPushUsedConcurrent drives many goroutines at one ring's PushUsed
+// (the parallel data path's shape: N workers completing requests on a
+// single queue) and checks the used ring is written exactly once per
+// entry, in order, with a final used.idx equal to the push count.
+func TestPushUsedConcurrent(t *testing.T) {
+	g := newMemGuest()
+	const (
+		desc, avail, used  = 0x0, 0x1000, 0x2000
+		ringSize           = 256
+		pushes             = 1024
+		writers            = 32
+	)
+	sg := &syncGuest{g: g}
+	ring := NewSplitRing(sg, ringSize, desc, avail, used)
+
+	var wg sync.WaitGroup
+	per := pushes / writers
+	for w := 0; w < writers; w++ {
+		wg.Add(1)
+		go func(base int) {
+			defer wg.Done()
+			for i := 0; i < per; i++ {
+				if _, err := ring.PushUsed(uint16(base+i), uint32(base+i)); err != nil {
+					t.Errorf("PushUsed: %v", err)
+					return
+				}
+			}
+		}(w * per)
+	}
+	wg.Wait()
+
+	wantIdx := uint16(pushes) // used.idx is free-running (16-bit), not mod ring
+	if got := g.readU16(used + usedIdxOff); got != wantIdx {
+		t.Fatalf("used.idx = %d, want %d", got, wantIdx)
+	}
+	// Every slot 0..ringSize-1 must hold a distinct (id, len) pair from
+	// the last full pass: collect the final ringSize entries and check
+	// they are a permutation of the last ringSize ids.
+	seen := map[uint16]bool{}
+	for slot := 0; slot < ringSize; slot++ {
+		var e [8]byte
+		if err := g.Read(e[:], used+usedRingOff+8*uint64(slot)); err != nil {
+			t.Fatalf("read used slot %d: %v", slot, err)
+		}
+		id, ln := binary.LittleEndian.Uint16(e[0:]), binary.LittleEndian.Uint32(e[4:])
+		if seen[id] {
+			t.Fatalf("slot %d: duplicate head id %d", slot, id)
+		}
+		seen[id] = true
+		if uint32(id) != ln {
+			t.Fatalf("slot %d: head=%d written=%d, want written==head", slot, id, ln)
+		}
+	}
+	if len(seen) != ringSize {
+		t.Fatalf("saw %d distinct heads, want %d", len(seen), ringSize)
+	}
+}
+
+func (g *memGuest) readU16(iova uint64) uint16 {
+	var b [2]byte
+	_ = g.Read(b[:], iova)
+	return binary.LittleEndian.Uint16(b[:])
 }
