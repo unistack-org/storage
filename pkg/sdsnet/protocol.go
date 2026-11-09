@@ -51,6 +51,11 @@ const (
 	OpRemove      // delete the object (vacuum of deleted-volume garbage)
 	OpStat        // does the object exist? response value = file size
 	OpStatInfo    // does the object exist? response value = allocated bytes
+	// OpStatFS reports the filesystem backing the server's store: the
+	// response carries a 24-byte payload (usage, free, total as big-endian
+	// uint64, bytes). Servers whose backend has no filesystem answer
+	// StatusNotSupp.
+	OpStatFS
 )
 
 func (o Op) String() string {
@@ -73,6 +78,8 @@ func (o Op) String() string {
 		return "stat"
 	case OpStatInfo:
 		return "stat_info"
+	case OpStatFS:
+		return "statfs"
 	}
 	return fmt.Sprintf("op(%d)", uint8(o))
 }

@@ -3,6 +3,8 @@ package sdsnet
 import (
 	"bufio"
 	"context"
+	"crypto/tls"
+	"encoding/binary"
 	"io"
 	"net"
 	"sync"
@@ -28,6 +30,7 @@ type Conn struct {
 	// the request loop allocation-free.
 	sreq  [ReqHeaderSize]byte
 	sresp [RespHeaderSize]byte
+	sfs   [24]byte // OpStatFS payload (usage, free, total)
 	// h is a reusable request header: do() takes it by value semantics
 	// (we stamp Seq/Epoch then encode immediately), so one scratch
 	// header per Conn avoids the &ReqHeader{...} argument allocation.
@@ -47,10 +50,54 @@ func (cc *Conn) Dead() bool { return cc.dead }
 
 // Dial connects and performs the handshake for export.
 func Dial(addr, export string, timeout time.Duration) (*Conn, error) {
+	return DialTLS(addr, export, timeout, nil)
+}
+
+// DialTLS is Dial over TLS when tlsCfg is set (mutual TLS: use
+// tlsconf.Config.ClientConfig; the ServerName is taken from addr). A nil
+// tlsCfg behaves exactly like Dial.
+func DialTLS(addr, export string, timeout time.Duration, tlsCfg *tls.Config) (*Conn, error) {
 	c, err := net.DialTimeout("tcp", addr, timeout)
 	if err != nil {
 		return nil, err
 	}
+	setNoDelay(c)
+	if tlsCfg != nil {
+		host, _, err := net.SplitHostPort(addr)
+		if err != nil {
+			host = addr
+		}
+		cfg := tlsCfg.Clone()
+		if cfg.ServerName == "" {
+			cfg.ServerName = host
+		}
+		tc := tls.Client(c, cfg)
+		if timeout > 0 {
+			_ = tc.SetDeadline(time.Now().Add(timeout))
+		}
+		if err := tc.Handshake(); err != nil {
+			tc.Close()
+			return nil, err
+		}
+		_ = tc.SetDeadline(time.Time{})
+		c = tc
+	}
+	cc := &Conn{
+		c:  c,
+		rd: bufio.NewReaderSize(c, 128<<10),
+		wr: bufio.NewWriterSize(c, 128<<10),
+	}
+	if err := cc.handshake(export, timeout); err != nil {
+		c.Close()
+		return nil, err
+	}
+	return cc, nil
+}
+
+// NewConn builds a protocol connection over an already-established
+// transport (the in-process socketpair path; see Socketpair). The
+// handshake runs exactly as over TCP, so the server side is unchanged.
+func NewConn(c net.Conn, export string, timeout time.Duration) (*Conn, error) {
 	setNoDelay(c)
 	cc := &Conn{
 		c:  c,
@@ -158,6 +205,18 @@ func (cc *Conn) do(ctx context.Context, h *ReqHeader, payload, p []byte) (int, e
 		}
 		return n, nil
 	}
+	if h.Op == OpStatFS {
+		// Fixed 24-byte payload (usage, free, total). Callers pass a
+		// 24-byte p; a short buffer is a programming error, not a
+		// transport one, so it must not mark the Conn dead.
+		if len(p) < 24 {
+			return 0, ErrProtocol
+		}
+		if _, err := io.ReadFull(cc.rd, p[:24]); err != nil {
+			return fail(err)
+		}
+		return 24, nil
+	}
 	return int(rh.Value), nil
 }
 
@@ -173,6 +232,16 @@ func (cc *Conn) op(ctx context.Context, op Op, oid, off uint64, length uint32, f
 func (cc *Conn) Ping(ctx context.Context) error {
 	_, err := cc.op(ctx, OpPing, 0, 0, 0, 0, nil, nil)
 	return err
+}
+
+// StatDisk reports the filesystem behind the server's store: bytes used
+// by the store's data, and the filesystem's free/total bytes. A server
+// whose backend has no filesystem returns StatusNotSupp (an *Error).
+func (cc *Conn) StatDisk(ctx context.Context) (usage, free, total uint64, err error) {
+	if _, err = cc.op(ctx, OpStatFS, 0, 0, 0, 0, nil, cc.sfs[:]); err != nil {
+		return 0, 0, 0, err
+	}
+	return binary.BigEndian.Uint64(cc.sfs[0:8]), binary.BigEndian.Uint64(cc.sfs[8:16]), binary.BigEndian.Uint64(cc.sfs[16:24]), nil
 }
 
 // Read reads len(p) bytes of object oid at off.
@@ -265,6 +334,15 @@ type Pool struct {
 	Addr   string
 	Export string
 	Limit  int // max connections (0 = unlimited)
+	// TLS, when set, dials every connection over TLS (mutual; see
+	// DialTLS).
+	TLS *tls.Config
+	// Local, when set, replaces DialTLS for establishing connections:
+	// it returns an already-connected transport (the in-process
+	// socketpair of a Server in this process). The handshake, headers
+	// and framing are unchanged, so server-side QoS, epoch fencing and
+	// metrics all apply exactly as over TCP.
+	Local func() (net.Conn, error)
 
 	epoch atomic.Uint32 // stamped onto connections at Get
 
@@ -332,7 +410,7 @@ func (pp *Pool) Get(ctx context.Context) (*Conn, error) {
 		pp.opened++
 		pp.mu.Unlock()
 
-		cc, err := Dial(pp.Addr, pp.Export, dialTimeout)
+		cc, err := pp.dial()
 		if err != nil {
 			pp.mu.Lock()
 			pp.opened--
@@ -350,6 +428,19 @@ func (pp *Pool) Get(ctx context.Context) (*Conn, error) {
 		pp.mu.Unlock()
 		return cc, nil
 	}
+}
+
+// dial establishes one connection: the Local transport when set
+// (in-process), else TCP/TLS to Addr.
+func (pp *Pool) dial() (*Conn, error) {
+	if pp.Local != nil {
+		c, err := pp.Local()
+		if err != nil {
+			return nil, err
+		}
+		return NewConn(c, pp.Export, dialTimeout)
+	}
+	return DialTLS(pp.Addr, pp.Export, dialTimeout, pp.TLS)
 }
 
 // Put returns cc to the pool (cc must not be in use). If the pool was
@@ -456,6 +547,19 @@ func (pp *Pool) do(ctx context.Context, fn func(*Conn) error) error {
 // Ping runs a ping over a pooled connection.
 func (pp *Pool) Ping(ctx context.Context) error {
 	return pp.Do(ctx, func(cc *Conn) error { return cc.Ping(ctx) })
+}
+
+// StatDisk runs a pooled filesystem stat (see Conn.StatDisk).
+func (pp *Pool) StatDisk(ctx context.Context) (usage, free, total uint64, err error) {
+	err = pp.Do(ctx, func(cc *Conn) error {
+		var e error
+		usage, free, total, e = cc.StatDisk(ctx)
+		return e
+	})
+	if err != nil {
+		return 0, 0, 0, err
+	}
+	return usage, free, total, nil
 }
 
 // Write runs a pooled write.

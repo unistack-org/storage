@@ -3,6 +3,7 @@ package sdsnet
 import (
 	"bufio"
 	"context"
+	"crypto/tls"
 	"encoding/binary"
 	"errors"
 	"io"
@@ -11,9 +12,14 @@ import (
 	"sync"
 	"sync/atomic"
 	"syscall"
+	"time"
 
 	"github.com/unistack-org/storage/pkg/qos"
 )
+
+// handshakeTLS bounds the TLS handshake on an accepted connection so a
+// stuck peer cannot hold the accept goroutine's resources open.
+const handshakeTLS = 10 * time.Second
 
 // Backend is the storage a Server exposes over the wire. store.Backend
 // satisfies it; tests use an in-memory implementation.
@@ -48,6 +54,15 @@ type statInfoer interface {
 	StatInfo(ctx context.Context, oid uint64) (uint64, uint64, error)
 }
 
+// statFSer is the optional Backend extension that exposes the filesystem
+// behind the store (OpStatFS, cluster capacity metrics): bytes used by
+// the store's data, plus the filesystem's free and total bytes. Backends
+// without a filesystem answer StatusNotSupp (per-op mixed-version
+// degradation, exactly like an old server).
+type statFSer interface {
+	StatFS(ctx context.Context) (usage, free, total uint64, err error)
+}
+
 // Server serves Backends over accepted connections. Every connection is
 // bound to a single export name by the handshake. Exactly one of
 // Backend (single anonymous export: any requested name maps to it) or
@@ -71,6 +86,19 @@ type Server struct {
 	// "limit iops on the physical device" knob — the per-OSD ceiling
 	// that keeps one noisy volume from starving its neighbours.
 	Aggregate *qos.Pair
+	// TLS, when set, wraps every accepted connection in TLS (mutual:
+	// use tlsconf.Config.ServerConfig, which requires and verifies a
+	// client certificate). The handshake must complete within
+	// handshakeTLS; plain clients are then rejected, TLS clients are
+	// rejected by plain servers — a mixed fleet must migrate at once.
+	TLS *tls.Config
+	// Metrics, when set, receives one sample per served request and
+	// per connection close (see ServerMetrics). Called on the request's
+	// serving goroutine right before the reply is flushed: keep the
+	// callbacks cheap (counter/histogram updates) and never blocking.
+	// It is the exporter seam: pkg/sdsnet stays dependency-free, and
+	// the binary maps the events onto its metrics library.
+	Metrics *ServerMetrics
 	// Logf receives connection lifecycle and request errors (may be nil).
 	Logf func(format string, args ...any)
 
@@ -82,6 +110,27 @@ type Server struct {
 	closedF  bool
 	conns    map[net.Conn]struct{}
 	wg       sync.WaitGroup
+}
+
+// ServerMetrics is the optional observation seam of a Server: one
+// callback per served request (after the reply status is known, before
+// the payload/reply is flushed) and one per connection close. The
+// server itself keeps no counters — a binary that exposes Prometheus/
+// VictoriaMetrics metrics plugs in here without pkg/sdsnet gaining a
+// dependency. All callbacks run on the serving goroutines; a nil
+// callback is skipped.
+type ServerMetrics struct {
+	// Request records one completed request: the op, its status, the
+	// payload bytes moved in the request direction (write payload) and
+	// out of the server (read reply), and the time from header decode
+	// to dispatch completion (throttle/queue time included).
+	Request func(op Op, status Status, bytesIn, bytesOut uint64, dur time.Duration)
+	// ConnAccepted reports a connection that completed the handshake
+	// (paired with ConnClosed when the connection ends).
+	ConnAccepted func()
+	// ConnClosed reports a connection that ended, with the number of
+	// requests it served.
+	ConnClosed func(ops uint64)
 }
 
 // SetMinEpoch enables placement-epoch fencing: requests carrying an
@@ -137,6 +186,19 @@ func (s *Server) ServeListener(ln net.Listener) error {
 			}
 			return err
 		}
+		if s.TLS != nil {
+			tc := tls.Server(c, s.TLS)
+			_ = tc.SetDeadline(time.Now().Add(handshakeTLS))
+			if err := tc.Handshake(); err != nil {
+				_ = c.Close()
+				if s.Logf != nil {
+					s.Logf("sdsnet: tls handshake: %v", err)
+				}
+				continue
+			}
+			_ = tc.SetDeadline(time.Time{})
+			c = tc
+		}
 		wg.Add(1)
 		s.wg.Add(1)
 		s.mu.Lock()
@@ -154,6 +216,26 @@ func (s *Server) ServeListener(ln net.Listener) error {
 			s.mu.Unlock()
 		}()
 	}
+}
+
+// ServeConn serves one already-established connection: the same
+// handshake + request loop a served socket gets. It is the in-process
+// entry point — pair it with Socketpair so a client and this server
+// live in one process (see Pool.Local). The connection is tracked like
+// a listener-accepted one: Close closes it.
+func (s *Server) ServeConn(c net.Conn) {
+	s.mu.Lock()
+	if s.conns == nil {
+		s.conns = make(map[net.Conn]struct{})
+	}
+	s.conns[c] = struct{}{}
+	s.mu.Unlock()
+	s.wg.Add(1)
+	defer s.wg.Done()
+	s.handle(c)
+	s.mu.Lock()
+	delete(s.conns, c)
+	s.mu.Unlock()
 }
 
 // Addr returns the listen address (valid once Serve has started).
@@ -236,6 +318,19 @@ func (s *Server) handle(c net.Conn) {
 	if err := s.reply(c, &RespHeader{Status: StatusOK}); err != nil {
 		return
 	}
+	// Per-connection request count for the ConnClosed metric hook.
+	// Accepted/Closed fire as a pair (only for connections that got a
+	// StatusOK handshake reply), so a gauge of accepted-minus-closed
+	// tracks live connections.
+	var connOps uint64
+	if s.Metrics != nil {
+		if s.Metrics.ConnAccepted != nil {
+			s.Metrics.ConnAccepted()
+		}
+		if s.Metrics.ConnClosed != nil {
+			defer func() { s.Metrics.ConnClosed(connOps) }()
+		}
+	}
 
 	rd := bufio.NewReaderSize(c, 128<<10)
 	wr := bufio.NewWriterSize(c, 128<<10)
@@ -301,7 +396,19 @@ func (s *Server) handle(c net.Conn) {
 				return
 			}
 		}
+		start := time.Now()
 		resp, out := s.dispatch(ctx, backend, &h, payload, rw)
+		if m := s.Metrics; m != nil && m.Request != nil {
+			connOps++
+			var bin, bout uint64
+			if h.Op == OpWrite {
+				bin = uint64(len(payload))
+			}
+			if resp.Status == StatusOK {
+				bout = uint64(len(out))
+			}
+			m.Request(h.Op, resp.Status, bin, bout, time.Since(start))
+		}
 		if err := s.replyRW(wr, rw, &resp, out); err != nil {
 			return
 		}
@@ -429,11 +536,21 @@ func (s *Server) dispatch(ctx context.Context, backend Backend, h *ReqHeader, pa
 		if err := backend.WriteAt(ctx, h.OID, h.Offset, payload); err != nil {
 			return RespHeader{Seq: h.Seq, Status: statusFromErr(err)}, nil
 		}
+		if h.Flags&FlagsFUA != 0 {
+			if err := backend.Sync(ctx); err != nil {
+				return RespHeader{Seq: h.Seq, Status: statusFromErr(err)}, nil
+			}
+		}
 		return RespHeader{Seq: h.Seq, Status: StatusOK, Value: uint64(h.Length)}, nil
 
 	case OpWriteZeroes:
 		if err := backend.WriteZeroes(ctx, h.OID, h.Offset, uint64(h.Length), h.Flags&FlagsHole != 0); err != nil {
 			return RespHeader{Seq: h.Seq, Status: statusFromErr(err)}, nil
+		}
+		if h.Flags&FlagsFUA != 0 {
+			if err := backend.Sync(ctx); err != nil {
+				return RespHeader{Seq: h.Seq, Status: statusFromErr(err)}, nil
+			}
 		}
 		return RespHeader{Seq: h.Seq, Status: StatusOK, Value: uint64(h.Length)}, nil
 
@@ -472,6 +589,21 @@ func (s *Server) dispatch(ctx context.Context, backend Backend, h *ReqHeader, pa
 			return RespHeader{Seq: h.Seq, Status: statusFromErr(err)}, nil
 		}
 		return RespHeader{Seq: h.Seq, Status: StatusOK, Value: alloc}, nil
+
+	case OpStatFS:
+		sf, ok := backend.(statFSer)
+		if !ok {
+			return RespHeader{Seq: h.Seq, Status: StatusNotSupp}, nil
+		}
+		usage, free, total, err := sf.StatFS(ctx)
+		if err != nil {
+			return RespHeader{Seq: h.Seq, Status: statusFromErr(err)}, nil
+		}
+		out := rw.getBuf(24)
+		binary.BigEndian.PutUint64(out[0:8], usage)
+		binary.BigEndian.PutUint64(out[8:16], free)
+		binary.BigEndian.PutUint64(out[16:24], total)
+		return RespHeader{Seq: h.Seq, Status: StatusOK}, out
 	}
 	return RespHeader{Seq: h.Seq, Status: StatusNotSupp}, nil
 }

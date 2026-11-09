@@ -11,6 +11,7 @@ package osd
 import (
 	"context"
 	"crypto/rand"
+	"crypto/tls"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -18,6 +19,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/unistack-org/storage/pkg/meta"
@@ -41,6 +43,11 @@ type Options struct {
 	// Direct / Preallocate are passed through to the object store.
 	Direct      bool
 	Preallocate bool
+	// CommitMode / FsyncBatch are passed through to the object store:
+	// how writes reach durable media (see store.CommitMode) and how
+	// concurrent Sync() calls coalesce into one fsync pass.
+	CommitMode store.CommitMode
+	FsyncBatch time.Duration
 	// Aggregate caps this disk (one store directory): every op from
 	// every client/export passes it before touching the store. This is
 	// the "limit iops on the NVMe" knob that keeps one volume from
@@ -52,6 +59,15 @@ type Options struct {
 	// per-volume class at the disk; in cluster mode exports share the
 	// anonymous name and per-volume limits live in the clients.
 	Limits func(export string) *qos.Pair
+	// TLS, when set, serves the sdsnet data plane over mutual TLS
+	// (tlsconf.Config.ServerConfig); clients must then present
+	// certificates signed by the same CA.
+	TLS *tls.Config
+	// Metrics, when set, is attached to the OSD's sdsnet server: the
+	// exporter seam for per-op request/conn counters (see
+	// sdsnet.ServerMetrics). The binary wires it to its metrics
+	// library; the OSD core stays dependency-free.
+	Metrics *sdsnet.ServerMetrics
 	// Logf receives informational messages (nil = silent).
 	Logf func(format string, args ...any)
 }
@@ -93,7 +109,12 @@ func (d *Daemon) Run(ctx context.Context) error {
 	if err := os.MkdirAll(d.opts.DataDir, 0o755); err != nil {
 		return err
 	}
-	st, err := store.New(d.opts.DataDir, store.Options{Direct: d.opts.Direct, Preallocate: d.opts.Preallocate})
+	st, err := store.New(d.opts.DataDir, store.Options{
+		Direct:      d.opts.Direct,
+		Preallocate: d.opts.Preallocate,
+		CommitMode:  d.opts.CommitMode,
+		FsyncBatch:  d.opts.FsyncBatch,
+	})
 	if err != nil {
 		return fmt.Errorf("osd: store: %w", err)
 	}
@@ -118,6 +139,8 @@ func (d *Daemon) Run(ctx context.Context) error {
 		Logf:      d.opts.Logf,
 		Aggregate: d.opts.Aggregate,
 		Limits:    d.opts.Limits,
+		TLS:       d.opts.TLS,
+		Metrics:   d.opts.Metrics,
 	}
 	d.mu.Lock()
 	d.srv = srv
@@ -290,6 +313,15 @@ func (d *Daemon) Fence() uint32 {
 	return d.srv.MinEpoch()
 }
 
+// Server returns the OSD's RPC server (nil before Run is serving). It
+// lets a same-process client serve a local-direct connection over a
+// socketpair whose peer is handled by this server, bypassing TCP.
+func (d *Daemon) Server() *sdsnet.Server {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.srv
+}
+
 // DiskStats reports the OSD's own disk accounting for the status API:
 // bytes stored in object files, and the filesystem's free/total for the
 // store directory (ok=false when the directory is not open yet or the
@@ -353,6 +385,25 @@ func (b *objectBackend) Remove(_ context.Context, oid uint64) error {
 
 func (b *objectBackend) Stat(_ context.Context, oid uint64) (uint64, error) {
 	return b.st.Stat(object.OID(oid))
+}
+
+// StatFS serves OpStatFS: the store's used bytes plus the backing
+// filesystem's free/total, for cluster capacity metrics.
+func (b *objectBackend) StatFS(_ context.Context) (usage, free, total uint64, err error) {
+	f, t, ok := b.st.DiskSpace()
+	if !ok {
+		return 0, 0, 0, syscall.ENOTSUP
+	}
+	if u := b.st.Usage(); u > 0 {
+		usage = uint64(u)
+	}
+	if f > 0 {
+		free = uint64(f)
+	}
+	if t > 0 {
+		total = uint64(t)
+	}
+	return usage, free, total, nil
 }
 
 // StatInfo implements the statInfoer extension (OpStatInfo): apparent
