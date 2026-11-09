@@ -257,3 +257,38 @@ SIGBUS перехватывается, кэшированные отображе
 сбрасываются, запрос завершается `VIRTIO_BLK_S_IOERR` + IRQ, демон продолжает
 работать. Стаки падения печатаются с этапом (`stage=next-avail|read-chain|…`)
 и снимком IOTLB.
+
+## 4K randread: барьер-фикс + local-direct (2026-11-09, new-sdsd6/7)
+
+**Барьер-фикс (vring.go PushUsed, StoreLoad) — ПОДТВЕРЖДЁН на железе:**
+30-секундные фризы randread исчезли полностью (max clat 64–94 мс вместо
+30.2 с). Профиль: 80K IOPS = базовый уровень до фризов восстановлен.
+
+**GOMAXPROCS=8 ОБЯЗАТЕЛЕН:** на 64-ядерном хосте дефолтные 64 proc'а дают
+50% CPU в runtime.stealWork/findRunnable (шторм планировщика) — это и было
+причиной «регресса» 40K. С GOMAXPROCS=8: 80.1K.
+
+**local-direct (socketpair вместо loopback-TCP для локальных OSD):**
+новый транспорт в pkg/sdsnet (Socketpair/ServeConn/NewConn/Pool.Local),
+Cluster.SetLocalDial, проводка в unistord для всех hosted OSD. Протокол,
+QoS, фенсинг, метрики — идентичны TCP-пути. Linux-бенчмарк пакета:
+4K op 22.7µs (TCP) → 4.0µs (local), ×5.7.
+
+Матрица на new-sdsd7 (GOMAXPROCS=8, fio /dev/vda, qd128×4 jobs, 20s):
+
+| Паттерн        | sdsd6 (TCP) | sdsd7 (local-direct) | Vitastor |
+|----------------|-------------|----------------------|----------|
+| 4K randread    | 80.1K       | **91.6K** (+14%)     | 175K     |
+| 4K randwrite   | 33.8K       | **39.1K** (+16%)     | —        |
+| 4K randread qd1| ~300µs      | **127µs** (6.5K IOPS)| —        |
+| 1M qd1 r/w     | 103/84      | 85/76                | —        |
+
+1M qd1: A/B-проверка на sdsd6 дала те же 103/84 — падение против прежних
+270/270 средовое (том полностью аллоцирован предыдущими бенчами, рейд1 с
+rmapbt=0), к local-direct отношения не имеет. Профиль 1M: демон полупростой
+(9.2s выборки за 12s) — путь latency-bound, не CPU.
+
+Профиль 91.6K randread: Syscall6 упал с 55% до 46% CPU. Остаток: IOTLB
+Lookup (pull-on-miss на unix-сокетах), memmove (2 копиру 4K-плейлоада),
+netpoll/wake-цепочки. Следующие шаги: батчинг RPC (N опов на раунд-трип),
+zero-copy IOTLB-кэш, XROW-репликация, multi-queue VDUSE.

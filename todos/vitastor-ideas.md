@@ -172,11 +172,13 @@ randread QD128: 41.6K против их 128K (×3). Their bottleneck = CPU + с�
 
 ## 4. P1–P2 — Семантика, ENOSPC, recovery
 
-- [ ] **4.1 Режимы `immediate_commit`: `flush` / `journal` / `none`** + lazy
-      fsync (батчинг fsync) и `small_write_throttling`. У нас есть hard
-      семантика и NBD `FLUSH`/`OpSync`, нет мягких режимов и нет
-      fsync-батчинга. Каждый режим обязан иметь тест «подтверждённая запись
-      не теряется при power-loss». `[2.x, 3.0.x]`
+- [x] **4.1 Режимы `immediate_commit`: `flush` / `journal` / `none`** + lazy
+      fsync (батчинг fsync) — сделано: `-commit none|flush|sync|journal` +
+      `-fsync-batch` в `pkg/store`/`unistord`; journal = WAL с ack по
+      fsync журнала, фоновое разглаживание, replay при старте. Тесты
+      «подтверждённая запись не теряется при power-loss» —
+      `pkg/store/journal_test.go` (crash survival, torn tail, remove
+      checkpoint). Не делал: `small_write_throttling` (нет demand). `[2.x, 3.0.x]`
 - [ ] **4.2 ENOSPC и полный журнал** (`pkg/store`, `pkg/osd`, `pkg/client`) —
       у нас в коде ENOSPC **не обрабатывается нигде**. Требуется: OSD
       выживает при 100% заполнении; полный журнал → `EAGAIN`/backpressure,

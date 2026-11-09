@@ -342,11 +342,14 @@
 - [ ] **`cpubench`-аналог** — цена чексумм/шифрования на ядро (у них
       xxhash3 1M ≈ 104 GB/s, AES-XTS+GCM ≈ 12.6 GB/s на EPYC). Без этого
       числа нельзя включать csum/шифрование на горячем пути (Фаза 5b)
-- [ ] **Ленивый fsync: операция SYNC + режим immediate_commit=off** (урок
-      Vitastor): запись без fdatasync, клиент кэширует незафиксированное в
-      памяти, повторяет после реконнекта, SYNC каждые client_dirty_limit
-      байт — главный источник их цифр на дешёвых SSD; NBD flush/SYNC → в
-      Volume.Flush
+- [x] **Ленивый fsync + режимы commit** (урок Vitastor): `-commit
+      none|flush|sync|journal` в `pkg/store` (WAL в `journal.log`: ack =
+      fsync журнала, фоновый applier разглаживает в объекты, replay+truncate
+      на старте, read-your-writes через оверлей, Remove-чекпойнт,
+      ENOSPC→StatusNoSpace, backpressure оверлея) и `-fsync-batch` —
+      коалесинг гостевых FLUSH в один проход fsync; NBD flush/SYNC → в
+      Volume.Flush. Тесты «подтверждённая запись переживает перезапуск» —
+      в `journal_test.go`/`commit_test.go`
 - [ ] **Восстановление пообъектное, не PG-ами** (урок Vitastor; Ceph из-за
       PG-гранулярности получает взрывной recovery): recovery-воркер чинит
       отдельные объекты строки pg
@@ -415,11 +418,17 @@
       `storage/tests/chaos/` (у них 62 функциональных скрипта; правило
       «фикс = тест»). Опционально: регулярный LLM-обход `pkg/` на баги с
       требованием минимального repro (у них в 3.0.14 так нашли >50 багов)
-- [ ] **Метрики Prometheus + дашборд** — у нас метрик нет вообще, у них с
-      1.7.0. Минимум: латентность-гистограммы OSD, IOPS/BW по типам, длины
-      очередей, write amplification, состояние PG, свободное место/журнал.
-      Статистика — **усреднённая** (`usec/count`), не суммарная (у них сумма
-      по OSD давала бессмысленные лаги). Детали: `vitastor-ideas.md` §6.1–6.2
+- [x] **Метрики Prometheus + дашборд** (первая половина) — экспорт
+      `GET /metrics` в текстовом формате Prometheus (`-metrics host:port`,
+      также на порту admin API при `-http`); VictoriaMetrics скрейпит
+      нативно. Покрыто: состояние кластера (osds/osds_live/healthy/epoch/
+      volumes/raft), статус по каждому OSD (up/weight/диск/соединения),
+      латентность-гистограммы и IOPS/BW по операциям (OSD-сервер и
+      экспорты, через hook-колбэки `sdsnet.ServerMetrics` — ядро `pkg/`
+      осталось без зависимостей), QoS sustained-рейты. Статистика —
+      через count/sum пары (rate/histogram_quantile), не «сумма
+      средних». Осталось: длины очередей, write amplification,
+      состояние PG, сам дашборд. Детали: `vitastor-ideas.md` §6.1–6.2
 - [ ] **Graceful SIGINT/SIGTERM** во всех серверах (`sdsd`, `sds-nbd`,
       `pkg/vduse`): дрейн и закрытие сокетов схемой `SO_LINGER` + `shutdown()`
       + `close()` (у них без этого мусор в io_uring); `/healthcheck` в
@@ -493,33 +502,59 @@
       живого тома (punch полностью нулевых объектов по всей длине,
       предикат — физическая аллокация через `OpStatInfo`, протокол v3).
       Детали: `test-vm-plan.md` M1.4.
-- [ ] **Квота тома + честный ENOSPC**: запись за квотой → отдельный
+- [x] **Квота тома + честный ENOSPC**: запись за квотой → отдельный
       `StatusNoSpace` в `sdsnet`, ENOSPC от реплики не считается гибелью OSD
       (не в `noteFailure`), полный журнал → форс-флеш/EAGAIN вместо падения;
       тест «диск полон: том A получает IO-error, том B работает, OSD жив».
       Детали: `test-vm-plan.md` §2 (M0.3, M0.4)
-- [ ] **QoS per-volume (IOPS/BPS)** — без него одна ВМ с fio в госте сажает
+- [x] **QoS per-volume (IOPS/BPS)** — без него одна ВМ с fio в госте сажает
       латентность всем; механика уже есть (`Pool.Limit` как ограничитель
       конкурентности на цель). Частично пересекается с «квоты, QoS» Фазы 6
 
 ## Фаза 6 — Функциональность уровня Ceph-фич (после 1–5)
 
-- [ ] снапшоты (copy-on-write по OID-поколениям), клон volume.
-      Формат решения выбрать ADR по их схеме **«forward/redo»**
-      (rename-on-snapshot + чтение по цепочке родителей; у них есть
-      сравнение undo-log / CoW+refcount / forward-redo с обоснованием).
-      Грабли сразу в тесты Фазы 5b: >255 снапшотов ломают чтение,
-      параллельное удаление из двух процессов рвёт цепочку.
+- [x] снапшоты (copy-on-write по OID-поколениям) + откат — реализованы
+      по ADR `todos/adr-snapshots.md`: схема **«forward/redo»**
+      (fresh-OID-on-snapshot + чтение по цепочке поколений, без CoW-refcount;
+      ADR зафиксирован до кода).
+      Грабли из их багов закрыты тестами: generation — uint32 + монотонный
+      LastGen (>255 и откаты безопасны, `TestSnapshotLimitAnd300Gens`,
+      `TestSnapshotRollback`); создание/удаление снапшотов — атомарные
+      CAS-транзакции meta (параллельные не рвут цепочку,
+      `TestSnapshotParallelCreateSerializes`, `TestSnapshotDelete`);
+      глубина цепочки ограничена 64 (ERR_TOO_MANY_SNAPSHOTS); метаданные
+      снапшота (битмап/allocmap) — источник истины, данные не копируются
+      (`TestSnapshotChainRead`, TRIM материализуется —
+      `TestSnapshotTrimMaterialization`, регрессия punch `
+      TestSnapshotFreeTrimPunchRegression`); rename нет вовсе — закоммиченный
+      в консенсусе снапшот всегда указывает на уже записанные объекты,
+      «сироты» незакоммиченных диапазонов не видны и собираются
+      `VolumeGarbage`.
+- [x] **клон volume** — копия меты поверх снапшот-цепочки источника
+      (`pkg/meta/clones.go`): свой свежий live-диапазон, цепочка
+      копируется, расшаренные поколения считаются счётчиками `genrefs:`
+      (префикс меты); vacuum/удаление/откат обходят диапазон с
+      ненулевым счётчиком. Протокол «Share до CAS клона, Drop после
+      CAS удаления» даёт при крахе только утечки, никогда —
+      уничтожение расшаренных данных. CLI `vol clone`, HTTP
+      `POST /v1/volumes/{name}/clone`. Тесты: `pkg/meta/clones_test.go`,
+      `pkg/client/clones_test.go` (E2E с CoW, удалением источника,
+      vacuum), `admin_clone_test.go`.
       Детали: `todos/vitastor-ideas.md` §7.1, механика OID-поколений и
       очередь граблей: `test-vm-plan.md` §5 (бейзы томов уже готовы —
       `VolumeSpec.OIDBase`).
-- [ ] thin provisioning + UNMAP/discard (в NBD и vhost-user-blk)
+- [x] thin provisioning + UNMAP/discard — реальный hole-punch в `pkg/store`
+      (fallocate PUNCH_HOLE, Darwin — `F_PUNCHHOLE`/`OpStatInfo` v3),
+      разреженные нули сквозь OSD и `sdsnet`, TRIM из `sds-nbd`/VDUSE;
+      live-vacuum нулевых объектов — поверх того же механизма.
 - [ ] erasure coding (RS) для холодных классов. Их уроки — до написания кода:
       очередь PG с активной записью + pending commit/rollback предыдущей
       (у них это вешало PG в STOPPING/REPEERING), **резерв места в журнале под
       commit**, версия ISA-L запинена + golden-тесты на векторах (2.31 = порча
       данных). Детали: `todos/vitastor-ideas.md` §7.3
-- [ ] квоты, QoS (IOPS/BPS-шейпинг per-volume)
+- [x] квоты, QoS (IOPS/BPS-шейпинг per-volume) — квота с честным ENOSPC и
+      live-обновлением (`vol qos`), шейпинг гостя + админский класс без
+      ограничений; менять можно на включённом томе.
 - [ ] бекапы/экспорт (qemu-img convert-совместимый raw-стрим): поверх
       `GET /v1/volumes/{name}/export` (Фаза 5b) — расписание, хранение,
       ротация, сверка контрольной суммы, восстановление в новый том через

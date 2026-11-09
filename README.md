@@ -21,6 +21,12 @@
   backing-файле. Детали: [`sds-nbd/README.md`](sds-nbd/README.md).
 - ✅ CRUSH: готов в отдельном репозитории crushkv (движок + формат карты
   Ceph + арена без GC).
+- ✅ Метрики: `unistord -metrics 0.0.0.0:8080` → `GET /metrics` в формате
+  Prometheus (скрейп VictoriaMetrics): состояние кластера, raft (состояние
+  и участники), статус и диски всех OSD (в т.ч. удалённых — зонд StatFS),
+  латентность/IOPS/BW, состояние PG и ёмкость томов, счётчики recovery.
+  Экспорт только на отдельном `-metrics`-порту, REST API метрики не отдаёт.
+  Детали: [`todos/runbook.md`](todos/runbook.md).
 - 🚧 Скелет репозитория: интерфейс-реестры `backend/`, `cache/`,
   `cluster/`, `hash/`, `journal/`, `transport/` (legacy-слой sheepdog-era
   удалён в фазе 0).
