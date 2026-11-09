@@ -91,6 +91,7 @@ type clusterMetrics struct {
 	gPool       *prometheus.GaugeVec // {osd,state}
 	gVolume     *prometheus.GaugeVec // {name} name=writable|degraded|...
 	gQoSLimit   *prometheus.GaugeVec // {export,rate} configured limits
+	gVacuum     *prometheus.GaugeVec // {name} vacuum backlog + autovacuum config
 
 	// Recovery traffic, filled by the RecoveryOpts.Record hook (runs
 	// started through this process).
@@ -188,10 +189,15 @@ func newClusterMetrics() *clusterMetrics {
 		Help: "Payload bytes moved by recovery runs started through this process.",
 	})
 
+	m.gVacuum = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "unistor_vacuum",
+		Help: "Vacuum backlog and autovacuum configuration: tombstones (pending records), objects (OIDs to unlink per OSD), bytes (garbage occupying disk = objects x 4MiB), oldest_seconds (age of the oldest tombstone), interval_seconds (autovacuum period; 0 = autovacuum off). bytes/oldest_seconds together answer how much work is left until autovacuum cleans the garbage.",
+	}, []string{"name"})
+
 	for _, c := range []prometheus.Collector{
 		m.osdRequests, m.osdBytes, m.osdLatency, m.osdConns,
 		m.exportRequests, m.exportBytes, m.exportLatency, m.exportSustained,
-		m.gCluster, m.gRaftState, m.gRaftMember, m.gOsd, m.gDisk, m.gPool, m.gVolume, m.gQoSLimit,
+		m.gCluster, m.gRaftState, m.gRaftMember, m.gOsd, m.gDisk, m.gPool, m.gVolume, m.gQoSLimit, m.gVacuum,
 		m.recoveryCopies, m.recoveryBytes,
 		collectors.NewGoCollector(),
 		collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}),
@@ -211,6 +217,12 @@ type metricsSource struct {
 	ms    meta.Store
 	raft  *meta.RaftStore
 	disks *diskRegistry
+
+	// vacuumInterval is the -vacuum-interval the autovacuum loop runs
+	// with in this process (0 = autovacuum off); exported as
+	// unistor_vacuum{name="interval_seconds"} so a dashboard can
+	// compute "time until the backlog is cleaned" against it.
+	vacuumInterval int
 }
 
 // volumeUsage reads a volume's allocation (bitmap popcount x object
@@ -357,6 +369,7 @@ func (m *clusterMetrics) collect(ctx context.Context, s metricsSource) {
 	m.gPool.Reset()
 	m.gVolume.Reset()
 	m.gQoSLimit.Reset()
+	m.gVacuum.Reset()
 
 	vols, err := s.cl.ListVolumes(ctx)
 	if err == nil {
@@ -440,6 +453,21 @@ func (m *clusterMetrics) collect(ctx context.Context, s metricsSource) {
 			}
 			m.gRaftMember.WithLabelValues(strconv.FormatUint(mem.ID, 10), mem.Addr).Set(v)
 		}
+	}
+
+	// Vacuum backlog: the garbage tombstones that the autovacuum loop
+	// has yet to unlink, with the configured interval so a dashboard
+	// can answer "how much is left / how long until autovacuum cleans
+	// it" (bytes, oldest age vs interval).
+	vctx, vcancel := context.WithTimeout(ctx, statusProbeTimeout)
+	vb, vbErr := s.cl.VacuumBacklog(vctx)
+	vcancel()
+	if vbErr == nil {
+		m.gVacuum.WithLabelValues("tombstones").Set(float64(vb.Tombstones))
+		m.gVacuum.WithLabelValues("objects").Set(float64(vb.Objects))
+		m.gVacuum.WithLabelValues("bytes").Set(float64(vb.Bytes))
+		m.gVacuum.WithLabelValues("oldest_seconds").Set(vb.Oldest)
+		m.gVacuum.WithLabelValues("interval_seconds").Set(float64(s.vacuumInterval))
 	}
 
 	for id, st := range s.cl.PoolStats() {

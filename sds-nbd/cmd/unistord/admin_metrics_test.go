@@ -258,3 +258,40 @@ func TestRecoveryRecorder(t *testing.T) {
 		t.Fatalf("missing counter families: %v", want)
 	}
 }
+
+// TestVacuumBacklogMetrics checks the autovacuum-backlog family: the
+// clean cluster reports an empty queue (oldest -1), deleting a volume
+// queues its objects, and the configured interval rides along so a
+// dashboard can compute "how long until autovacuum cleans it".
+func TestVacuumBacklogMetrics(t *testing.T) {
+	a, cl, _ := startStatusCluster(t)
+	mreg := newClusterMetrics()
+	src := metricsSource{cl: cl, ms: a.ms, raft: nil, disks: a.disks, vacuumInterval: 300}
+
+	if v, ok := metricValue(t, mreg, src, "unistor_vacuum", map[string]string{"name": "tombstones"}); !ok || v != 0 {
+		t.Fatalf("tombstones = %v (ok=%v), want 0", v, ok)
+	}
+	if v, ok := metricValue(t, mreg, src, "unistor_vacuum", map[string]string{"name": "oldest_seconds"}); !ok || v != -1 {
+		t.Fatalf("oldest_seconds = %v (ok=%v), want -1", v, ok)
+	}
+	if v, ok := metricValue(t, mreg, src, "unistor_vacuum", map[string]string{"name": "interval_seconds"}); !ok || v != 300 {
+		t.Fatalf("interval_seconds = %v (ok=%v), want 300", v, ok)
+	}
+
+	// vm0 is 128 MiB at 4 MiB objects: its tombstone queues 32 OIDs.
+	if err := cl.DeleteVolume(context.Background(), "vm0"); err != nil {
+		t.Fatal(err)
+	}
+	if v, ok := metricValue(t, mreg, src, "unistor_vacuum", map[string]string{"name": "tombstones"}); !ok || v != 1 {
+		t.Fatalf("tombstones = %v (ok=%v), want 1", v, ok)
+	}
+	if v, ok := metricValue(t, mreg, src, "unistor_vacuum", map[string]string{"name": "objects"}); !ok || v != 32 {
+		t.Fatalf("objects = %v (ok=%v), want 32", v, ok)
+	}
+	if v, ok := metricValue(t, mreg, src, "unistor_vacuum", map[string]string{"name": "bytes"}); !ok || v != 128<<20 {
+		t.Fatalf("bytes = %v (ok=%v), want %v", v, ok, float64(128<<20))
+	}
+	if v, ok := metricValue(t, mreg, src, "unistor_vacuum", map[string]string{"name": "oldest_seconds"}); !ok || v < 0 {
+		t.Fatalf("oldest_seconds = %v (ok=%v), want >= 0", v, ok)
+	}
+}

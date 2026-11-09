@@ -70,7 +70,14 @@ curl -s http://10.0.0.1:8443/v1/status | jq
   к сырому, сейчас 1/replicas);
 - восстановление: `unistor_recovery_copies_total`,
   `unistor_recovery_bytes_total` (счётчики сработавших прогонов
-  recovery на этой ноде).
+  recovery на этой ноде);
+- автовакуум (аналог postgres «age до autovacuum»): `unistor_vacuum{name=
+  tombstones|objects|bytes|oldest_seconds|interval_seconds}` — очередь
+  мусора удалённых томов из meta-БД: сколько записей/объектов/байт
+  ждёт unlink и насколько оно старое (`oldest_seconds` против
+  `interval_seconds` = сколько автовакуум ещё не добирал).
+  `bytes` — сколько места на дисках освободит вакуум; алерт:
+  `oldest_seconds > 3*interval_seconds` — автовакуум отстаёт.
 
 Средние считайте через `rate()` / `histogram_quantile()` — все величины
 усреднённые, не «сумма средних».

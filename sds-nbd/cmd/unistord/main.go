@@ -384,7 +384,7 @@ func main() {
 				mcl.SetTLS(tlsClient)
 			}
 			defer mcl.Close()
-			msrc := metricsSource{cl: mcl, ms: ms, raft: raftSt, disks: disks}
+			msrc := metricsSource{cl: mcl, ms: ms, raft: raftSt, disks: disks, vacuumInterval: *vacuumInterval}
 			go func() {
 				if err := mreg.serveMetrics(ctx, *metricsAddr, msrc, logger); err != nil {
 					logger.Printf("metrics http: %v", err)

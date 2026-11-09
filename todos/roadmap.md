@@ -419,16 +419,23 @@
       «фикс = тест»). Опционально: регулярный LLM-обход `pkg/` на баги с
       требованием минимального repro (у них в 3.0.14 так нашли >50 багов)
 - [x] **Метрики Prometheus + дашборд** (первая половина) — экспорт
-      `GET /metrics` в текстовом формате Prometheus (`-metrics host:port`,
-      также на порту admin API при `-http`); VictoriaMetrics скрейпит
-      нативно. Покрыто: состояние кластера (osds/osds_live/healthy/epoch/
-      volumes/raft), статус по каждому OSD (up/weight/диск/соединения),
-      латентность-гистограммы и IOPS/BW по операциям (OSD-сервер и
-      экспорты, через hook-колбэки `sdsnet.ServerMetrics` — ядро `pkg/`
-      осталось без зависимостей), QoS sustained-рейты. Статистика —
-      через count/sum пары (rate/histogram_quantile), не «сумма
-      средних». Осталось: длины очередей, write amplification,
-      состояние PG, сам дашборд. Детали: `vitastor-ideas.md` §6.1–6.2
+      `GET /metrics` в текстовом формате Prometheus (только отдельный
+      `-metrics host:port`; admin REST API метрики не отдаёт);
+      VictoriaMetrics скрейпит нативно. Покрыто: состояние кластера
+      (osds/osds_live/healthy/epoch/volumes/raft), участники raft
+      (`unistor_raft_member`), статус и диски ВСЕХ OSD кластера
+      (up/weight/соединения + stored/free/total через новый протокольный
+      зонд OpStatFS — аналог vitastor vitastor_osd_free_bytes), ёмкость
+      кластера и томов (total/free/used_raw_bytes, raw_to_usable_bytes,
+      space_efficiency — аналог vitastor_pool_*), состояние PG томов
+      (pgs/pgs_ok/pgs_degraded/pgs_down — аналог vitastor_pg_count),
+      счётчики recovery (copies/bytes), латентность-гистограммы и
+      IOPS/BW по операциям (OSD-сервер и экспорты, через hook-колбэки
+      `sdsnet.ServerMetrics` — ядро `pkg/` осталось без зависимостей),
+      QoS sustained-рейты. Статистика — через count/sum пары
+      (rate/histogram_quantile), не «сумма средних». Осталось: длины
+      очередей, write amplification, сам дашборд Grafana.
+      Детали: `vitastor-ideas.md` §6.1–6.2
 - [ ] **Graceful SIGINT/SIGTERM** во всех серверах (`sdsd`, `sds-nbd`,
       `pkg/vduse`): дрейн и закрытие сокетов схемой `SO_LINGER` + `shutdown()`
       + `close()` (у них без этого мусор в io_uring); `/healthcheck` в

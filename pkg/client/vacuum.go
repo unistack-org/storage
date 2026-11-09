@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"github.com/unistack-org/storage/pkg/meta"
+	"github.com/unistack-org/storage/pkg/object"
 	"github.com/unistack-org/storage/pkg/sdsnet"
 )
 
@@ -45,9 +46,66 @@ func (c *Cluster) PendingVacuum(ctx context.Context) ([]meta.VacuumRecord, error
 	return meta.ListVacuum(ctx, c.meta)
 }
 
+// TombstoneObjects counts the OIDs one tombstone covers (base range +
+// resize extents).
+func TombstoneObjects(rec meta.VacuumRecord) uint64 {
+	n := rec.NumObjs
+	for _, e := range rec.Extents {
+		n += e.Count
+	}
+	return n
+}
+
+// TombstoneBytes is the payload backlog one tombstone represents:
+// every reserved object counts at full object size, which is what the
+// vacuum unlinks per OID.
+func TombstoneBytes(rec meta.VacuumRecord) uint64 {
+	return TombstoneObjects(rec) * object.Size
+}
+
 // VacuumDeletedVolumes lives in vacuum_volume.go: it lists the
 // pending tombstones and hands them to the shared vacuumRecs engine,
 // which VacuumVolume (one tombstone by name) reuses.
+
+// VacuumBacklog quantifies the garbage that is waiting for a vacuum —
+// the "how long until autovacuum" question, PostgreSQL-style: the
+// pending work is measurable (Tombstones/Objects/Bytes) and so is how
+// stale it already is (Oldest).
+type VacuumBacklog struct {
+	Tombstones int     // pending records
+	Objects    uint64  // OIDs to unlink (per OSD, summed over records)
+	Bytes      uint64  // Objects x object size: disk the garbage occupies
+	Oldest     float64 // seconds since the oldest tombstone was written (-1 = none)
+}
+
+// VacuumBacklog reads the tombstone queue. Bytes is the payload the
+// vacuum will free; Objects is the work (it costs one OpRemove per OID
+// per OSD, so Objects x live OSDs is the request count the trickle has
+// to pay).
+func (c *Cluster) VacuumBacklog(ctx context.Context) (VacuumBacklog, error) {
+	recs, err := c.PendingVacuum(ctx)
+	if err != nil {
+		return VacuumBacklog{Oldest: -1}, err
+	}
+	out := VacuumBacklog{Tombstones: len(recs), Oldest: -1}
+	if len(recs) == 0 {
+		return out, nil
+	}
+	now := time.Now().Unix()
+	oldest := recs[0].DeletedAt
+	for _, rec := range recs {
+		n := TombstoneObjects(rec)
+		out.Objects += n
+		out.Bytes += n * object.Size
+		if rec.DeletedAt < oldest {
+			oldest = rec.DeletedAt
+		}
+	}
+	if age := now - oldest; age >= 0 {
+		out.Oldest = float64(age)
+	}
+	return out, nil
+}
 
 // vacuumOSD removes rec's whole OID range on one OSD and returns the
 // number of OIDs it processed.

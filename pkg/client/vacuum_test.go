@@ -525,3 +525,53 @@ func TestVolumeVacuumLive(t *testing.T) {
 		t.Fatalf("write under freed quota: %v", err)
 	}
 }
+
+// TestVacuumBacklog checks the queue gauge math: empty queue reports
+// Oldest -1, and the aggregate counts base ranges plus resize extents
+// across tombstones, with the age of the oldest record.
+func TestVacuumBacklog(t *testing.T) {
+	dir := t.TempDir()
+	m, err := meta.OpenDir(filepath.Join(dir, "meta"))
+	if err != nil {
+		t.Fatalf("meta: %v", err)
+	}
+	defer m.Close()
+	ctx := context.Background()
+	cl := NewCluster(m)
+	defer cl.Close()
+
+	vb, err := cl.VacuumBacklog(ctx)
+	if err != nil {
+		t.Fatalf("VacuumBacklog: %v", err)
+	}
+	if vb.Tombstones != 0 || vb.Objects != 0 || vb.Bytes != 0 || vb.Oldest != -1 {
+		t.Fatalf("empty backlog = %+v", vb)
+	}
+
+	old := time.Now().Add(-2 * time.Hour).Unix()
+	if _, err := meta.PutVacuum(ctx, m, meta.VacuumRecord{
+		Name: "a", OIDBase: 10, NumObjs: 4,
+		Extents:   []meta.OIDExtent{{Base: 100, Count: 2}},
+		DeletedAt: old,
+	}); err != nil {
+		t.Fatalf("PutVacuum a: %v", err)
+	}
+	if _, err := meta.PutVacuum(ctx, m, meta.VacuumRecord{
+		Name: "b", OIDBase: 20, NumObjs: 8, DeletedAt: time.Now().Unix(),
+	}); err != nil {
+		t.Fatalf("PutVacuum b: %v", err)
+	}
+	vb, err = cl.VacuumBacklog(ctx)
+	if err != nil {
+		t.Fatalf("VacuumBacklog: %v", err)
+	}
+	if vb.Tombstones != 2 || vb.Objects != 14 {
+		t.Fatalf("backlog = %+v, want 2 tombstones / 14 objects", vb)
+	}
+	if vb.Bytes != 14*object.Size {
+		t.Fatalf("bytes = %d, want %d", vb.Bytes, 14*object.Size)
+	}
+	if vb.Oldest < 7100 || vb.Oldest > 7300 {
+		t.Fatalf("oldest = %v, want ~7200", vb.Oldest)
+	}
+}
