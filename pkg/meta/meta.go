@@ -82,6 +82,14 @@ type DirStore struct {
 	watch  map[*dirWatcher]struct{}
 	closed bool
 
+	// wmu serializes the read-check-rename of a CAS Put/Delete so the
+	// revision comparison and the rename are atomic together. Without
+	// it two racing writers can read the same current revision, both
+	// pass the check, and the second rename clobbers the first (a lost
+	// update). Renames stay atomic for readers, so readers never block
+	// on wmu. notify is called after wmu is released (it takes mu).
+	wmu sync.Mutex
+
 	// PollInterval is how often watchers scan the prefix directory.
 	PollInterval time.Duration
 }
@@ -122,21 +130,26 @@ func (s *DirStore) Put(_ context.Context, prefix, key string, value []byte, casR
 		return 0, err
 	}
 	p := s.path(prefix, key)
+	s.wmu.Lock()
 	var next int64 = 1
 	if cur, err := os.ReadFile(p); err == nil {
 		var r record
 		if err := json.Unmarshal(cur, &r); err != nil {
+			s.wmu.Unlock()
 			return 0, fmt.Errorf("meta: corrupt record %s/%s: %w", prefix, key, err)
 		}
 		next = r.Rev + 1
 	} else if !errors.Is(err, os.ErrNotExist) {
+		s.wmu.Unlock()
 		return 0, err
 	}
 	if casRev >= 0 && next-1 != casRev {
+		s.wmu.Unlock()
 		return 0, fmt.Errorf("%w: have %d want %d", ErrConflict, next-1, casRev)
 	}
 	b, err := json.Marshal(record{Rev: next, Value: value})
 	if err != nil {
+		s.wmu.Unlock()
 		return 0, err
 	}
 	// Unique temp name: two concurrent writers to the same key must not
@@ -144,21 +157,26 @@ func (s *DirStore) Put(_ context.Context, prefix, key string, value []byte, casR
 	// after the winner consumed the shared temp).
 	tmp, err := os.CreateTemp(filepath.Dir(p), filepath.Base(p)+".tmp-")
 	if err != nil {
+		s.wmu.Unlock()
 		return 0, err
 	}
 	if _, err := tmp.Write(b); err != nil {
 		tmp.Close()
 		os.Remove(tmp.Name())
+		s.wmu.Unlock()
 		return 0, err
 	}
 	if err := tmp.Close(); err != nil {
 		os.Remove(tmp.Name())
+		s.wmu.Unlock()
 		return 0, err
 	}
 	if err := os.Rename(tmp.Name(), p); err != nil {
 		os.Remove(tmp.Name())
+		s.wmu.Unlock()
 		return 0, err
 	}
+	s.wmu.Unlock()
 	s.notify(prefix, key, "put", next)
 	return next, nil
 }
@@ -166,23 +184,30 @@ func (s *DirStore) Put(_ context.Context, prefix, key string, value []byte, casR
 // Delete implements Store.
 func (s *DirStore) Delete(_ context.Context, prefix, key string, casRev int64) error {
 	p := s.path(prefix, key)
+	s.wmu.Lock()
 	if casRev >= 0 {
 		cur, err := os.ReadFile(p)
 		if errors.Is(err, os.ErrNotExist) {
+			s.wmu.Unlock()
 			return ErrNotFound
 		}
 		if err != nil {
+			s.wmu.Unlock()
 			return err
 		}
 		var r record
 		if err := json.Unmarshal(cur, &r); err != nil {
+			s.wmu.Unlock()
 			return err
 		}
 		if r.Rev != casRev {
+			s.wmu.Unlock()
 			return fmt.Errorf("%w: have %d want %d", ErrConflict, r.Rev, casRev)
 		}
 	}
-	if err := os.Remove(p); errors.Is(err, os.ErrNotExist) {
+	err := os.Remove(p)
+	s.wmu.Unlock()
+	if errors.Is(err, os.ErrNotExist) {
 		return ErrNotFound
 	} else if err != nil {
 		return err

@@ -63,7 +63,7 @@ type VolumeSpec struct {
 	// means "created at Size, never grown" (BaseObjs derives it).
 	OIDCount uint64      `json:"oid_count,omitempty"`
 	Extents  []OIDExtent `json:"extents,omitempty"`
-	Replicas int    `json:"replicas"`
+	Replicas int         `json:"replicas"`
 	// MinSize is the minimum number of live replicas a volume stays
 	// writable with (quorum width). 0 means the Ceph-style default
 	// Replicas/2+1. Below it, writes fail fast instead of hanging:
@@ -86,6 +86,27 @@ type VolumeSpec struct {
 	ReadBPS     uint64 `json:"read_bps,omitempty"`
 	WriteIOPS   uint64 `json:"write_iops,omitempty"`
 	WriteBPS    uint64 `json:"write_bps,omitempty"`
+
+	// Gen is the current snapshot generation: 0 on a volume that
+	// never had a snapshot; CreateSnapshot increments it. The live
+	// addressing (OIDBase/OIDCount/Extents) plus the live allocmap
+	// always describe ONLY writes made in the current generation; a
+	// read that misses on the live range falls back through
+	// Snapshots newest-to-oldest (see snapshots.go).
+	Gen uint32 `json:"gen,omitempty"`
+
+	// LastGen is the generation high-water mark: the largest generation
+	// number this volume ever used. Generation ids are monotonic and
+	// never rewound: a rollback sets Gen back to the chosen generation
+	// and drops the newer ones, but LastGen stays, so the next
+	// CreateSnapshot numbers above every generation that ever existed
+	// (a stale client holding snapshot gen 5 can never be confused with
+	// a newly created gen 5).
+	LastGen uint32 `json:"last_gen,omitempty"`
+
+	// Snapshots are the frozen read-only generations, oldest first.
+	// The live volume is generation Gen and is not listed here.
+	Snapshots []GenRecord `json:"snapshots,omitempty"`
 }
 
 // QoSed reports whether the spec carries any limit.
@@ -240,7 +261,7 @@ func NextOIDBase(ctx context.Context, s Store, count uint64) (uint64, error) {
 			cas = rev
 		}
 		if _, err := s.Put(ctx, PrefixAlloc, AllocOIDs, b, cas); err != nil {
-			if err == ErrConflict {
+			if errors.Is(err, ErrConflict) {
 				continue // racing creator: re-read and retry
 			}
 			return 0, err
@@ -285,6 +306,14 @@ func ResizeVolume(ctx context.Context, s Store, name string, newSize uint64) (Vo
 		if newSize == spec.Size {
 			return spec, nil // idempotent no-op
 		}
+		if len(spec.Snapshots) > 0 {
+			// Snapshots freeze the geometry: the chain fallback walks
+			// frozen ranges sized for the old capacity, and a grown
+			// live range would need per-generation extent tracking.
+			// v1 refuses (delete the snapshots, grow, re-snapshot).
+			return VolumeSpec{}, fmt.Errorf("meta: volume %s: resize with %d snapshot(s): %w",
+				name, len(spec.Snapshots), ErrSnapshotsUnsupported)
+		}
 		// The volume addresses indices [0, NumObjects(newSize)). The
 		// base plus existing extents cover ReservedObjs; the delta is
 		// the new range to reserve. Extents (not a widened base) are
@@ -313,7 +342,7 @@ func ResizeVolume(ctx context.Context, s Store, name string, newSize uint64) (Vo
 			return VolumeSpec{}, err
 		}
 		if _, err := s.Put(ctx, PrefixVolumes, name, nb, rev); err != nil {
-			if err == ErrConflict {
+			if errors.Is(err, ErrConflict) {
 				continue // racing editor: re-read and re-check
 			}
 			return VolumeSpec{}, err
@@ -396,7 +425,7 @@ func MutateVolume(ctx context.Context, s Store, name string, mutate func(*Volume
 			return VolumeSpec{}, err
 		}
 		if _, err := s.Put(ctx, PrefixVolumes, name, nb, rev); err != nil {
-			if err == ErrConflict {
+			if errors.Is(err, ErrConflict) {
 				continue
 			}
 			return VolumeSpec{}, err

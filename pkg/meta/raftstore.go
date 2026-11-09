@@ -33,6 +33,7 @@ package meta
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
@@ -144,6 +145,17 @@ type RaftConfig struct {
 	ProxyPeers []string
 	// Logger for raft events (nil = default logger).
 	Logger *log.Logger
+	// TLS, when set, wraps the raft wire transport (this node's listener
+	// and all peer connections, snapshots included) in mutual TLS. Use
+	// tlsconf.Config.ServerConfig. Peers must present certificates signed
+	// by the same CA.
+	TLS *tls.Config
+	// ProxyTLS, when set (with TLS), is used by the write-proxy client to
+	// dial peer proxies over https (mutual). Use
+	// tlsconf.Config.ClientConfig — leaving ServerName empty makes Go
+	// verify each peer against the dial address host, so proxy and raft
+	// addresses must be covered by the peer's certificate SANs.
+	ProxyTLS *tls.Config
 }
 
 // RaftStore is a Store replicated by a raft group.
@@ -930,7 +942,7 @@ func OpenRaft(cfg RaftConfig) (*RaftStore, error) {
 	for _, p := range cfg.Peers {
 		peers[memberID(p)] = p
 	}
-	tr := newTCPTransport(memberID(cfg.BindAddr), cfg.BindAddr, peers)
+	tr := newTCPTransport(memberID(cfg.BindAddr), cfg.BindAddr, peers, cfg.TLS)
 	s, err := newRaftStore(cfg, raftBackend{st: bs, tr: tr})
 	if err != nil {
 		bs.Close()
@@ -1711,6 +1723,27 @@ func (s *RaftStore) RaftState() string {
 	default:
 		return "Follower"
 	}
+}
+
+// RaftMember is one voter of the meta raft group.
+type RaftMember struct {
+	ID     uint64 // raft member id
+	Addr   string // transport address ("" until learned)
+	Leader bool   // the member currently leading
+}
+
+// RaftMembers lists the raft voters with the current leader flagged —
+// the metrics view of the control plane (vitastor_monitor_info style).
+// The voter set is the persisted ConfState; addresses come from the
+// membership map the run loop maintains.
+func (s *RaftStore) RaftMembers() []RaftMember {
+	st := s.currentStatus()
+	cs := s.lastConfState()
+	out := make([]RaftMember, 0, len(cs.Voters))
+	for _, id := range cs.Voters {
+		out = append(out, RaftMember{ID: id, Addr: s.addrOf(id), Leader: id == st.lead})
+	}
+	return out
 }
 
 // isLeaderless reports whether the group currently has no leader.

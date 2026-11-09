@@ -1,9 +1,9 @@
 package meta
 
 import (
-	"reflect"
 	"context"
 	"errors"
+	"reflect"
 	"sync"
 	"testing"
 	"time"

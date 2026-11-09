@@ -18,6 +18,7 @@ package meta
 // endian length + protobuf payload.
 
 import (
+	"crypto/tls"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -98,6 +99,9 @@ func readFrame(r io.Reader, max uint32) (byte, []byte, error) {
 type tcpTransport struct {
 	id   uint64
 	addr string
+	// tlsCfg, when set, wraps every inbound and outbound connection in
+	// mutual TLS (RaftConfig.TLS).
+	tlsCfg *tls.Config
 
 	mu    sync.Mutex
 	peers map[uint64]string
@@ -110,15 +114,17 @@ type tcpTransport struct {
 }
 
 // newTCPTransport creates a transport that listens at bindAddr and reaches
-// the given peers (id => host:port).
-func newTCPTransport(id uint64, bindAddr string, peers map[uint64]string) *tcpTransport {
+// the given peers (id => host:port). tlsCfg (nil = plain TCP) enables
+// mutual TLS on every connection.
+func newTCPTransport(id uint64, bindAddr string, peers map[uint64]string, tlsCfg *tls.Config) *tcpTransport {
 	t := &tcpTransport{
-		id:    id,
-		addr:  bindAddr,
-		peers: make(map[uint64]string, len(peers)),
-		conns: make(map[uint64]*net.Conn),
-		msgc:  make(chan *raftpb.Message, 256),
-		stop:  make(chan struct{}),
+		id:     id,
+		addr:   bindAddr,
+		tlsCfg: tlsCfg,
+		peers:  make(map[uint64]string, len(peers)),
+		conns:  make(map[uint64]*net.Conn),
+		msgc:   make(chan *raftpb.Message, 256),
+		stop:   make(chan struct{}),
 	}
 	for pid, a := range peers {
 		t.peers[pid] = a
@@ -126,10 +132,34 @@ func newTCPTransport(id uint64, bindAddr string, peers map[uint64]string) *tcpTr
 	return t
 }
 
+// tlsClientConn upgrades an established TCP connection to TLS, using the
+// peer address host as the SNI/verification name.
+func tlsClientConn(c net.Conn, addr string, cfg *tls.Config) (net.Conn, error) {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		host = addr
+	}
+	sc := cfg.Clone()
+	if sc.ServerName == "" {
+		sc.ServerName = host
+	}
+	tc := tls.Client(c, sc)
+	_ = tc.SetDeadline(time.Now().Add(raftDialTO))
+	if err := tc.Handshake(); err != nil {
+		tc.Close()
+		return nil, err
+	}
+	_ = tc.SetDeadline(time.Time{})
+	return tc, nil
+}
+
 func (t *tcpTransport) Start() error {
 	ln, err := net.Listen("tcp", t.addr)
 	if err != nil {
 		return fmt.Errorf("raft transport: listen %s: %w", t.addr, err)
+	}
+	if t.tlsCfg != nil {
+		ln = tls.NewListener(ln, t.tlsCfg)
 	}
 	t.ln = ln
 	go t.acceptLoop()
@@ -183,6 +213,12 @@ func (t *tcpTransport) connection(id uint64) (net.Conn, error) {
 	c, err := net.DialTimeout("tcp", addr, raftDialTO)
 	if err != nil {
 		return nil, err
+	}
+	if t.tlsCfg != nil {
+		c, err = tlsClientConn(c, addr, t.tlsCfg)
+		if err != nil {
+			return nil, err
+		}
 	}
 	t.conns[id] = &c
 	return c, nil
@@ -246,6 +282,13 @@ func (t *tcpTransport) SendSnapshot(id uint64, snap *raftpb.Snapshot) error {
 		return err
 	}
 	defer c.Close()
+	if t.tlsCfg != nil {
+		c, err = tlsClientConn(c, addr, t.tlsCfg)
+		if err != nil {
+			return err
+		}
+		defer c.Close()
+	}
 	_ = c.SetWriteDeadline(time.Now().Add(raftSnapWrite))
 	data, err := proto.Marshal(snap)
 	if err != nil {

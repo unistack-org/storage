@@ -19,6 +19,7 @@ package meta
 
 import (
 	"bytes"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -37,6 +38,10 @@ import (
 type proxyConfig struct {
 	Addr  string
 	Peers map[string]string
+	// tlsSrv/tlsClient mirror RaftConfig.TLS / RaftConfig.ProxyTLS: the
+	// proxy speaks https when set.
+	tlsSrv    *tls.Config
+	tlsClient *tls.Config
 }
 
 // proxyOp is the wire format of POST /apply.
@@ -66,7 +71,7 @@ func (s *RaftStore) startProxy(cfg RaftConfig) error {
 		}
 	}
 	s.mu.Lock()
-	s.proxy = &proxyConfig{Addr: cfg.ProxyAddr, Peers: peers}
+	s.proxy = &proxyConfig{Addr: cfg.ProxyAddr, Peers: peers, tlsSrv: cfg.TLS, tlsClient: cfg.ProxyTLS}
 	s.mu.Unlock()
 
 	mux := http.NewServeMux()
@@ -74,6 +79,9 @@ func (s *RaftStore) startProxy(cfg RaftConfig) error {
 	srv := &http.Server{Handler: mux, ReadHeaderTimeout: 5 * time.Second}
 	s.closers = append(s.closers, &httpCloser{srv})
 	go func() {
+		if cfg.TLS != nil {
+			ln = tls.NewListener(ln, cfg.TLS)
+		}
 		if serr := srv.Serve(ln); serr != nil && serr != http.ErrServerClosed {
 			s.lg.Printf("raft proxy: %v", serr)
 		}
@@ -160,8 +168,14 @@ func (s *RaftStore) proxyForward(o op, leaderAddr string) (*opResult, bool, erro
 	if err != nil {
 		return nil, false, err
 	}
-	client := &http.Client{Timeout: 5 * time.Second}
-	resp, err := client.Post("http://"+target+"/apply", "application/json", bytes.NewReader(body))
+	scheme := "http"
+	tr := http.DefaultTransport
+	if pr.tlsClient != nil {
+		scheme = "https"
+		tr = &http.Transport{TLSClientConfig: pr.tlsClient.Clone()}
+	}
+	client := &http.Client{Timeout: 5 * time.Second, Transport: tr}
+	resp, err := client.Post(scheme+"://"+target+"/apply", "application/json", bytes.NewReader(body))
 	if err != nil {
 		return nil, true, nil // leader unreachable: caller retries
 	}

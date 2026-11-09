@@ -3,6 +3,7 @@ package meta
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 )
 
@@ -108,7 +109,7 @@ func MutateAlloc(ctx context.Context, s Store, name string, nbits int, mutate fu
 			return rec.Bits, false, nil // bitmap already in the desired state
 		}
 		if _, err := PutAllocMap(ctx, s, name, rec); err != nil {
-			if err == ErrConflict {
+			if errors.Is(err, ErrConflict) {
 				continue // racing allocator: re-read, re-merge, retry
 			}
 			return nil, false, err
