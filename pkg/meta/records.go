@@ -373,6 +373,38 @@ func GetVolume(ctx context.Context, s Store, name string) (VolumeSpec, error) {
 	return spec, json.Unmarshal(b, &spec)
 }
 
+// MutateVolume read-modify-writes a volume spec under CAS: mutate
+// receives the current record and returns false to leave it untouched.
+// A racing editor (a resize appending extents, another QoS edit) makes
+// the CAS fail and the pair is re-read and re-merged, so concurrent
+// edits of different fields never overwrite each other.
+func MutateVolume(ctx context.Context, s Store, name string, mutate func(*VolumeSpec) bool) (VolumeSpec, error) {
+	for {
+		b, rev, err := s.Get(ctx, PrefixVolumes, name)
+		if err != nil {
+			return VolumeSpec{}, err
+		}
+		var spec VolumeSpec
+		if err := json.Unmarshal(b, &spec); err != nil {
+			return VolumeSpec{}, fmt.Errorf("meta: volume %s: %w", name, err)
+		}
+		if !mutate(&spec) {
+			return spec, nil
+		}
+		nb, err := json.Marshal(spec)
+		if err != nil {
+			return VolumeSpec{}, err
+		}
+		if _, err := s.Put(ctx, PrefixVolumes, name, nb, rev); err != nil {
+			if err == ErrConflict {
+				continue
+			}
+			return VolumeSpec{}, err
+		}
+		return spec, nil
+	}
+}
+
 // PutMap stores a crush map generation and returns its revision.
 func PutMap(ctx context.Context, s Store, rec MapRecord) (int64, error) {
 	b, err := json.Marshal(rec)

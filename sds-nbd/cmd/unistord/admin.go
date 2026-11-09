@@ -582,6 +582,45 @@ func (a *adminAPI) handleVolumeQuota(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, a.volumeView(r.Context(), spec))
 }
 
+// handleVolumeResize grows a volume online (grow-only). Open NBD
+// targets and exports pick the new size up through their volume watch;
+// a fresh NBD handshake serves the new capacity (see resize-export).
+func (a *adminAPI) handleVolumeResize(w http.ResponseWriter, r *http.Request) {
+	name := volumeName(r)
+	if name == "" {
+		jsonError(w, http.StatusBadRequest, "bad volume name")
+		return
+	}
+	var req resizeRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		jsonError(w, http.StatusBadRequest, "bad json: %v", err)
+		return
+	}
+	size, err := sizeSuffix(req.Size)
+	if err != nil {
+		jsonError(w, http.StatusBadRequest, "bad size: %v", err)
+		return
+	}
+	spec, err := a.cl.ResizeVolume(r.Context(), name, size)
+	if err != nil {
+		if errors.Is(err, meta.ErrNotFound) {
+			jsonError(w, http.StatusNotFound, "volume %q not found", name)
+			return
+		}
+		if errors.Is(err, meta.ErrShrinkUnsupported) {
+			jsonError(w, http.StatusBadRequest, "shrinking is not supported (volume %q stays at its size)", name)
+			return
+		}
+		if a.readOnlyGate(w, err) {
+			return
+		}
+		jsonError(w, http.StatusInternalServerError, "resize: %v", err)
+		return
+	}
+	a.logger.Printf("admin: volume %q resized to %s (%d extent(s))", name, humanSize(size), len(spec.Extents))
+	writeJSON(w, http.StatusOK, a.volumeView(r.Context(), spec))
+}
+
 // ---------- QoS class routes ----------
 
 func (a *adminAPI) handleListClasses(w http.ResponseWriter, r *http.Request) {
