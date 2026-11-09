@@ -56,7 +56,67 @@ const (
 	// uint64, bytes). Servers whose backend has no filesystem answer
 	// StatusNotSupp.
 	OpStatFS
+	// OpBatch carries several ordinary ops in one request frame: the
+	// header's Length field holds the sub-op count, the payload is a
+	// batch body (see BatchReqHeaderSize / EncodeBatchReqBody), and the
+	// response carries a batch body of per-sub-op replies. Servers
+	// without batch support answer StatusNotSupp and clients fall back
+	// to single ops, so a mixed-version cluster keeps working.
+	OpBatch
 )
+
+// MaxBatchOps bounds the sub-op count of one OpBatch request. 64 covers
+// the batching the VDUSE data path produces (a worker drains up to 64
+// queued virtq jobs) while keeping one batch frame ≤ 64 × (4 MiB +
+// headers) in the worst case, same per-op bound as single requests.
+const MaxBatchOps = 64
+
+// Batch body sizes. A batch request payload is
+//
+//	[sub-op 0: ReqHeaderSize header][payload] ... [sub-op N-1: ...]
+//
+// and a batch response payload is
+//
+//	[sub-op 0: RespHeaderSize header][payload] ... [sub-op N-1: ...]
+//
+// with N (the count) carried in the outer header's Length (request) /
+// Value (response) field, so a body of N sub-ops starts at byte 0.
+const (
+	BatchReqHeaderSize  = ReqHeaderSize
+	BatchRespHeaderSize = RespHeaderSize
+)
+
+// EncodeBatchReqBody writes sub-op headers (with their payloads, in
+// order) into b and returns the bytes written. headers[i] describes
+// payload[i]; a nil/empty payload is written for ops that carry none.
+// Each header's Seq must be its index and its Op must not be OpBatch
+// (no nesting).
+func EncodeBatchReqBody(b []byte, headers []ReqHeader, payloads [][]byte) (int, error) {
+	if len(headers) > MaxBatchOps {
+		return 0, ErrTooBig
+	}
+	off := 0
+	for i := range headers {
+		if headers[i].Op == OpBatch {
+			return 0, ErrProtocol
+		}
+		if off+BatchReqHeaderSize > len(b) {
+			return off, ErrTooBig
+		}
+		headers[i].Encode(b[off : off+BatchReqHeaderSize])
+		off += BatchReqHeaderSize
+		p := payloads[i]
+		if len(p) > int(headers[i].Length) {
+			p = p[:headers[i].Length]
+		}
+		if off+len(p) > len(b) {
+			return off, ErrTooBig
+		}
+		copy(b[off:], p)
+		off += len(p)
+	}
+	return off, nil
+}
 
 func (o Op) String() string {
 	switch o {
@@ -80,6 +140,8 @@ func (o Op) String() string {
 		return "stat_info"
 	case OpStatFS:
 		return "statfs"
+	case OpBatch:
+		return "batch"
 	}
 	return fmt.Sprintf("op(%d)", uint8(o))
 }

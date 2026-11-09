@@ -315,7 +315,9 @@ func (s *Server) handle(c net.Conn) {
 		s.reply(c, &RespHeader{Status: StatusUnknown})
 		return
 	}
-	if err := s.reply(c, &RespHeader{Status: StatusOK}); err != nil {
+	// Value=1 advertises batch support (OpBatch) in the handshake
+	// reply; clients that see 0 (old servers) never send batch frames.
+	if err := s.reply(c, &RespHeader{Status: StatusOK, Value: 1}); err != nil {
 		return
 	}
 	// Per-connection request count for the ConnClosed metric hook.
@@ -360,6 +362,14 @@ func (s *Server) handle(c net.Conn) {
 			rawSeq := binary.BigEndian.Uint32(rw.rh[4:8])
 			s.replyRW(wr, rw, &RespHeader{Seq: rawSeq, Status: statusFromErr(err)}, nil)
 			if wr.Flush() != nil {
+				return
+			}
+			continue
+		}
+		// Batched frame: sub-ops carry their own QoS charges inside
+		// handleBatch, so the outer header bypasses the throttle below.
+		if h.Op == OpBatch {
+			if !s.handleBatch(ctx, c, rd, wr, rw, backend, limits, &h, &connOps) {
 				return
 			}
 			continue
@@ -412,10 +422,99 @@ func (s *Server) handle(c net.Conn) {
 		if err := s.replyRW(wr, rw, &resp, out); err != nil {
 			return
 		}
-		if err := wr.Flush(); err != nil {
-			return
+		// Lazy flush: if the client has already pipelined more requests
+		// into the socket, our buffered reply will leave with the write
+		// syscall that services them, so an explicit flush now is one
+		// syscall too many. Only flush when the reader has nothing
+		// pending (the client is waiting on this reply).
+		if rd.Buffered() == 0 {
+			if err := wr.Flush(); err != nil {
+				return
+			}
 		}
 	}
+}
+
+// handleBatch services one OpBatch frame: count sub-ops (h.Length) read
+// positionally from rd, each dispatched through the same QoS, epoch and
+// metrics paths as a single request, with replies written in order. It
+// reports whether the connection may continue; false means the caller
+// must stop serving this connection.
+//
+// Sub-op replies carry Seq = sub-op index (a single request echoes its
+// own seq), which is how the client detects desync.
+func (s *Server) handleBatch(ctx context.Context, c net.Conn, rd *bufio.Reader, wr *bufio.Writer, rw *connRW, backend Backend, limits *qos.Pair, h *ReqHeader, connOps *uint64) bool {
+	count := int(h.Length)
+	if count < 1 || count > MaxBatchOps {
+		s.replyRW(wr, rw, &RespHeader{Seq: h.Seq, Status: StatusInvalid}, nil)
+		return wr.Flush() == nil
+	}
+	// Replies are written straight into the bufio writer; a batch of
+	// 4 KiB reads (64 × 4 KiB = 256 KiB) exceeds the 128 KiB buffer, so
+	// bufio writes the excess through to the socket in chunks. That is
+	// fine (and better than one syscall per sub-op), it just means the
+	// big-batch case is not a single syscall.
+	for i := 0; i < count; i++ {
+		if _, err := io.ReadFull(rd, rw.rh); err != nil {
+			s.logf("sdsnet: read batch sub-header %d: %v", i, err)
+			return false
+		}
+		sub, err := DecodeReqHeader(rw.rh)
+		if err != nil {
+			s.logf("sdsnet: bad batch sub-header %d: %v", i, err)
+			return false
+		}
+		if sub.Op == OpBatch {
+			// Nesting is not part of the protocol: the stream cannot be
+			// re-aligned, so drop the connection.
+			s.logf("sdsnet: nested batch at sub-op %d", i)
+			return false
+		}
+		sub.Seq = uint32(i)
+		var payload []byte
+		if sub.Op == OpWrite && sub.Length > 0 {
+			payload = rw.getBuf(int(sub.Length))
+			if _, err := io.ReadFull(rd, payload); err != nil {
+				s.logf("sdsnet: read batch payload %d: %v", i, err)
+				return false
+			}
+		}
+		if s.Aggregate != nil || limits != nil {
+			status, proceed, alive := s.throttle(ctx, limits, &sub)
+			if !alive {
+				return false
+			}
+			if !proceed {
+				s.replyRW(wr, rw, &RespHeader{Seq: sub.Seq, Status: status}, nil)
+				continue
+			}
+		}
+		start := time.Now()
+		resp, out := s.dispatch(ctx, backend, &sub, payload, rw)
+		if m := s.Metrics; m != nil && m.Request != nil {
+			*connOps++
+			var bin, bout uint64
+			if sub.Op == OpWrite {
+				bin = uint64(len(payload))
+			}
+			if resp.Status == StatusOK {
+				bout = uint64(len(out))
+			}
+			m.Request(sub.Op, resp.Status, bin, bout, time.Since(start))
+		}
+		if err := s.replyRW(wr, rw, &resp, out); err != nil {
+			return false
+		}
+		// Flush whenever the client may already be blocked waiting: the
+		// sub-op replies leave in order, and a pipelined reader lets us
+		// defer (see the lazy flush in the request loop).
+		if i%8 == 7 && rd.Buffered() == 0 {
+			if err := wr.Flush(); err != nil {
+				return false
+			}
+		}
+	}
+	return wr.Flush() == nil
 }
 
 // connRW holds per-connection reusable wire buffers (see handle).

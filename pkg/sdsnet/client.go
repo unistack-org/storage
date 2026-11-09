@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/binary"
+	"errors"
 	"io"
 	"net"
 	"sync"
@@ -25,6 +26,14 @@ type Conn struct {
 	seq  uint32
 	dead bool // transport error: the stream state is unknown
 	ep   atomic.Uint32
+	// batchOK is set from the handshake reply's Value field: a
+	// batch-capable server answers the handshake with Value=1. Old
+	// servers (Value=0) must never receive a batch frame — a pre-batch
+	// server would answer the outer header with StatusNotSupp and then
+	// misread the sub-op headers in the payload as top-level requests,
+	// desyncing the stream. That is why batch support is negotiated at
+	// handshake, not discovered from a StatusNotSupp reply.
+	batchOK bool
 	// Per-connection wire scratch: a stack array handed to io.ReadFull
 	// (io.Reader interface) escapes to the heap, so reusing these keeps
 	// the request loop allocation-free.
@@ -132,6 +141,7 @@ func (cc *Conn) handshake(export string, timeout time.Duration) error {
 	if h.Status != StatusOK {
 		return &Error{Op: 0, Status: h.Status}
 	}
+	cc.batchOK = h.Value != 0
 	return nil
 }
 
@@ -226,6 +236,173 @@ func (cc *Conn) op(ctx context.Context, op Op, oid, off uint64, length uint32, f
 	h := &cc.h
 	h.Op, h.Flags, h.OID, h.Offset, h.Length = op, flags, oid, off, length
 	return cc.do(ctx, h, payload, p)
+}
+
+// ErrBatchNotSupported reports that the server answered a batch request
+// with StatusNotSupp (old server). No sub-op ran: callers should fall
+// back to single ops. The connection is intact.
+var ErrBatchNotSupported = errors.New("sdsnet: batch not supported")
+
+// BatchReq describes one sub-op of a Batch call. For reads, Len/P
+// receive the data; for writes, Payload carries the data; the remaining
+// ops take neither. Op must be one of Read, Write, WriteZeroes, Trim,
+// Sync, Remove, Stat, StatInfo (no nested batches).
+type BatchReq struct {
+	Op      Op
+	OID     uint64
+	Offset  uint64
+	Flags   uint16
+	Len     uint32 // range length for WriteZeroes/Trim
+	Payload []byte // write payload (ignored for non-writes)
+	P       []byte // read destination (ignored for non-reads)
+}
+
+// subLength returns the wire Length for the sub-op.
+func (r *BatchReq) subLength() uint32 {
+	switch r.Op {
+	case OpRead:
+		return uint32(len(r.P))
+	case OpWrite:
+		return uint32(len(r.Payload))
+	case OpWriteZeroes, OpTrim:
+		return r.Len
+	}
+	return 0
+}
+
+// BatchResult is the reply for one sub-op, positional.
+type BatchResult struct {
+	Status Status
+	Value  uint64 // read: byte count; stat: size/alloc; write: length
+	Err    error  // *Error for a failed sub-op (nil when Status == StatusOK)
+}
+
+// allowedBatchOp reports whether op may appear inside a batch.
+func allowedBatchOp(op Op) bool {
+	switch op {
+	case OpRead, OpWrite, OpWriteZeroes, OpTrim, OpSync, OpRemove, OpStat, OpStatInfo:
+		return true
+	}
+	return false
+}
+
+// Batch sends len(reqs) ops in one request frame and fills results (same
+// length) positionally. It returns a transport/protocol error (the Conn
+// is then dead and must be discarded), ErrBatchNotSupported (server
+// lacks batch support, no sub-op ran), or nil — sub-op failures are
+// carried per-slot in results[i].Err, never collapsed into the return.
+//
+// Like do(), the whole exchange runs under one deadline. The reply
+// stream is consumed strictly positionally, so the connection stays
+// consistent even when individual sub-ops fail.
+func (cc *Conn) Batch(ctx context.Context, reqs []BatchReq, results []BatchResult) error {
+	if cc.dead {
+		return ErrClosed
+	}
+	if len(reqs) == 0 || len(reqs) > MaxBatchOps || len(results) != len(reqs) {
+		return ErrProtocol
+	}
+	for i := range reqs {
+		if !allowedBatchOp(reqs[i].Op) {
+			return ErrProtocol
+		}
+	}
+	if !cc.batchOK {
+		// Server predates batches: sending one would desync the stream
+		// (it would read the sub-op headers as top-level requests). The
+		// caller falls back to single ops.
+		return ErrBatchNotSupported
+	}
+	if cc.seq == 0 {
+		cc.seq = 1
+	}
+	ep := cc.ep.Load()
+
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		deadline = time.Now().Add(opTimeout)
+	}
+	cc.c.SetDeadline(deadline)
+	defer cc.c.SetDeadline(time.Time{})
+
+	// Encode: one outer header (Length = sub-op count), then each
+	// sub-op's header and payload. Everything goes through the bufio
+	// writer, so the flush below is a single write syscall for a batch
+	// that fits the 128 KiB buffer — the whole point of batching.
+	var sh [BatchReqHeaderSize]byte
+	outer := &cc.h
+	outer.Op, outer.Flags, outer.Seq = OpBatch, 0, cc.seq
+	outer.OID, outer.Offset, outer.Length, outer.Epoch = 0, 0, uint32(len(reqs)), ep
+	cc.seq += uint32(len(reqs))
+	fail := func(err error) error {
+		if _, ok := err.(*Error); !ok {
+			cc.dead = true
+		}
+		return err
+	}
+	outer.Encode(cc.sreq[:])
+	if _, err := cc.wr.Write(cc.sreq[:]); err != nil {
+		return fail(err)
+	}
+	for i := range reqs {
+		r := &reqs[i]
+		sub := ReqHeader{
+			Op:     r.Op,
+			Flags:  r.Flags,
+			Seq:    uint32(i),
+			OID:    r.OID,
+			Offset: r.Offset,
+			Length: r.subLength(),
+			Epoch:  ep,
+		}
+		if sub.Length > MaxPayload {
+			return ErrTooBig
+		}
+		sub.Encode(sh[:])
+		if _, err := cc.wr.Write(sh[:]); err != nil {
+			return fail(err)
+		}
+		if r.Op == OpWrite && len(r.Payload) > 0 {
+			if _, err := cc.wr.Write(r.Payload); err != nil {
+				return fail(err)
+			}
+		}
+	}
+	if err := cc.wr.Flush(); err != nil {
+		return fail(err)
+	}
+
+	// Decode: len(reqs) positional replies.
+	var sb [BatchRespHeaderSize]byte
+	for i := range results {
+		if _, err := io.ReadFull(cc.rd, sb[:]); err != nil {
+			return fail(err)
+		}
+		rh, err := DecodeRespHeader(sb[:])
+		if err != nil {
+			return fail(err)
+		}
+		if rh.Seq != uint32(i) {
+			return fail(ErrProtocol) // stream desync
+		}
+		results[i].Status = rh.Status
+		results[i].Value = rh.Value
+		if rh.Status != StatusOK {
+			results[i].Err = &Error{Seq: uint32(i), Op: reqs[i].Op, Status: rh.Status, Value: rh.Value}
+			continue
+		}
+		results[i].Err = nil
+		if reqs[i].Op == OpRead && rh.Value > 0 {
+			n := int(rh.Value)
+			if n > len(reqs[i].P) {
+				n = len(reqs[i].P)
+			}
+			if _, err := io.ReadFull(cc.rd, reqs[i].P[:n]); err != nil {
+				return fail(err)
+			}
+		}
+	}
+	return nil
 }
 
 // Ping checks the connection round-trip.
@@ -477,6 +654,15 @@ func (pp *Pool) signal() {
 // Close closes every idle connection and marks the pool closed: Get
 // fails with ErrClosed afterwards and Put/Discard close returned
 // connections. In-use connections close when they come back.
+// Closed reports whether the pool has been closed (dropPool/Cluster
+// close). A closed pool never dials again; callers caching a pool must
+// re-resolve it when this returns true.
+func (pp *Pool) Closed() bool {
+	pp.mu.Lock()
+	defer pp.mu.Unlock()
+	return pp.closed
+}
+
 func (pp *Pool) Close() {
 	pp.mu.Lock()
 	idle := pp.idle
@@ -617,6 +803,15 @@ func (pp *Pool) StatInfo(ctx context.Context, oid uint64) (alloc uint64, exists 
 		return 0, false, err
 	}
 	return alloc, exists, nil
+}
+
+// Batch runs a batched exchange over a pooled connection (see
+// Conn.Batch). Like Do, it retries once over a fresh connection when an
+// idle conn turned out dead. A StatusNotSupp reply is surfaced as
+// ErrBatchNotSupported so callers can fall back to single ops; per-op
+// results are positional in results.
+func (pp *Pool) Batch(ctx context.Context, reqs []BatchReq, results []BatchResult) error {
+	return pp.Do(ctx, func(cc *Conn) error { return cc.Batch(ctx, reqs, results) })
 }
 
 const dialTimeout = 5 * time.Second

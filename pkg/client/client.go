@@ -1090,6 +1090,14 @@ func (v *Volume) reloadQoS(ctx context.Context) {
 	if err != nil {
 		return
 	}
+	// Resolve the template into the local spec BEFORE publishing it:
+	// cur.Store shares this address with every reader, so mutating
+	// spec afterwards would race with (and corrupt) live reads.
+	if spec.QoSTemplate != "" {
+		if rec, err := meta.GetQoSClass(ctx, v.cluster.meta, spec.QoSTemplate); err == nil {
+			spec.ReadIOPS, spec.ReadBPS, spec.WriteIOPS, spec.WriteBPS = rec.Rates()
+		}
+	}
 	v.mu.Lock()
 	v.qosTemplate = spec.QoSTemplate
 	// Live geometry: an online resize (Size, OID extents) travels on
@@ -1105,11 +1113,6 @@ func (v *Volume) reloadQoS(ctx context.Context) {
 		v.quota = spec.Quota
 	}
 	v.mu.Unlock()
-	if spec.QoSTemplate != "" {
-		if rec, err := meta.GetQoSClass(ctx, v.cluster.meta, spec.QoSTemplate); err == nil {
-			spec.ReadIOPS, spec.ReadBPS, spec.WriteIOPS, spec.WriteBPS = rec.Rates()
-		}
-	}
 	v.SetQoS(spec)
 }
 
@@ -1172,6 +1175,18 @@ type Volume struct {
 	// through meta CAS so concurrent writers cannot lose bits.
 	allocMu sync.Mutex
 	alloc   []byte
+
+	// Read micro-batching (volume_batch.go). batchMu guards the
+	// per-OSD collector map; batchClosed is set by Close so late
+	// senders fall back to the single-op path instead of creating a
+	// collector on a dead volume. batchDisabled latches off after a
+	// peer without negotiated batch support answers, so a mixed-version
+	// cluster pays one probe, not a fallback per read.
+	batchMu       sync.Mutex
+	batchGroups   map[int32]*batchGroup
+	batchClosed   bool
+	batchWG       sync.WaitGroup
+	batchDisabled atomic.Bool
 }
 
 // SetQoS replaces the volume's limits at runtime (admin
@@ -1226,6 +1241,7 @@ func (v *Volume) Close() error {
 	if v.stopQoSWatch != nil {
 		v.stopQoSWatch()
 	}
+	v.closeBatchers()
 	v.mu.Lock()
 	lim := v.limits
 	v.limits = nil
@@ -1506,7 +1522,14 @@ func (v *Volume) readChunk(ctx context.Context, p []byte, index, inObj uint64) e
 			if err != nil {
 				return err
 			}
-			n, err := pp.Read(ctx, uint64(oid), inObj, p)
+			// Micro-batched read: coalesces concurrent chunk reads for
+			// this OSD into one round-trip. handled=false means "not
+			// applicable" (batching off/snapshot volume/legacy peer/
+			// closing) and the single-op path below answers verbatim.
+			n, err, handled := v.batchRead(ctx, ref, uint64(oid), inObj, p)
+			if !handled {
+				n, err = pp.Read(ctx, uint64(oid), inObj, p)
+			}
 			switch {
 			case err == nil:
 				v.cluster.noteSuccess(ref.OSD)
