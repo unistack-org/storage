@@ -16,6 +16,9 @@ func (s *Store) openFile(p string, create bool) (*os.File, error) {
 	if s.opts.Direct {
 		flags |= syscall.O_DIRECT
 	}
+	if s.opts.CommitMode == CommitSync {
+		flags |= syscall.O_SYNC
+	}
 	return os.OpenFile(p, flags, 0o644)
 }
 

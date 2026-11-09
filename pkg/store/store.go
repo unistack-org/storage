@@ -17,16 +17,22 @@ package store
 import (
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"path"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/unistack-org/storage/pkg/object"
 )
 
 // ErrObjectTooSmall is returned when an I/O runs past the object size.
 var ErrObjectTooSmall = errors.New("store: io beyond object size")
+
+// ErrClosed is returned by Sync after Close has drained the coalescer.
+var ErrClosed = errors.New("store: store closed")
 
 // ErrNoSuchObject is returned when an object does not exist. It wraps
 // fs.ErrNotExist so callers (and the network layer's status mapping) can
@@ -46,11 +52,64 @@ const punchAlign = 4096
 // it is false.
 const PunchSupported = punchSupported
 
+// Commit modes (Options.CommitMode) — the durability/throughput dial,
+// the same idea as Vitastor's immediate_commit:
+//
+//	CommitNone  writes land in the page cache; durability is the caller's
+//	            job (an explicit Sync per FLUSH/FUA). Fastest; a machine
+//	            crash loses the acked-but-unflushed tail.
+//	CommitFlush every write (and hole punch) fsyncs before returning.
+//	            Safe; one fsync per operation.
+//	CommitSync  files are opened O_SYNC: the kernel fsyncs each write,
+//	            cheaper than an fsync syscall per write.
+//	CommitJournal every write is appended to a write-ahead log and the
+//	            log is fsynced before the write is acknowledged; a
+//	            background applier flattens the log into the objects
+//	            lazily (see journal.go). Fastest safe mode for small
+//	            random writes: sequential log append instead of random
+//	            writes + fsyncs into 4 MiB objects.
+const (
+	CommitNone    CommitMode = "none"
+	CommitFlush   CommitMode = "flush"
+	CommitSync    CommitMode = "sync"
+	CommitJournal CommitMode = "journal"
+)
+
+// CommitMode selects how writes reach durable media.
+type CommitMode string
+
+// ParseCommitMode maps a CLI string ("none"/"flush"/"sync"/"journal",
+// "" = none) to a CommitMode.
+func ParseCommitMode(s string) (CommitMode, error) {
+	switch s {
+	case "", "none":
+		return CommitNone, nil
+	case "flush":
+		return CommitFlush, nil
+	case "sync":
+		return CommitSync, nil
+	case "journal":
+		return CommitJournal, nil
+	}
+	return "", fmt.Errorf("store: unknown commit mode %q (want none, flush, sync or journal)", s)
+}
+
 // Options configures a Store.
 type Options struct {
 	// Direct requests O_DIRECT (Linux) / F_NOCACHE (darwin) on object
 	// files. The store falls back to buffered I/O when unsupported.
 	Direct bool
+	// CommitMode is one of CommitNone/CommitFlush/CommitSync ("" =
+	// CommitNone).
+	CommitMode CommitMode
+	// FsyncBatch > 0 turns Sync() into a coalescer: concurrent Sync
+	// callers share one fsync pass started up to FsyncBatch after the
+	// first request arrived (the classic writeback coalescing that turns
+	// N fsyncs/second into ~1/FsyncBatch). Ordering is kept: every
+	// request is served by a pass that starts *after* the caller's
+	// writes were issued, so a Sync that returns has all prior writes
+	// durable.
+	FsyncBatch time.Duration
 	// Preallocate fallocates each newly created object file to the full
 	// object size.
 	Preallocate bool
@@ -74,11 +133,34 @@ type Store struct {
 	mu    sync.RWMutex
 	files map[object.OID]*entry
 	usage int64 // sum of file sizes of known objects
+
+	// fsync coalescer (active when opts.FsyncBatch > 0).
+	batchMu     sync.Mutex
+	batch       []batchWaiter
+	batchTimer  *time.Timer
+	batchClosed bool
+
+	// jrn is the write-ahead log state (nil unless CommitMode is
+	// CommitJournal; see journal.go).
+	jrn *journalState
+
+	syncPasses atomic.Int64 // fsync passes performed (Sync + batches), for stats/tests
+}
+
+type batchWaiter struct {
+	done chan error
 }
 
 type entry struct {
 	f    *os.File
 	size int64
+	// dirty counts writes issued since the last successful fsync of
+	// this file (0 = clean). Sync skips clean files, which keeps a
+	// flush latency proportional to the data written in the window
+	// rather than to the whole cache of open objects. Atomic: a sync
+	// pass snapshots it, fsyncs, and clears it only if an intervening
+	// write has not bumped it.
+	dirty atomic.Int64
 }
 
 // New opens (creating if needed) the store directory.
@@ -89,7 +171,127 @@ func New(dir string, opts Options) (*Store, error) {
 	if opts.Logf == nil {
 		opts.Logf = func(string, ...any) {}
 	}
-	return &Store{dir: dir, opts: opts, files: map[object.OID]*entry{}}, nil
+	switch opts.CommitMode {
+	case "", CommitNone, CommitFlush, CommitSync, CommitJournal:
+	default:
+		return nil, fmt.Errorf("store: unknown commit mode %q (want none|flush|sync|journal)", opts.CommitMode)
+	}
+	s := &Store{
+		dir: dir, opts: opts, files: map[object.OID]*entry{},
+	}
+	if opts.CommitMode == CommitJournal {
+		js, err := openJournal(dir, opts.Logf)
+		if err != nil {
+			return nil, err
+		}
+		s.jrn = js
+		s.startApplier(js)
+	}
+	return s, nil
+}
+
+// syncPass fsyncs the object files that have writes outstanding. Callers
+// that need a stable snapshot take the read lock across the whole pass
+// (batch mode); Sync takes it per file when unbuffered.
+//
+// Only dirty files are flushed and an entry's dirty counter is snapshotted
+// under the same lock that the writers take: if a write lands between the
+// snapshot and the fsync, the counter has grown, so it stays dirty and the
+// next pass (or an explicit Sync) covers it. A pass that starts after a
+// caller's writes therefore always flushes them.
+func (s *Store) syncPass(underReadLock bool) error {
+	s.syncPasses.Add(1)
+	var pending []entryWithSeq
+	if underReadLock {
+		s.mu.RLock()
+		defer s.mu.RUnlock()
+		pending = s.dirtyEntries()
+	} else {
+		s.mu.RLock()
+		pending = s.dirtyEntries()
+		s.mu.RUnlock()
+	}
+	var firstErr error
+	for _, fl := range pending {
+		if err := fl.e.f.Sync(); err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+		// Clear only if no write landed since the snapshot: a write
+		// that raced in bumps the counter and stays for the next pass.
+		fl.e.dirty.CompareAndSwap(fl.seq, 0)
+	}
+	return firstErr
+}
+
+// dirtyEntries returns the files with unflushed writes plus the dirty
+// counter observed for each.
+func (s *Store) dirtyEntries() []entryWithSeq {
+	var out []entryWithSeq
+	for _, e := range s.files {
+		if d := e.dirty.Load(); d > 0 {
+			out = append(out, entryWithSeq{e, d})
+		}
+	}
+	return out
+}
+
+// entryWithSeq pairs an entry with the dirty counter read under the lock.
+type entryWithSeq struct {
+	e   *entry
+	seq int64
+}
+
+// Sync flushes every cached object file to stable storage.
+//
+// With Options.FsyncBatch > 0 the call joins a coalescing batch: the
+// fsync pass starts no earlier than FsyncBatch after the batch opened,
+// so concurrent flushes share one pass. Ordering is safe — the batch
+// opened after this call, so every write this caller issued is inside
+// the pass.
+func (s *Store) Sync() error {
+	if s.jrn != nil {
+		// Journal mode: acknowledged writes are already durable in the
+		// log. Sync additionally flattens the log into the objects and
+		// truncates it, so after Sync the objects alone are complete
+		// (what the guest's FLUSH/FUA semantics promise).
+		return s.applyPass(true)
+	}
+	if s.opts.FsyncBatch <= 0 {
+		return s.syncPass(false)
+	}
+	w := batchWaiter{done: make(chan error, 1)}
+	s.batchMu.Lock()
+	if s.batchClosed {
+		s.batchMu.Unlock()
+		return ErrClosed
+	}
+	first := len(s.batch) == 0
+	s.batch = append(s.batch, w)
+	if first {
+		s.batchTimer = time.AfterFunc(s.opts.FsyncBatch, s.runBatch)
+	}
+	s.batchMu.Unlock()
+	return <-w.done
+}
+
+// runBatch performs one coalesced fsync pass for all queued waiters.
+func (s *Store) runBatch() {
+	s.batchMu.Lock()
+	if s.batchClosed {
+		s.batchMu.Unlock()
+		return
+	}
+	waiters := s.batch
+	s.batch = nil
+	s.batchMu.Unlock()
+
+	err := s.syncPass(true)
+	for _, w := range waiters {
+		w.done <- err
+	}
 }
 
 func (s *Store) path(oid object.OID) string {
@@ -174,10 +376,15 @@ func (s *Store) openSlow(oid object.OID, create bool) (*entry, error) {
 }
 
 // ReadAt reads len(p) bytes from object oid at byte offset off.
-// It is allocation-free for cached objects.
+// It is allocation-free for cached objects. In journal mode any
+// un-applied log records are overlaid on the file read, so reads always
+// see every acknowledged write (read-your-writes).
 func (s *Store) ReadAt(oid object.OID, p []byte, off int64) (int, error) {
 	if off+int64(len(p)) > int64(object.Size) {
 		return 0, ErrObjectTooSmall
+	}
+	if s.jrn != nil {
+		return s.journalReadAt(oid, p, off)
 	}
 	e, err := s.open(oid, false)
 	if err != nil {
@@ -186,11 +393,49 @@ func (s *Store) ReadAt(oid object.OID, p []byte, off int64) (int, error) {
 	return e.f.ReadAt(p, off)
 }
 
+// journalReadAt serves a read in journal mode: overlay the staged
+// records over the object file (which may lag the log, not exist yet,
+// or be a hole).
+func (s *Store) journalReadAt(oid object.OID, p []byte, off int64) (int, error) {
+	recs := s.overlayFor(oid)
+	if len(recs) == 0 {
+		// Nothing staged: plain file read (missing object = hole).
+		e, err := s.open(oid, false)
+		if err != nil {
+			return 0, err
+		}
+		return e.f.ReadAt(p, off)
+	}
+	// Start from the file contents (a missing object is all zeroes),
+	// then stamp the overlay on top in seq order.
+	e, err := s.open(oid, false)
+	switch {
+	case err == nil:
+		if _, err := e.f.ReadAt(p, off); err != nil && !errors.Is(err, io.EOF) {
+			return 0, err
+		}
+	case errors.Is(err, ErrNoSuchObject):
+		for i := range p {
+			p[i] = 0
+		}
+	default:
+		return 0, err
+	}
+	overlayRead(recs, p, off)
+	return len(p), nil
+}
+
 // WriteAt writes p into object oid at byte offset off, creating the object
 // on first write. Writes never leave the object bounds.
 func (s *Store) WriteAt(oid object.OID, p []byte, off int64) (int, error) {
 	if off+int64(len(p)) > int64(object.Size) {
 		return 0, ErrObjectTooSmall
+	}
+	if s.jrn != nil {
+		if err := s.journalWrite(oid, p, off); err != nil {
+			return 0, err
+		}
+		return len(p), nil
 	}
 	e, err := s.open(oid, true)
 	if err != nil {
@@ -206,7 +451,18 @@ func (s *Store) WriteAt(oid object.OID, p []byte, off int64) (int, error) {
 		e.size += grow
 		s.usage += grow
 	}
+	// In CommitNone durability is an explicit Sync, so remember that
+	// this file needs one. CommitFlush fsyncs below and CommitSync uses
+	// O_SYNC: both leave the file clean when WriteAt returns.
+	if err == nil && s.opts.CommitMode == CommitNone {
+		e.dirty.Add(1)
+	}
 	s.mu.Unlock()
+	if err == nil && s.opts.CommitMode == CommitFlush {
+		if serr := e.f.Sync(); serr != nil {
+			return n, serr
+		}
+	}
 	return n, err
 }
 
@@ -233,6 +489,9 @@ func (s *Store) WriteZeroes(oid object.OID, off, n uint64, sparse bool) error {
 	if n == 0 {
 		return nil
 	}
+	if s.jrn != nil {
+		return s.journalZeroes(oid, off, n, sparse)
+	}
 	e, err := s.open(oid, true)
 	if err != nil {
 		return err
@@ -244,13 +503,33 @@ func (s *Store) WriteZeroes(oid object.OID, off, n uint64, sparse bool) error {
 				if err := s.zeroFill(e, off, head); err != nil {
 					return err
 				}
-				return s.zeroFill(e, off+tail, n-tail)
+				if err := s.zeroFill(e, off+tail, n-tail); err != nil {
+					return err
+				}
+				return s.commitSync(e)
 			}
 			// Punch failed: fall through to a zero-fill. Correctness
 			// first, reclaim is a bonus.
 		}
 	}
-	return s.zeroFill(e, off, n)
+	if err := s.zeroFill(e, off, n); err != nil {
+		return err
+	}
+	return s.commitSync(e)
+}
+
+// commitSync records (or performs) durability work after a mutating op.
+// CommitFlush fsyncs immediately; CommitNone marks the file dirty so an
+// explicit Sync covers the punch/zero-fill; CommitSync relies on O_SYNC.
+func (s *Store) commitSync(e *entry) error {
+	switch s.opts.CommitMode {
+	case CommitNone:
+		e.dirty.Add(1)
+		return nil
+	case CommitFlush:
+		return e.f.Sync()
+	}
+	return nil
 }
 
 // zeroFill writes n zeroes at off through the cached handle. It never
@@ -300,8 +579,17 @@ func zeroBuf() []byte {
 	return zeros
 }
 
-// Remove deletes an object.
+// Remove deletes an object. In journal mode the delete is a checkpoint:
+// the log is drained and truncated first (see journalRemove), so the
+// object's history can never be replayed over its own deletion.
 func (s *Store) Remove(oid object.OID) error {
+	if s.jrn != nil {
+		return s.journalRemove(oid)
+	}
+	return s.removeFile(oid)
+}
+
+func (s *Store) removeFile(oid object.OID) error {
 	s.mu.Lock()
 	e := s.files[oid]
 	delete(s.files, oid)
@@ -366,22 +654,6 @@ func (s *Store) Lookup(oid object.OID) (*os.File, error) {
 	return e.f, nil
 }
 
-// Sync flushes every cached object file to stable storage.
-func (s *Store) Sync() error {
-	s.mu.RLock()
-	entries := make([]*entry, 0, len(s.files))
-	for _, e := range s.files {
-		entries = append(entries, e)
-	}
-	s.mu.RUnlock()
-	for _, e := range entries {
-		if err := e.f.Sync(); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
 // Usage returns the total bytes stored across all known objects.
 func (s *Store) Usage() int64 {
 	s.mu.RLock()
@@ -401,8 +673,33 @@ func (s *Store) DiskSpace() (free, total int64, ok bool) {
 	return fileSpace(f)
 }
 
-// Close syncs and closes all cached files.
+// Close syncs and closes all cached files. In journal mode the log is
+// drained into the objects first (clean shutdown: a reopen sees an
+// empty log).
 func (s *Store) Close() error {
+	// Drain the journal before the object files: the applier writes
+	// through open(), which wants the store lock.
+	journalErr := s.journalClose()
+
+	// Drain the coalescer before taking the store lock: runBatch takes
+	// the read lock, so waiting for it while holding the write lock
+	// would deadlock. Waiters that arrive after this point get ErrClosed.
+	if s.opts.FsyncBatch > 0 {
+		s.batchMu.Lock()
+		s.batchClosed = true
+		waiters := s.batch
+		s.batch = nil
+		if s.batchTimer != nil {
+			s.batchTimer.Stop()
+			s.batchTimer = nil
+		}
+		s.batchMu.Unlock()
+		err := s.syncPass(false)
+		for _, w := range waiters {
+			w.done <- err
+		}
+	}
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	var firstErr error
@@ -414,6 +711,9 @@ func (s *Store) Close() error {
 			firstErr = err
 		}
 		delete(s.files, oid)
+	}
+	if journalErr != nil && firstErr == nil {
+		firstErr = journalErr
 	}
 	return firstErr
 }

@@ -11,6 +11,9 @@ func (s *Store) openFile(p string, create bool) (*os.File, error) {
 	if create {
 		flags |= os.O_CREATE
 	}
+	if s.opts.CommitMode == CommitSync {
+		flags |= os.O_SYNC
+	}
 	f, err := os.OpenFile(p, flags, 0o644)
 	if err != nil {
 		return nil, err
