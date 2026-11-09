@@ -107,6 +107,21 @@ type VolumeSpec struct {
 	// Snapshots are the frozen read-only generations, oldest first.
 	// The live volume is generation Gen and is not listed here.
 	Snapshots []GenRecord `json:"snapshots,omitempty"`
+
+	// ReadOnly marks the volume for read-only serving: an export (NBD
+	// or VDUSE) created for it advertises the device read-only
+	// (NBD_FLAG_READ_ONLY / VIRTIO_BLK_F_RO) and refuses every write,
+	// and the flag lives here so the setting survives a daemon
+	// restart that re-creates the export from meta.
+	ReadOnly bool `json:"read_only,omitempty"`
+	// Shared advertises that the volume may be exported to several
+	// clients at once (NBD_FLAG_SEND_FLUSH semantics aside, it is the
+	// caller's contract that the guest uses a shared-capable
+	// filesystem). VDUSE devices are inherently single-attach.
+	Shared bool `json:"shared,omitempty"`
+	// Owner is free-form bookkeeping (the control plane that created
+	// the volume, e.g. "cell:<id>"); the daemon never interprets it.
+	Owner string `json:"owner,omitempty"`
 }
 
 // QoSed reports whether the spec carries any limit.

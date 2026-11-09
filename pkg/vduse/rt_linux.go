@@ -149,10 +149,10 @@ type queueState struct {
 	// of loopback TCP, and doing it serially capped us at ~18K IOPS —
 	// then complete (status + used + IRQ) and release their pins.
 	jobs     chan *job
-	inflight int           // claimed jobs not fully finished
-	cond     *sync.Cond    // signals inflight == 0 (guards ctrlMu)
-	ctrlMu   sync.Mutex    // guards inflight/cond/closed
-	closed   bool          // Close: dispatcher must not enqueue
+	inflight int        // claimed jobs not fully finished
+	cond     *sync.Cond // signals inflight == 0 (guards ctrlMu)
+	ctrlMu   sync.Mutex // guards inflight/cond/closed
+	closed   bool       // Close: dispatcher must not enqueue
 	workers  sync.WaitGroup
 
 	// irqPending coalesces interrupt requests: completions set it, and
@@ -178,8 +178,8 @@ type job struct {
 	br   *BlkReq
 	hdr  BlkReqHeader
 	refs []*RegionRef
-	ring *SplitRing     // ring the request was claimed from (completion target)
-	t0   time.Time      // dispatch time (debug timing only)
+	ring *SplitRing // ring the request was claimed from (completion target)
+	t0   time.Time  // dispatch time (debug timing only)
 }
 
 // queueWorkers is the per-queue worker pool size. A request spends
@@ -361,6 +361,7 @@ type Device struct {
 	pullMu   sync.Mutex // serialises VDUSE_IOTLB_GET_FD pulls
 	trim     bool
 	wz       bool
+	ro       bool
 	dbg      bool
 	stop     chan struct{}
 	done     chan struct{}
@@ -380,6 +381,10 @@ type Options struct {
 	// REQ_WRITE_ZEROES; disable when the backend cannot honour them.
 	Trim        bool
 	WriteZeroes bool
+	// ReadOnly advertises VIRTIO_BLK_F_RO: the guest mounts the disk
+	// read-only and every write request is refused with VIRTIO_BLK_S_IOERR
+	// (the device is the read-only enforcement point, not the guest).
+	ReadOnly bool
 }
 
 // NewDevice creates (or reattaches to) the kernel device and opens it,
@@ -401,7 +406,7 @@ func NewDevice(name string, opts Options, be Backend) (*Device, error) {
 	_, statErr := os.Stat("/dev/vduse/" + name)
 	attached := statErr == nil
 	if !attached {
-		features := FeatureMask(opts.Trim, opts.WriteZeroes)
+		features := FeatureMask(opts.Trim, opts.WriteZeroes, opts.ReadOnly)
 		if err := CreateDevice(name, nq, features, ConfigSpace(be.Size(), nq)); err != nil {
 			return nil, err
 		}
@@ -422,6 +427,7 @@ func NewDevice(name string, opts Options, be Backend) (*Device, error) {
 		attached: attached,
 		trim:     opts.Trim,
 		wz:       opts.WriteZeroes,
+		ro:       opts.ReadOnly,
 		dbg:      os.Getenv("SDS_VDUSE_DEBUG") != "",
 		stop:     make(chan struct{}),
 		done:     make(chan struct{}),
@@ -1267,9 +1273,9 @@ func (d *Device) SetCapacity(sizeBytes uint64) error {
 	c := ConfigSpace(sizeBytes, d.nq)
 	// struct vduse_config_data { u32 offset; u32 length; u8 buffer[] }
 	hdr := [8]byte{}
-	binary.LittleEndian.PutUint32(hdr[0:], 0)    // capacity @0
-	binary.LittleEndian.PutUint32(hdr[4:], 8)    // 8 bytes
-	buf := append(hdr[:], c[:8]...)              //
+	binary.LittleEndian.PutUint32(hdr[0:], 0) // capacity @0
+	binary.LittleEndian.PutUint32(hdr[4:], 8) // 8 bytes
+	buf := append(hdr[:], c[:8]...)           //
 	if _, err := ioctl(d.devFD.Fd(), iocDevSetConfig, unsafe.Pointer(&buf[0])); err != nil {
 		return fmt.Errorf("vduse set_config: %w", err)
 	}
@@ -1400,6 +1406,16 @@ func (d *Device) coalesce(gm SliceGuestMem, segs []Seg, total int) (buf []byte, 
 func (d *Device) exec(br *BlkReq, hdr BlkReqHeader) (uint8, uint32) {
 	gm := d.gm
 	off := int64(hdr.Sector) * 512
+	// A read-only device refuses every request that mutates the image:
+	// the F_RO advertisement is not advisory, the device is the
+	// enforcement point (a misbehaving or compromised guest must not
+	// write through).
+	if d.ro {
+		switch hdr.Type {
+		case ReqOut, ReqDiscard, ReqZeroOut:
+			return StatusIOErr, 0
+		}
+	}
 	switch hdr.Type {
 	case ReqIn:
 		// VIRTIO_BLK_T_IN: the guest receives data, so every data

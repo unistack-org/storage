@@ -166,3 +166,42 @@ func TestExecPastVolumeEnd(t *testing.T) {
 		t.Fatalf("backend saw %d writes, want 0", be.writes)
 	}
 }
+
+// TestExecReadOnlyRefusesWrites: a read-only device must refuse every
+// mutating request (the F_RO advertisement is enforced at the device,
+// not trusted from the guest). Reads and flushes still pass.
+func TestExecReadOnlyRefusesWrites(t *testing.T) {
+	g := newMemGuest()
+	be := &stubBE{data: make([]byte, 4096)}
+	for i := range be.data {
+		be.data[i] = 0xA5
+	}
+	d := &Device{gm: g, be: be, ro: true}
+	for _, typ := range []uint32{ReqOut, ReqDiscard, ReqZeroOut} {
+		br := &BlkReq{
+			HeaderSeg: Seg{Addr: 0x1000, Len: 16},
+			DataSegs:  []Seg{{Addr: 0x2000, Len: 512}},
+			StatusSeg: Seg{Addr: 0x3000, Len: 1, Write: true},
+		}
+		if typ != ReqOut { // discard/zeroout segs are driver-owned too
+			br.DataSegs[0].Write = false
+		}
+		if st, _ := d.exec(br, BlkReqHeader{Type: typ, Sector: 1}); st != StatusIOErr {
+			t.Fatalf("RO exec type %d: status=%d, want IOErr", typ, st)
+		}
+	}
+	for i := range be.data {
+		if be.data[i] != 0xA5 {
+			t.Fatalf("backend byte %d modified by RO device", i)
+		}
+	}
+	// Read still works on a read-only device.
+	br := &BlkReq{
+		HeaderSeg: Seg{Addr: 0x1000, Len: 16},
+		DataSegs:  []Seg{{Addr: 0x2000, Len: 512, Write: true}},
+		StatusSeg: Seg{Addr: 0x3000, Len: 1, Write: true},
+	}
+	if st, n := d.exec(br, BlkReqHeader{Type: ReqIn, Sector: 0}); st != StatusOK || n != 512 {
+		t.Fatalf("RO exec IN: status=%d n=%d, want OK/512", st, n)
+	}
+}

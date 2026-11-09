@@ -2,6 +2,7 @@ package nbd
 
 import (
 	"bufio"
+	"context"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -10,6 +11,7 @@ import (
 	"net"
 	"os"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 )
@@ -19,6 +21,19 @@ type Export struct {
 	Name     string
 	Backend  Backend
 	ReadOnly bool
+
+	// conns counts transmissions currently using this export; it backs
+	// the "refuse to remove a busy export" rule the admin API relies
+	// on (an export in use by a running VM must not disappear).
+	conns int
+}
+
+// ExportInfo is a read-only snapshot of one export's registration.
+type ExportInfo struct {
+	Name     string `json:"name"`
+	ReadOnly bool   `json:"read_only"`
+	Size     uint64 `json:"size"`
+	Conns    int    `json:"conns"`
 }
 
 // ServerOptions configures a Server.
@@ -69,6 +84,41 @@ func (s *Server) AddExport(e *Export) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.exports[e.Name] = e
+}
+
+// ErrExportBusy reports a RemoveExport of an export with live
+// transmissions.
+var ErrExportBusy = errors.New("nbd: export in use")
+
+// RemoveExport unregisters an export. It refuses (ErrExportBusy) while
+// a client is transmitting on it: closing the registration under a
+// running VM would leave the guest's NBD connection pointed at a
+// backend the caller believes is gone. An existing transmission keeps
+// its resolved backend, so removal only gates new handshakes; the
+// busy check is what makes "remove" mean "nobody can use it again".
+func (s *Server) RemoveExport(name string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	e, ok := s.exports[name]
+	if !ok {
+		return fmt.Errorf("nbd: export %q not found", name)
+	}
+	if e.conns > 0 {
+		return ErrExportBusy
+	}
+	delete(s.exports, name)
+	return nil
+}
+
+// ListExports returns one info row per registered export.
+func (s *Server) ListExports() []ExportInfo {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make([]ExportInfo, 0, len(s.exports))
+	for _, e := range s.exports {
+		out = append(out, ExportInfo{Name: e.Name, ReadOnly: e.ReadOnly, Size: e.Backend.Size(), Conns: e.conns})
+	}
+	return out
 }
 
 // getExport looks up an export by name.
@@ -144,6 +194,50 @@ func (s *Server) Serve(ln net.Listener) error {
 	}
 }
 
+// Shutdown stops accepting new connections and lets in-flight
+// transmissions finish: established connections are NOT cut — clients
+// (kernel nbd, qemu) keep working until the deadline, after which all
+// remaining connections are force-closed. Callers should SIGTERM
+// consumers (VMs) first: the NBD protocol has no drain verb, so the
+// deadline is the polite good-bye. Close remains the immediate path.
+func (s *Server) Shutdown(ctx context.Context) error {
+	s.mu.Lock()
+	if s.closing {
+		s.mu.Unlock()
+		return nil
+	}
+	s.closing = true
+	var lnErr error
+	if s.ln != nil {
+		lnErr = s.ln.Close()
+	}
+	s.mu.Unlock()
+
+	done := make(chan struct{})
+	go func() {
+		s.wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return lnErr
+	case <-ctx.Done():
+		s.mu.Lock()
+		var errs []error
+		for c := range s.conns {
+			if cerr := c.Close(); cerr != nil {
+				errs = append(errs, cerr)
+			}
+		}
+		s.mu.Unlock()
+		<-done
+		if len(errs) > 0 {
+			return errs[0]
+		}
+		return ctx.Err()
+	}
+}
+
 // Close stops accepting, force-closes active connections and the listener.
 func (s *Server) Close() error {
 	s.mu.Lock()
@@ -177,8 +271,15 @@ type connState struct {
 	multiCon   bool // CAN_MULTI_CONN advertised
 	readOnly   bool
 	backend    Backend
-	size       uint64
-	shutdown   bool
+	// size is the cached export size for range checks. It is atomic
+	// because an online grow (backend.Size() growing under a live
+	// transmission, e.g. a volume resized via unistorctl) must be
+	// served without a reconnect: checkRange refreshes the cache only
+	// when a request falls outside it, so the hot path stays a plain
+	// load. Shrinking an export under a live client is unsafe (the
+	// guest is not notified) and requires a reconnect.
+	size     atomic.Uint64
+	shutdown bool
 	// ioBuf is the connection's single reusable I/O buffer. The
 	// transmission loop is sequential per connection, so no pool is
 	// needed: growing this slice on demand and never releasing it
@@ -191,6 +292,12 @@ type connState struct {
 	// allocated once per connection and reused on the hot path.
 	reqHdrBuf [28]byte
 	scratch   [32]byte // largest header we emit: 20B chunk hdr + 8B offset
+
+	// exp is the export whose backend this connection transmits (nil
+	// until enterTransmission); the server keeps a per-export
+	// transmission count on it (RemoveExport refuses to unregister a
+	// busy export).
+	exp *Export
 
 	// --- pipelined mode (structured replies only) ---
 	// With structured replies the spec allows replying out of order
@@ -285,7 +392,14 @@ func (s *Server) handleConn(conn net.Conn) {
 		s.logf("nbd: handshake with %s failed: %v", conn.RemoteAddr(), err)
 		return
 	}
-	s.logf("nbd: %s transmitting export (size=%d)", conn.RemoteAddr(), cs.size)
+	if cs.exp != nil {
+		defer func() {
+			s.mu.Lock()
+			cs.exp.conns--
+			s.mu.Unlock()
+		}()
+	}
+	s.logf("nbd: %s transmitting export (size=%d)", conn.RemoteAddr(), cs.size.Load())
 	var err error
 	if cs.structured {
 		// Structured replies allow replying out of order, so use the
@@ -609,6 +723,16 @@ func (s *Server) transmissionFlags(cs *connState, e *Export) uint16 {
 // enterTransmission sends the final OPT_EXPORT_NAME reply when needed and
 // stores export state on the connection.
 func (s *Server) enterTransmission(cs *connState, e *Export, exportNameStyle bool) error {
+	// Count this transmission against the export before replying:
+	// RemoveExport refuses to unregister an export with live
+	// transmissions, and the acquisition must be visible by the time
+	// the client can issue requests. handleConn releases it on exit.
+	if cs.exp == nil {
+		s.mu.Lock()
+		e.conns++
+		s.mu.Unlock()
+		cs.exp = e
+	}
 	if exportNameStyle {
 		// Legacy reply: u64 size, u16 flags, 124 zero bytes (unless NO_ZEROES).
 		var b [10]byte
@@ -628,8 +752,18 @@ func (s *Server) enterTransmission(cs *connState, e *Export, exportNameStyle boo
 		}
 	}
 	cs.backend = e.Backend
-	cs.size = e.Backend.Size()
+	cs.size.Store(e.Backend.Size())
 	cs.readOnly = e.ReadOnly
+	// Count this transmission against the export: RemoveExport refuses
+	// to unregister an export with live transmissions. One reference
+	// per connection (handleInfo may call us for the LIST probe, where
+	// cs.exp is left nil below only when we get here via enterTrans).
+	if cs.exp == nil {
+		s.mu.Lock()
+		e.conns++
+		s.mu.Unlock()
+		cs.exp = e
+	}
 	return nil
 }
 
@@ -711,7 +845,7 @@ func (s *Server) transmission(cs *connState) error {
 				}
 				continue
 			}
-			if err := validRange(cs.size, req.offset, req.length); err != nil {
+			if err := cs.checkRange(req.offset, req.length); err != nil {
 				if err2 := s.replyErr(cs, req.handle, ErrEINVAL, "request failed"); err2 != nil {
 					return err2
 				}
@@ -739,7 +873,7 @@ func (s *Server) transmission(cs *connState) error {
 				}
 				continue
 			}
-			if err := validRange(cs.size, req.offset, req.length); err != nil {
+			if err := cs.checkRange(req.offset, req.length); err != nil {
 				if err2 := s.replyErr(cs, req.handle, ErrEINVAL, "request failed"); err2 != nil {
 					return err2
 				}
@@ -832,7 +966,7 @@ func (s *Server) transmissionPipelined(cs *connState) error {
 				}
 				continue
 			}
-			if err := validRange(cs.size, req.offset, req.length); err != nil {
+			if err := cs.checkRange(req.offset, req.length); err != nil {
 				if err2 := s.replyPipelinedErr(cs, req.handle, ErrEINVAL, "read failed"); err2 != nil {
 					return err2
 				}
@@ -862,7 +996,7 @@ func (s *Server) transmissionPipelined(cs *connState) error {
 				})
 				continue
 			}
-			if err := validRange(cs.size, req.offset, req.length); err != nil {
+			if err := cs.checkRange(req.offset, req.length); err != nil {
 				s.dispatch(cs, func(cs *connState) error {
 					return cs.writeStructuredReply(req.handle, ErrEINVAL, "request failed", 0, nil)
 				})
@@ -897,7 +1031,7 @@ func (s *Server) transmissionPipelined(cs *connState) error {
 				}
 				continue
 			}
-			if err := validRange(cs.size, req.offset, req.length); err != nil {
+			if err := cs.checkRange(req.offset, req.length); err != nil {
 				if err2 := s.replyPipelinedErr(cs, req.handle, ErrEINVAL, "request failed"); err2 != nil {
 					return err2
 				}
@@ -925,7 +1059,7 @@ func (s *Server) transmissionPipelined(cs *connState) error {
 				}
 				continue
 			}
-			if err := validRange(cs.size, req.offset, req.length); err != nil {
+			if err := cs.checkRange(req.offset, req.length); err != nil {
 				if err2 := s.replyPipelinedErr(cs, req.handle, ErrEINVAL, "request failed"); err2 != nil {
 					return err2
 				}
@@ -1135,6 +1269,21 @@ func writeStructuredErrorChunk(w io.Writer, handle uint64, code uint32, msg stri
 	return err
 }
 
+// checkRange validates a request against the export size, refreshing
+// the cached size from the backend when the request falls outside it:
+// an export grown online (resize while a client is connected) is
+// accepted on the very next request, no reconnect needed. Requests
+// past a shrunk size fail like any out-of-range request; shrinking
+// under a live guest is not a safe operation in NBD at all.
+func (cs *connState) checkRange(offset uint64, length uint32) error {
+	if err := validRange(cs.size.Load(), offset, length); err == nil {
+		return nil
+	}
+	size := cs.backend.Size()
+	cs.size.Store(size)
+	return validRange(size, offset, length)
+}
+
 // validRange checks offset+length lies inside the export.
 func validRange(size, offset uint64, length uint32) error {
 	if offset >= size {
@@ -1158,7 +1307,7 @@ func (s *Server) handleRead(cs *connState, req reqHdr) error {
 		}
 		return s.replyErr(cs, req.handle, ErrEINVAL, "request failed")
 	}
-	if err := validRange(cs.size, req.offset, req.length); err != nil {
+	if err := cs.checkRange(req.offset, req.length); err != nil {
 		return s.replyReadError(cs, req.handle, ErrEINVAL)
 	}
 	buf := cs.getBuf(int(req.length))
@@ -1239,7 +1388,7 @@ func (s *Server) handleWrite(cs *connState, req reqHdr) error {
 		}
 		return s.replyErr(cs, req.handle, ErrEPERM, "request failed")
 	}
-	if err := validRange(cs.size, req.offset, req.length); err != nil {
+	if err := cs.checkRange(req.offset, req.length); err != nil {
 		if _, err := io.CopyN(io.Discard, cs.br, int64(req.length)); err != nil {
 			return err
 		}

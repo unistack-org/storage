@@ -47,7 +47,6 @@ import (
 	"io"
 	"log"
 	"net/http"
-	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -64,12 +63,24 @@ import (
 const importChunk = 1 << 20 // 1 MiB
 
 type adminAPI struct {
-	cl      *client.Cluster
-	ms      meta.Store
+	cl     *client.Cluster
+	ms     meta.Store
 	raft   *meta.RaftStore // nil in dir-backed mode
 	disks  *diskRegistry   // OSDs hosted in this process (disk stats)
 	logger *log.Logger
 	srv    *http.Server
+	// token, when set (flag -admin-token), turns every endpoint except
+	// /healthz behind "Authorization: Bearer <token>": the admin port
+	// grows the power to attach volumes to VMs, so a control plane
+	// talking to it over a shared network must authenticate.
+	token string
+	// exports is the runtime export hub (nbd/vduse add/remove/list);
+	// nil in standalone mode. jobs tracks async ingests.
+	exports *exportHub
+	jobs    *jobRegistry
+	// importHTTP is the client used by URL imports (tests swap in their
+	// own transport).
+	importHTTP *http.Client
 	// recoveryRecord feeds the recovery counters when metrics are
 	// enabled (nil = no-op); it never exposes metrics over REST.
 	recoveryRecord func(copies int, bytes uint64)
@@ -83,16 +94,22 @@ type adminAPI struct {
 // collects the OSDs hosted in this process (the admin starts before the
 // daemons; they register into the registry as they come up). It does not
 // start serving; call serve.
-func newAdminServer(ms meta.Store, addr string, logger *log.Logger, raftSt *meta.RaftStore, disks *diskRegistry, tlsCfg *tls.Config, clientTLS *tls.Config) (*adminAPI, error) {
+func newAdminServer(ms meta.Store, addr string, logger *log.Logger, raftSt *meta.RaftStore, disks *diskRegistry, tlsCfg *tls.Config, clientTLS *tls.Config, token string, exports *exportHub) (*adminAPI, error) {
 	cl := client.NewCluster(ms)
 	if clientTLS != nil {
 		// Import/export touch the OSDs over the data plane: dial it the
 		// same TLS way the exports do.
 		cl.SetTLS(clientTLS)
 	}
-	a := &adminAPI{cl: cl, ms: ms, logger: logger, raft: raftSt, disks: disks}
+	a := &adminAPI{cl: cl, ms: ms, logger: logger, raft: raftSt, disks: disks, token: token, exports: exports,
+		jobs: newJobRegistry(), importHTTP: &http.Client{Timeout: 0}}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", a.handleHealthz)
+	mux.HandleFunc("GET /v1/exports", a.handleListExports)
+	mux.HandleFunc("POST /v1/exports", a.handleAddExport)
+	mux.HandleFunc("DELETE /v1/exports/{name}", a.handleDeleteExport)
+	mux.HandleFunc("GET /v1/jobs", a.handleJobs)
+	mux.HandleFunc("GET /v1/jobs/{id}", a.handleJob)
 	mux.HandleFunc("GET /v1/status", a.handleStatus)
 	mux.HandleFunc("GET /v1/osds", a.handleOSDs)
 	mux.HandleFunc("GET /v1/volumes", a.handleListVolumes)
@@ -119,7 +136,11 @@ func newAdminServer(ms meta.Store, addr string, logger *log.Logger, raftSt *meta
 	mux.HandleFunc("GET /v1/recovery", a.handleRecoveryScan)
 	mux.HandleFunc("GET /v1/recovery/{name}", a.handleRecoveryCheck)
 	mux.HandleFunc("POST /v1/recovery/{name}", a.handleRecoveryRepair)
-	a.srv = &http.Server{Addr: addr, Handler: mux, ReadHeaderTimeout: 10 * time.Second, TLSConfig: tlsCfg}
+	var handler http.Handler = mux
+	if token != "" {
+		handler = a.bearerGate(mux)
+	}
+	a.srv = &http.Server{Addr: addr, Handler: handler, ReadHeaderTimeout: 10 * time.Second, TLSConfig: tlsCfg}
 	return a, nil
 }
 
@@ -157,6 +178,10 @@ func writeJSON(w http.ResponseWriter, code int, v any) {
 	enc.SetIndent("", "  ")
 	_ = enc.Encode(v)
 }
+
+// cluster exposes the admin's cluster client to the export hub (runtime
+// exports open volumes through the same placement-refreshed handle).
+func (a *adminAPI) cluster() *client.Cluster { return a.cl }
 
 // readOnlyGate answers the request when err means "the meta cannot be
 // written right now" (raft without a quorum / this node is a follower).
@@ -882,7 +907,7 @@ func (a *adminAPI) handleDeleteClass(w http.ResponseWriter, r *http.Request) {
 
 // streamImport writes src into vol from offset and returns the byte
 // count. Shared by the body-import and URL-import handlers.
-func streamImport(ctx context.Context, vol *client.Volume, src io.Reader, offset int64) (int64, error) {
+func streamImport(ctx context.Context, vol *client.Volume, src io.Reader, offset int64, hash io.Writer) (int64, error) {
 	size := int64(vol.Size())
 	buf := make([]byte, importChunk)
 	total := offset
@@ -894,6 +919,11 @@ func streamImport(ctx context.Context, vol *client.Volume, src io.Reader, offset
 			}
 			if _, werr := vol.WriteAt(ctx, buf[:n], uint64(total)); werr != nil {
 				return total - offset, fmt.Errorf("write at %d: %w", total, werr)
+			}
+			if hash != nil {
+				if _, herr := hash.Write(buf[:n]); herr != nil {
+					return total - offset, fmt.Errorf("hash: %w", herr)
+				}
 			}
 			total += int64(n)
 		}
@@ -932,72 +962,9 @@ func (a *adminAPI) handleImportBody(w http.ResponseWriter, r *http.Request) {
 	}
 	defer vol.Close()
 	a.logger.Printf("admin: import %q from body at offset %d", name, offset)
-	n, err := streamImport(r.Context(), vol, r.Body, offset)
+	n, err := streamImport(r.Context(), vol, r.Body, offset, nil)
 	if err != nil {
 		a.logger.Printf("admin: import %q: %v", name, err)
-		jsonError(w, http.StatusInternalServerError, "import: %v", err)
-		return
-	}
-	writeJSON(w, http.StatusOK, map[string]any{"volume": name, "written": n, "written_human": humanSize(uint64(n))})
-}
-
-// handleImportURL makes the daemon fetch the blob itself (M2 decision:
-// import by URL), so a caller with only a curl one-liner can seed a VM
-// disk from any HTTP server reachable by the storage node.
-func (a *adminAPI) handleImportURL(w http.ResponseWriter, r *http.Request) {
-	name := volumeName(r)
-	if name == "" {
-		jsonError(w, http.StatusBadRequest, "bad volume name")
-		return
-	}
-	var req struct {
-		URL    string `json:"url"`
-		Offset int64  `json:"offset"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		jsonError(w, http.StatusBadRequest, "bad json: %v", err)
-		return
-	}
-	u, err := url.Parse(req.URL)
-	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
-		jsonError(w, http.StatusBadRequest, "url must be http(s)")
-		return
-	}
-	if req.Offset < 0 {
-		jsonError(w, http.StatusBadRequest, "bad offset")
-		return
-	}
-	fetchCtx, cancel := context.WithCancel(r.Context())
-	defer cancel()
-	httpReq, err := http.NewRequestWithContext(fetchCtx, http.MethodGet, req.URL, nil)
-	if err != nil {
-		jsonError(w, http.StatusBadRequest, "bad url: %v", err)
-		return
-	}
-	resp, err := http.DefaultClient.Do(httpReq)
-	if err != nil {
-		jsonError(w, http.StatusBadGateway, "fetch: %v", err)
-		return
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		jsonError(w, http.StatusBadGateway, "fetch: %s", resp.Status)
-		return
-	}
-	vol, err := a.openAdmin(r.Context(), name)
-	if err != nil {
-		if errors.Is(err, meta.ErrNotFound) {
-			jsonError(w, http.StatusNotFound, "volume %q not found", name)
-			return
-		}
-		jsonError(w, http.StatusInternalServerError, "open: %v", err)
-		return
-	}
-	defer vol.Close()
-	a.logger.Printf("admin: import %q from %s at offset %d", name, req.URL, req.Offset)
-	n, err := streamImport(r.Context(), vol, resp.Body, req.Offset)
-	if err != nil {
-		a.logger.Printf("admin: import %q from %s: %v", name, req.URL, err)
 		jsonError(w, http.StatusInternalServerError, "import: %v", err)
 		return
 	}

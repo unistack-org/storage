@@ -106,7 +106,7 @@ func startStatusCluster(t *testing.T) (*adminAPI, *client.Cluster, []*osd.Daemon
 		t.Fatal(err)
 	}
 	disks := newDiskRegistry()
-	a, err := newAdminServer(ms, "127.0.0.1:0", log.New(io.Discard, "", 0), nil, disks, nil, nil)
+	a, err := newAdminServer(ms, "127.0.0.1:0", log.New(io.Discard, "", 0), nil, disks, nil, nil, "", nil)
 	if err != nil {
 		t.Fatal(err)
 	}

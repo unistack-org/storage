@@ -185,7 +185,8 @@ func main() {
 	var qosClasses qosFlag
 	flag.Var(&qosClasses, "qos-class", "with -cluster: register a QoS class name=riops:rbps:wiops:wbps in meta (volumes reference it via QoSTemplate), repeatable")
 	osdQoS := flag.String("osd-qos", "", "with -cluster: aggregate limits per in-process OSD riops:rbps:wiops:wbps (the per-disk ceiling shared by all volumes on it; 0/empty = unlimited)")
-	httpAddr := flag.String("http", "", "with -cluster: admin HTTP API on this address (e.g. 127.0.0.1:8443; empty = disabled): volumes, QoS, import/export over octet-stream")
+	httpAddr := flag.String("http", "", "with -cluster: admin HTTP API on this address (e.g. 127.0.0.1:8443; empty = disabled): volumes, QoS, import/export over octet-stream, runtime exports")
+	adminToken := flag.String("admin-token", "", "with -http: require Authorization: Bearer <token> on every admin endpoint except /healthz (the export endpoints attach volumes to VMs, so a control plane on a shared network must authenticate; empty = no auth)")
 	metricsAddr := flag.String("metrics", "", "with -cluster: Prometheus metrics endpoint (VictoriaMetrics scrape target) on this address, served at http://<addr>/metrics (e.g. 0.0.0.0:8080; empty = disabled). Independent of -http: metrics are served only here, never on the admin API")
 	commit := flag.String("commit", "none", "durability of OSD/-store writes: none (page cache; a guest FLUSH/FUA syncs the disk), flush (fsync every write/punch), sync (O_SYNC at open; on macOS degrades to flush semantics), journal (append to a write-ahead log + fsync per write, background flattening into objects; fastest safe mode for small random writes)")
 	fsyncBatch := flag.Duration("fsync-batch", 0, "with -commit none: coalesce Sync() calls that land within this window (e.g. 2ms) into one fsync pass (0 = fsync disk on every sync request)")
@@ -378,6 +379,8 @@ func main() {
 		if *metricsAddr != "" {
 			mreg = newClusterMetrics()
 		}
+		var hub *exportHub
+		var vdm *vduseManager
 		if *metricsAddr != "" {
 			mcl := client.NewCluster(ms)
 			if tlsClient != nil {
@@ -391,15 +394,20 @@ func main() {
 				}
 			}()
 		}
+		if *httpAddr != "" || len(vduseSpecs) > 0 {
+			vdm = newVDUSEManager(logger, vduseFlags{Trim: *trim, WriteZeroes: *writeZeroes})
+		}
 		if *httpAddr != "" {
 			// Start the admin API before the exports: on a raft cluster
 			// the export setup may block waiting for OSD registration
 			// (which needs a quorum), and the operator needs the status
 			// and write endpoints available throughout.
-			admin, err := newAdminServer(ms, *httpAddr, logger, raftSt, disks, tlsAdmin, tlsClient)
+			hub = newExportHub(nil, logger, vdm)
+			admin, err := newAdminServer(ms, *httpAddr, logger, raftSt, disks, tlsAdmin, tlsClient, *adminToken, hub)
 			if err != nil {
 				logger.Fatalf("admin http: %v", err)
 			}
+			hub.setCluster(admin.cluster())
 			// Recovery runs started over the admin API feed the metrics
 			// registry (nil-safe); the admin itself never serves them.
 			admin.recoveryRecord = mreg.recoveryRecorder()
@@ -445,11 +453,15 @@ func main() {
 			return
 		}
 		if len(vduseSpecs) > 0 {
-			if _, err := startVDUSE(ctx, logger, es, vduseSpecs, *trim, *writeZeroes); err != nil {
+			if err := vdm.start(ctx, es, vduseSpecs); err != nil {
 				logger.Fatalf("vduse: %v", err)
 			}
+			go func() {
+				<-ctx.Done()
+				vdm.closeAll()
+			}()
 		}
-		serve(ctx, logger, *listen, nbd.ServerOptions{
+		serve(ctx, logger, *listen, hub, nbd.ServerOptions{
 			MaxConnections:    *maxConns,
 			MaxReadWorkers:    *readWorkers,
 			Logger:            logger,
@@ -509,7 +521,7 @@ func main() {
 		}
 	}
 
-	serve(ctx, logger, *listen, nbd.ServerOptions{
+	serve(ctx, logger, *listen, nil, nbd.ServerOptions{
 		MaxConnections:    *maxConns,
 		MaxReadWorkers:    *readWorkers,
 		Logger:            logger,
@@ -518,9 +530,13 @@ func main() {
 	}, es)
 }
 
-// serve runs the NBD server until ctx is cancelled.
-func serve(ctx context.Context, logger *log.Logger, listen string, opts nbd.ServerOptions, es []*nbd.Export) {
+// serve runs the NBD server until ctx is cancelled. hub (nullable) is
+// bound to the server so the admin API can manage exports at runtime.
+func serve(ctx context.Context, logger *log.Logger, listen string, hub *exportHub, opts nbd.ServerOptions, es []*nbd.Export) {
 	srv := nbd.NewServer(es, opts)
+	if hub != nil {
+		hub.setNBD(srv)
+	}
 
 	ln, err := net.Listen("tcp", listen)
 	if err != nil {
@@ -531,7 +547,14 @@ func serve(ctx context.Context, logger *log.Logger, listen string, opts nbd.Serv
 	go func() {
 		<-ctx.Done()
 		logger.Printf("shutting down")
-		srv.Close()
+		// Graceful drain: in-flight NBD requests finish, guests get
+		// ESHUTDOWN on new ones; after the deadline the server
+		// force-closes whatever is left so SIGTERM is bounded.
+		sctx, scancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer scancel()
+		if err := srv.Shutdown(sctx); err != nil {
+			logger.Printf("nbd shutdown: %v", err)
+		}
 	}()
 
 	if err := srv.Serve(ln); err != nil && ctx.Err() == nil {
@@ -817,8 +840,11 @@ func clusterExports(ctx context.Context, p clusterParams) ([]*nbd.Export, error)
 		}
 		// QoS sustained/limit gauges + per-op counters need the export.
 		backend = p.metrics.trackExport(volName, vol, backend)
-		p.logger.Printf("export %q -> cluster volume %q (%s)", volName, volName, humanSize(vol.Size()))
-		es = append(es, &nbd.Export{Name: volName, Backend: backend})
+		// The read-only flag lives on the volume record (the admin API
+		// persists it), so a restart reproduces the same access mode.
+		ro := vol.Spec().ReadOnly
+		p.logger.Printf("export %q -> cluster volume %q (%s, ro=%v)", volName, volName, humanSize(vol.Size()), ro)
+		es = append(es, &nbd.Export{Name: volName, Backend: backend, ReadOnly: ro})
 	}
 	return es, nil
 }

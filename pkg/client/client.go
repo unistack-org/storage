@@ -851,6 +851,24 @@ func (c *Cluster) SetVolumeQoS(ctx context.Context, name string, spec meta.Volum
 	return cur, nil
 }
 
+// SetVolumeFlags updates the serving flags of a volume (read-only,
+// shared, owner) with a CAS mutate, the same way SetVolumeQoS edits
+// QoS. Exports re-read the spec through their meta watch, so flipping
+// ReadOnly live takes effect on the next export creation (an existing
+// NBD transmission keeps the flags it negotiated at handshake).
+func (c *Cluster) SetVolumeFlags(ctx context.Context, name string, readOnly, shared bool, owner string) (meta.VolumeSpec, error) {
+	cur, err := meta.MutateVolume(ctx, c.meta, name, func(cur *meta.VolumeSpec) bool {
+		cur.ReadOnly = readOnly
+		cur.Shared = shared
+		cur.Owner = owner
+		return true
+	})
+	if err != nil {
+		return meta.VolumeSpec{}, fmt.Errorf("client: set flags volume %q: %w", name, err)
+	}
+	return cur, nil
+}
+
 // SetVolumeQuota updates a volume's allocation cap (0 = cap at the
 // logical size, the default). Open volumes pick the change up through
 // the same live-config watch that carries QoS edits. Shrinking the cap

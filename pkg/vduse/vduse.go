@@ -32,7 +32,7 @@ const (
 
 // virtio feature bits we advertise (kept to what we actually implement).
 const (
-	featRingIndirect  = 1 << 28 // indirect descriptor tables allowed
+	featRingIndirect = 1 << 28 // indirect descriptor tables allowed
 	// VIRTIO_RING_F_EVENT_IDX is deliberately NOT advertised: it lets the
 	// driver suppress kicks using used.avail_event, a field a split-ring
 	// device must write. We never do, so the threshold computed from the
@@ -52,6 +52,7 @@ const (
 	// the VDUSE kernel driver forbids (read-only config space), so we
 	// advertise read-only VIRTIO_BLK_F_FLUSH and keep wce=1 fixed.
 	featAccessPlatform = 1 << 33 // VIRTIO_F_ACCESS_PLATFORM: required by VDUSE
+	featBlkRO          = 1 << 6  // VIRTIO_BLK_F_RO: read-only device
 )
 
 // Features is the feature word offered to the guest (discard and
@@ -65,14 +66,18 @@ const Features = uint64(featVersion1 | featRingIndirect |
 
 // FeatureMask returns the feature word for a device, dropping the
 // discard / write-zeroes advertisement when the backend cannot honour
-// them (same rationale as sdsd's -trim/-write-zeroes flags).
-func FeatureMask(trim, writeZeroes bool) uint64 {
+// them (same rationale as sdsd's -trim/-write-zeroes flags), and adding
+// VIRTIO_BLK_F_RO for a read-only device.
+func FeatureMask(trim, writeZeroes, readOnly bool) uint64 {
 	f := Features
 	if !trim {
 		f &^= featBlkDiscard
 	}
 	if !writeZeroes {
 		f &^= featBlkWriteZeroe
+	}
+	if readOnly {
+		f |= featBlkRO
 	}
 	return f
 }
