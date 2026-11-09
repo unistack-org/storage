@@ -71,6 +71,9 @@ type RecoveryOpts struct {
 	Limit *qos.Pair
 	// Logf receives per-copy progress (may be nil).
 	Logf func(string, ...any)
+	// Record, when non-nil, is called once per completed copy with the
+	// bytes moved (metrics hook; nil in tools and tests).
+	Record func(copies int, bytes uint64)
 }
 
 // RecoveryStats counts what a Recover run did.
@@ -285,6 +288,9 @@ func (v *Volume) Recover(ctx context.Context, rep *RecoveryReport, opts Recovery
 		}
 		st.Copied++
 		st.Bytes += object.Size
+		if opts.Record != nil {
+			opts.Record(1, object.Size)
+		}
 		if opts.Logf != nil {
 			opts.Logf("recovery %s: obj %d copied osd %d -> osd %d", v.spec.Name, it.Index, it.Source, it.OSD)
 		}

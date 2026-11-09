@@ -23,11 +23,13 @@ package client
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"math/bits"
+	"net"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -93,6 +95,15 @@ type Cluster struct {
 	// OSD itself, not by per-op client connections, so a few fat
 	// connections per OSD are enough.
 	poolOpts func(*sdsnet.Pool)
+
+	// localDial, when set via SetLocalDial, is installed on every
+	// per-OSD pool as Pool.Local: an in-process transport for OSDs
+	// served by this same process (see SetLocalDial).
+	localDial func(osdID int32) (net.Conn, error)
+
+	// poolTLS, when set via SetTLS, makes every per-OSD pool dial over
+	// mutual TLS (tlsconf.Config.ClientConfig).
+	poolTLS *tls.Config
 
 	// refreshMin bounds how often Refresh may rebuild placement.
 	refreshMin time.Duration
@@ -438,6 +449,46 @@ func (c *Cluster) SetPoolLimit(n int) {
 	c.poolOpts = func(pp *sdsnet.Pool) { pp.Limit = n }
 }
 
+// SetTLS makes every per-OSD connection pool dial over mutual TLS (use
+// tlsconf.Config.ClientConfig; the ServerName is taken from each OSD
+// address). Set before first use: pools already dialed keep plain
+// connections.
+func (c *Cluster) SetTLS(cfg *tls.Config) {
+	c.poolsMu.Lock()
+	c.poolTLS = cfg
+	c.poolsMu.Unlock()
+}
+
+// SetLocalDial installs an in-process transport for OSD connections:
+// for every OSD the cluster later dials, f returns a connected stream
+// (typically a socketpair whose peer is served by a sdsnet.Server in
+// this same process). A nil f (the default) means plain TCP/TLS. The
+// wire protocol, fencing, QoS and metrics are identical on both paths;
+// only the bytes-in-transit differ, which removes the TCP stack from
+// the hot path of a single-process node. Set before first use: pools
+// already dialed keep their transport.
+func (c *Cluster) SetLocalDial(f func(osdID int32) (net.Conn, error)) {
+	c.poolsMu.Lock()
+	c.localDial = f
+	c.poolsMu.Unlock()
+}
+
+// PoolStats returns the connection-pool occupancy of every OSD target
+// dialed so far: OSD id -> (idle, in-use) connections. It is a cheap
+// snapshot of the cached pools (no dialing, no network), the export seam
+// for a metrics endpoint that reports client-side connection pressure
+// per target.
+func (c *Cluster) PoolStats() map[int32][2]int {
+	c.poolsMu.Lock()
+	defer c.poolsMu.Unlock()
+	out := make(map[int32][2]int, len(c.pools))
+	for id, pp := range c.pools {
+		idle, inUse := pp.Stats()
+		out[id] = [2]int{idle, inUse}
+	}
+	return out
+}
+
 // ProbeOSDs pings every registered OSD over a fresh connection (the
 // cached pools may be poisoned for a dead peer) and returns the registry
 // it probed plus the per-OSD outcome: nil error means the OSD answered.
@@ -461,6 +512,42 @@ func (c *Cluster) ProbeOSDs(ctx context.Context, timeout time.Duration) (infos [
 	return infos, probes, nil
 }
 
+// DiskUsage is one OSD's raw capacity report (bytes).
+type DiskUsage struct {
+	Usage uint64 // bytes stored in object files
+	Free  uint64 // filesystem free bytes
+	Total uint64 // filesystem total bytes
+}
+
+// ProbeOSDsDisk is ProbeOSDs plus a StatFS round-trip per answering OSD:
+// disk usage/free/total for every OSD in the cluster, not just those
+// hosted in this process (the metrics export's capacity view). probes
+// keeps the ping outcome (nil = alive); disk only carries entries for
+// OSDs that answered StatFS (an old server pings fine but answers
+// StatusNotSupp, which simply omits it).
+func (c *Cluster) ProbeOSDsDisk(ctx context.Context, timeout time.Duration) (infos []meta.OSDInfo, probes map[int32]error, disk map[int32]DiskUsage, metaErr error) {
+	infos, err := meta.ListOSDs(ctx, c.meta)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	probes = make(map[int32]error, len(infos))
+	disk = make(map[int32]DiskUsage, len(infos))
+	for _, info := range infos {
+		pp := sdsnet.NewPool(info.Addr, "vol")
+		pctx, cancel := context.WithTimeout(ctx, timeout)
+		pingErr := pp.Ping(pctx)
+		probes[info.ID] = pingErr
+		if pingErr == nil {
+			if usage, free, total, e := pp.StatDisk(pctx); e == nil {
+				disk[info.ID] = DiskUsage{Usage: usage, Free: free, Total: total}
+			}
+		}
+		cancel()
+		pp.Close()
+	}
+	return infos, probes, disk, nil
+}
+
 // pool returns (dialing on demand) the connection pool for one OSD.
 func (c *Cluster) pool(id int32, addr string) (*sdsnet.Pool, error) {
 	c.poolsMu.Lock()
@@ -473,6 +560,11 @@ func (c *Cluster) pool(id int32, addr string) (*sdsnet.Pool, error) {
 		pp = sdsnet.NewPool(addr, "vol")
 		if c.poolOpts != nil {
 			c.poolOpts(pp)
+		}
+		pp.TLS = c.poolTLS
+		if c.localDial != nil {
+			dial := c.localDial
+			pp.Local = func() (net.Conn, error) { return dial(id) }
 		}
 		c.pools[id] = pp
 	}
@@ -577,11 +669,17 @@ func (c *Cluster) compile(rec meta.MapRecord, reg placement.Registry, tmpl *plac
 
 // VolumeHealth is the placement verdict for one volume at the current
 // map epoch: how many of its replicas the live placement provides and
-// the quorum width it needs to write.
+// the quorum width it needs to write, plus the per-PG state census
+// (the vitastor_pg_count view: every placement group classified by the
+// live width of its row).
 type VolumeHealth struct {
 	LiveTargets int // live OSDs in this volume's placement rows
 	MinSize     int // write quorum width (degraded when LiveTargets < MinSize)
 	Writable    bool
+	PGs         int // placement groups in the volume's layout
+	PGsOK       int // rows with the full replica set live
+	PGsDegraded int // rows reduced below the replica count but >= min_size
+	PGsDown     int // rows below min_size (writes to these PGs fail)
 }
 
 // VolumeHealth compiles the volume's placement at the current epoch and
@@ -611,16 +709,33 @@ func (c *Cluster) VolumeHealth(ctx context.Context, spec meta.VolumeSpec) (Volum
 	if ms <= 0 {
 		ms = rep/2 + 1
 	}
-	// Every PG is compiled from the same map and registry through the
-	// same rule, so all rows have the same live width: Row(0) answers
-	// "how many replicas does a write find".
+	// Census over every PG: the same map and registry through the same
+	// rule, so a healthy row is the common case; each row is classified
+	// by its live width (full / degraded >= min_size / below min_size).
 	live := 0
-	for _, id := range snap.Row(0) {
-		if id >= 0 {
-			live++
+	h := VolumeHealth{MinSize: ms, PGs: int(snap.PGNum)}
+	for pg := 0; pg < h.PGs; pg++ {
+		n := 0
+		for _, id := range snap.Row(uint32(pg)) {
+			if id >= 0 {
+				n++
+			}
+		}
+		switch {
+		case n >= rep:
+			h.PGsOK++
+		case n >= ms:
+			h.PGsDegraded++
+		default:
+			h.PGsDown++
+		}
+		if pg == 0 {
+			live = n // Row(0) answers "how many replicas does a write find"
 		}
 	}
-	return VolumeHealth{LiveTargets: live, MinSize: ms, Writable: live >= ms}, nil
+	h.LiveTargets = live
+	h.Writable = live >= ms
+	return h, nil
 }
 
 // MapEpoch publishes a new crush map epoch: the map is stored in meta// under maps/<epoch> (OSDs raise their fence and clients rebuild on
@@ -719,17 +834,19 @@ func (c *Cluster) ResizeVolume(ctx context.Context, name string, newSize uint64)
 // Volume.SetQoS with the returned spec. Passing an all-zero, no-template
 // spec makes the volume unlimited (the admin class).
 func (c *Cluster) SetVolumeQoS(ctx context.Context, name string, spec meta.VolumeSpec) (meta.VolumeSpec, error) {
-	cur, err := meta.GetVolume(ctx, c.meta, name)
+	// CAS mutate: a concurrent resize (which rewrites the record to
+	// append extents) cannot be lost, and QoS fields are re-applied to
+	// the fresh record on a racing edit.
+	cur, err := meta.MutateVolume(ctx, c.meta, name, func(cur *meta.VolumeSpec) bool {
+		cur.QoSTemplate = spec.QoSTemplate
+		cur.ReadIOPS = spec.ReadIOPS
+		cur.ReadBPS = spec.ReadBPS
+		cur.WriteIOPS = spec.WriteIOPS
+		cur.WriteBPS = spec.WriteBPS
+		return true
+	})
 	if err != nil {
 		return meta.VolumeSpec{}, fmt.Errorf("client: set qos volume %q: %w", name, err)
-	}
-	cur.QoSTemplate = spec.QoSTemplate
-	cur.ReadIOPS = spec.ReadIOPS
-	cur.ReadBPS = spec.ReadBPS
-	cur.WriteIOPS = spec.WriteIOPS
-	cur.WriteBPS = spec.WriteBPS
-	if _, err := meta.PutVolume(ctx, c.meta, cur); err != nil {
-		return meta.VolumeSpec{}, err
 	}
 	return cur, nil
 }
@@ -740,16 +857,20 @@ func (c *Cluster) SetVolumeQoS(ctx context.Context, name string, spec meta.Volum
 // never touches existing data: it only refuses the next first-touch
 // write when usage is already at or above the new cap.
 func (c *Cluster) SetVolumeQuota(ctx context.Context, name string, quota uint64) (meta.VolumeSpec, error) {
-	cur, err := meta.GetVolume(ctx, c.meta, name)
+	var tooBig uint64
+	cur, err := meta.MutateVolume(ctx, c.meta, name, func(cur *meta.VolumeSpec) bool {
+		if quota > cur.Size {
+			tooBig = cur.Size
+			return false
+		}
+		cur.Quota = quota
+		return true
+	})
 	if err != nil {
 		return meta.VolumeSpec{}, fmt.Errorf("client: set quota volume %q: %w", name, err)
 	}
-	if quota > cur.Size {
+	if tooBig != 0 || quota > cur.Size {
 		return meta.VolumeSpec{}, fmt.Errorf("client: set quota volume %q: quota %d exceeds volume size %d", name, quota, cur.Size)
-	}
-	cur.Quota = quota
-	if _, err := meta.PutVolume(ctx, c.meta, cur); err != nil {
-		return meta.VolumeSpec{}, err
 	}
 	return cur, nil
 }
@@ -782,13 +903,20 @@ func (c *Cluster) DeleteQoSClass(ctx context.Context, name string) error {
 	return nil
 }
 
-// DeleteVolume removes a volume's registration. It first writes a
-// vacuum tombstone (meta.PrefixVacuum) carrying the volume's private
-// object-id range, so the objects can be vacuumed from the OSDs later
-// (Cluster.VacuumDeletedVolumes, plan M1.4); the record removals happen
-// only after the tombstone is durable. An in-flight writer keeps
-// writing to objects it can no longer register — those writes land in
-// the tombstoned range and are removed by the vacuum.
+// DeleteVolume removes a volume's registration. It removes the
+// volume record, releases the volume's references on shared snapshot
+// ranges (clones, clones.go protocol: refs drop AFTER the record is
+// gone, so a clone racing the delete re-reads a chain without the
+// ranges it pre-shared), writes a vacuum tombstone (meta.PrefixVacuum)
+// covering every range the volume ends up owning (unshared live
+// range, resize extents, snapshot generations no clone references —
+// deleting a volume discards its snapshots with it, ADR), and
+// removes the allocation map. An in-flight writer keeps writing to
+// objects it can no longer register — those writes land in the
+// tombstoned range and are removed by the vacuum. A crash between
+// the record removal and the tombstone leaks the ranges (capacity
+// only, never a clone's data); leaking a range into a vacuum a clone
+// still reads would destroy the clone, so the order is deliberate.
 func (c *Cluster) DeleteVolume(ctx context.Context, name string) error {
 	if name == "" {
 		return errors.New("client: volume name required")
@@ -801,24 +929,30 @@ func (c *Cluster) DeleteVolume(ctx context.Context, name string) error {
 		return fmt.Errorf("client: delete volume %q: %w", name, err)
 	}
 	if spec.OIDBase != 0 {
-		// Tombstone first: leaking a tombstone is harmless (the vacuum
-		// is idempotent), leaking the range is not (the objects would
-		// be unreachable garbage forever).
-		numObjs := spec.BaseObjs()
-		if numObjs == 0 {
-			numObjs = object.NumObjects(spec.Size)
+		if err := meta.DeleteVolume(ctx, c.meta, name); err != nil {
+			return fmt.Errorf("client: delete volume %q: %w", name, err)
 		}
-		if _, err := meta.PutVacuum(ctx, c.meta, meta.VacuumRecord{
-			Name:      name,
-			OIDBase:   spec.OIDBase,
-			NumObjs:   numObjs,
-			Extents:   spec.Extents,
-			DeletedAt: time.Now().Unix(),
-		}); err != nil {
-			return fmt.Errorf("client: delete volume %q: vacuum tombstone: %w", name, err)
+		ranges, err := meta.DropGenRanges(ctx, c.meta, meta.VolumeGarbage(spec))
+		if err != nil {
+			return fmt.Errorf("client: delete volume %q: release refs: %w", name, err)
 		}
-	}
-	if err := meta.DeleteVolume(ctx, c.meta, name); err != nil {
+		// A fully cloned volume (all ranges shared) leaves nothing to
+		// vacuum: no tombstone at all.
+		if len(ranges) > 0 {
+			rec := meta.VacuumRecord{
+				Name:      name,
+				OIDBase:   ranges[0].Base,
+				NumObjs:   ranges[0].Count,
+				DeletedAt: time.Now().Unix(),
+			}
+			for _, r := range ranges[1:] {
+				rec.Extents = append(rec.Extents, meta.OIDExtent{Base: r.Base, Count: r.Count})
+			}
+			if _, err := meta.PutVacuum(ctx, c.meta, rec); err != nil {
+				return fmt.Errorf("client: delete volume %q: vacuum tombstone: %w", name, err)
+			}
+		}
+	} else if err := meta.DeleteVolume(ctx, c.meta, name); err != nil {
 		return fmt.Errorf("client: delete volume %q: %w", name, err)
 	}
 	// The allocation map rides with the volume record (accounting
@@ -1068,6 +1202,22 @@ func (v *Volume) limitsSnapshot() *qos.Pair {
 	return v.limits
 }
 
+// QoSSustained returns the sustained rates (iops, bps) each QoS axis of
+// this volume is currently holding, as the limiters measured them over
+// their last refill window. This is the exporter seam for "what speed
+// is this volume actually allowed/using" — (0,0) for an unlimited
+// volume. Rates, not totals: Prometheus computes the totals from
+// counters.
+func (v *Volume) QoSSustained() (readIOPS uint32, readBPS uint64, writeIOPS uint32, writeBPS uint64) {
+	lim := v.limitsSnapshot()
+	if lim == nil {
+		return 0, 0, 0, 0
+	}
+	readIOPS, readBPS = lim.Read.Stats()
+	writeIOPS, writeBPS = lim.Write.Stats()
+	return readIOPS, readBPS, writeIOPS, writeBPS
+}
+
 // Close releases the volume's QoS waiters and stops its live-QoS watch.
 // Open volumes in long-running processes (NBD targets) are closed on
 // shutdown; forgetting to close a volume leaks nothing but leaves its
@@ -1109,19 +1259,19 @@ func (v *Volume) quotaCap() uint64 {
 	return v.quota
 }
 
-// chargeQuota books index against the volume's quota before its first
-// write. It is a no-op when the volume is uncapped (the common case:
-// no meta traffic at all) and when the cached bitmap already shows the
-// object allocated. A first touch CAS-updates the shared bitmap; if the
-// volume is at its cap the write is refused with ErrNoSpace (which
-// reaches a guest as ENOSPC through the NBD/VDUSE errno mapping).
+// chargeQuota books index against the volume's allocation bitmap before
+// its first write. The bitmap is maintained for EVERY volume (capped or
+// not): it is the snapshot layer's source of truth (a snapshot copies it
+// into the frozen generation, Usage() popcounts it). For a capped volume
+// a first touch that would exceed the cap is refused with ErrNoSpace
+// (which reaches a guest as ENOSPC through the NBD/VDUSE errno mapping);
+// for an uncapped volume the charge just sets the bit. A cached-bit hit
+// keeps the hot path free of meta traffic.
 func (v *Volume) chargeQuota(ctx context.Context, index uint64) error {
 	if index >= uint64(v.nbits()) {
 		return nil // safety: nothing to charge beyond the volume
 	}
-	if v.quotaCap() >= v.Size() {
-		return nil // uncapped (quota >= logical size)
-	}
+	capped := v.quotaCap() < v.Size()
 	v.allocMu.Lock()
 	cached := v.alloc
 	v.allocMu.Unlock()
@@ -1133,7 +1283,7 @@ func (v *Volume) chargeQuota(ctx context.Context, index uint64) error {
 		if allocBitLocal(b, int(index)) {
 			return false
 		}
-		if uint64(meta.AllocMapPopcount(b))*object.Size >= v.quotaCap() {
+		if capped && uint64(meta.AllocMapPopcount(b))*object.Size >= v.quotaCap() {
 			overQuota = true
 			return false
 		}
@@ -1153,10 +1303,12 @@ func (v *Volume) chargeQuota(ctx context.Context, index uint64) error {
 	return nil
 }
 
-// releaseQuota gives quota room back after a sparse TRIM cleared a
+// releaseQuota gives allocation room back after a sparse TRIM cleared a
 // whole object (the allocation granularity): only full-object clears
 // release, matching "TRIM frees space" for guest discard. Partial
-// object zeroes keep the object allocated, as they do on the OSDs.
+// object zeroes keep the object allocated, as they do on the OSDs. The
+// bitmap bit is cleared for every volume (it feeds Usage and snapshots);
+// the cached-bit check keeps the hot path free of meta traffic.
 func (v *Volume) releaseQuota(ctx context.Context, index uint64) {
 	if index >= uint64(v.nbits()) {
 		return
@@ -1164,8 +1316,8 @@ func (v *Volume) releaseQuota(ctx context.Context, index uint64) {
 	v.allocMu.Lock()
 	cached := v.alloc
 	v.allocMu.Unlock()
-	if v.quotaCap() >= v.Size() && (cached == nil || !allocBitLocal(cached, int(index))) {
-		return // uncapped and nothing booked locally: nothing to release
+	if cached != nil && !allocBitLocal(cached, int(index)) {
+		return // nothing booked locally for this object
 	}
 	bits, _, err := meta.MutateAlloc(ctx, v.cluster.meta, v.spec.Name, v.nbits(), func(b []byte) bool {
 		return clearAllocBitLocal(b, int(index))
@@ -1389,8 +1541,20 @@ func (v *Volume) readChunk(ctx context.Context, p []byte, index, inObj uint64) e
 			}
 		}
 		if sawMissing {
-			// All replicas report the region absent: authoritative
-			// zeros (thin provisioning).
+			// All replicas report the region absent. On a volume with
+			// snapshots the live range only covers writes after the
+			// last generation swap: walk the frozen chain
+			// newest-to-oldest before declaring zeros.
+			if v.hasSnapshots() {
+				found, serr := v.readSnapshotChain(ctx, p, index, inObj)
+				if serr != nil {
+					return serr
+				}
+				if found {
+					return nil
+				}
+			}
+			// Authoritative zeros (thin provisioning).
 			for i := range p {
 				p[i] = 0
 			}
@@ -1851,12 +2015,33 @@ func (v *Volume) WriteZeroes(ctx context.Context, off, n uint64, sparse bool) er
 			return err
 		}
 	}
+	// TRIM materialization rule (ADR): on a volume with snapshots a
+	// discard must be VISIBLE against the frozen chain. Punching holes
+	// (or leaving objects absent) would make reads fall through to
+	// older generations and resurrect pre-trim data, so discards store
+	// literal zeros in the live range instead: the object becomes
+	// allocated, its live bit is charged to quota, and no quota is
+	// released. Volumes without snapshots keep punch-and-release
+	// semantics unchanged.
+	materialize := sparse && v.hasSnapshots()
+	if materialize {
+		sparse = false
+	}
 	for done := uint64(0); done < n; {
 		cur := off + done
 		index, inObj := object.Split(cur)
 		ch := n - done
 		if ch > object.Size-inObj {
 			ch = object.Size - inObj
+		}
+		if materialize {
+			// Conservative order: reserve the allocation first, then
+			// store the zeros. An over-count after a failed write is
+			// safe; an under-count would hide a live object from the
+			// next snapshot bitmap.
+			if qerr := v.chargeQuota(ctx, index); qerr != nil {
+				return qerr
+			}
 		}
 		if err := v.writeChunk(ctx, nil, ch, index, inObj, true, sparse); err != nil {
 			return err

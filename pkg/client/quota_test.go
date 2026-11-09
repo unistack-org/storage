@@ -137,9 +137,10 @@ func TestQuotaEnforcement(t *testing.T) {
 	}
 }
 
-// TestQuotaUncapped proves the uncapped (quota=0) volume never touches
-// the allocmap: no record is created, so the hot write path stays
-// exactly the pre-quota path.
+// TestQuotaUncapped proves an uncapped (quota=0) volume never refuses a
+// write for space, yet its allocation bitmap is maintained: usage is
+// tracked (the snapshot layer and Usage() depend on it for every
+// volume, capped or not).
 func TestQuotaUncapped(t *testing.T) {
 	c := newCluster(t, 3)
 	c.publishMap(1)
@@ -155,13 +156,19 @@ func TestQuotaUncapped(t *testing.T) {
 		t.Fatalf("OpenVolume: %v", err)
 	}
 	defer v.Close()
-	data := make([]byte, 4096)
+	data := make([]byte, object.Size)
 	fillQuota(data, 0x11, 0)
 	if _, err := v.WriteAt(ctx, data, 0); err != nil {
 		t.Fatalf("write: %v", err)
 	}
-	if _, _, err := c.meta.Get(ctx, meta.PrefixAllocMaps, "free"); !errors.Is(err, meta.ErrNotFound) {
-		t.Fatalf("uncapped volume created an allocmap record: %v", err)
+	// The bitmap is now maintained for every volume: usage counts the
+	// one allocated object.
+	u, err := v.Usage(ctx)
+	if err != nil {
+		t.Fatalf("Usage: %v", err)
+	}
+	if u != object.Size {
+		t.Fatalf("usage after one write = %d, want %d", u, object.Size)
 	}
 }
 
