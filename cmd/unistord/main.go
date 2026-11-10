@@ -162,6 +162,7 @@ func main() {
 	writeZeroes := flag.Bool("write-zeroes", true, "advertise and handle WRITE_ZEROES")
 	vduseReadAhead := flag.Bool("vduse-readahead", true, "with -vduse: prefetch a window on sequential guest read runs (ideas §3.8); disable to force one backend read per request")
 	vduseReadAheadWindow := flag.Int("vduse-readahead-window", 0, "with -vduse-readahead: prefetch window bytes per queue (default 262144 = 256 KiB)")
+	vduseQueues := flag.Int("vduse-queues", 1, "with -vduse: virtqueues per device (VIRTIO_BLK_F_MQ multi-queue); 1 = single queue (default)")
 	storeMode := flag.Bool("store", false, "treat export paths as object-store directories (phase-1 data path) instead of sparse files")
 	direct := flag.Bool("direct", false, "with -store: request O_DIRECT on object files")
 	prealloc := flag.Bool("preallocate", false, "with -store: fallocate each new object to full size")
@@ -211,6 +212,8 @@ func main() {
 	tlsCA := flag.String("tls-ca", "", "PEM CA certificate(s) that signed the peers'/clients' certificates; required for the OSD/raft planes; it is also used to verify admin API clients unless -tls-client-ca-file is set")
 	tlsClientCA := flag.String("tls-client-ca-file", "", "with -tls-ca: require admin API client certificates signed by this CA (by default the admin API presents a certificate but does not demand client certificates, so plain 'curl --cacert' works)")
 	tlsMinVer := flag.String("tls-min-version", "1.2", "minimum TLS version: 1.2 or 1.3")
+	importAllowPrivate := flag.Bool("import-allow-private", false, "let URL imports (-import / job url) fetch from private, loopback and link-local networks. Off by default: the ingest fetch is an HTTP client driven by the control plane, so without this guard a supplied URL can reach cloud metadata, the placement plane on localhost, and other internal services. Overrides stay blocked (unspecified, multicast, CGNAT/overlay) and bare hostnames are always refused; set this only on an isolated storage net that legitimately imports from a private mirror")
+	importMaxSize := flag.String("import-max-size", "0", "cap on how many bytes one URL/stream import may land in a volume (suffixes K/M/G/T, e.g. 40G; 0 = unlimited). Guards against an unbounded source filling the cluster; a stream that would cross the cap fails the job")
 	showVersion := flag.Bool("version", false, "print version and exit")
 	flag.Parse()
 	if *showVersion {
@@ -417,7 +420,7 @@ func main() {
 			}()
 		}
 		if *httpAddr != "" || len(vduseSpecs) > 0 {
-			vdm = newVDUSEManager(logger, vduseFlags{Trim: *trim, WriteZeroes: *writeZeroes, ReadAhead: *vduseReadAhead, ReadAheadWindow: *vduseReadAheadWindow})
+			vdm = newVDUSEManager(logger, vduseFlags{Trim: *trim, WriteZeroes: *writeZeroes, ReadAhead: *vduseReadAhead, ReadAheadWindow: *vduseReadAheadWindow, Queues: *vduseQueues})
 		}
 		if *httpAddr != "" || len(vubSpecs) > 0 {
 			vubm = newVUBManager(logger, vubFlags{Trim: *trim, WriteZeroes: *writeZeroes, Queues: *vubQueues, Workers: *vubWorkers})
@@ -432,6 +435,16 @@ func main() {
 			if err != nil {
 				logger.Fatalf("admin http: %v", err)
 			}
+			// URL imports fetch a control-plane-supplied address, so the
+			// import client runs behind the SSRF guard (dial-time IP
+			// policy + bounded redirects) and the size cap.
+			maxSize, err := sizeSuffix(*importMaxSize)
+			if err != nil {
+				logger.Fatalf("import max size: %v", err)
+			}
+			guard := newSSRFGuard(*importAllowPrivate, logger)
+			admin.importHTTP = &http.Client{Transport: guard.importTransport(), CheckRedirect: guard.checkRedirect, Timeout: 0}
+			admin.importMaxSize = int64(maxSize)
 			hub.setCluster(admin.cluster())
 			// Recovery runs started over the admin API feed the metrics
 			// registry (nil-safe); the admin itself never serves them.
@@ -560,7 +573,7 @@ func main() {
 	}
 
 	if len(vduseSpecs) > 0 {
-		if _, err := startVDUSE(ctx, logger, es, vduseSpecs, *trim, *writeZeroes, *vduseReadAhead, *vduseReadAheadWindow); err != nil {
+		if _, err := startVDUSE(ctx, logger, es, vduseSpecs, *trim, *writeZeroes, *vduseReadAhead, *vduseReadAheadWindow, *vduseQueues); err != nil {
 			logger.Fatalf("vduse: %v", err)
 		}
 	}

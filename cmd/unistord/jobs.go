@@ -670,7 +670,7 @@ func (a *adminAPI) fetchInto(ctx context.Context, v *client.Volume, rawurl strin
 	if h != nil {
 		hashOut = h
 	}
-	if err := streamImport(ctx, v, resp.Body, resume, wantSize, hashOut, progress, written); err != nil {
+	if err := streamImport(ctx, v, resp.Body, resume, wantSize, hashOut, progress, written, a.importMaxSize); err != nil {
 		return err
 	}
 	if want != "" {
@@ -686,11 +686,20 @@ func (a *adminAPI) fetchInto(ctx context.Context, v *client.Volume, rawurl strin
 // (and calls progress) with every landed chunk.
 //
 // expected is the byte total this stream must deliver (0 = unknown):
-// a stream that ends short — a clean EOF with bytes still missing, or
-// a mid-chunk ReadFull break — is an error, so a truncated fetch never
-// reports success (gap 1).
+// with a declared size, a stream that ends short — a clean EOF with
+// bytes still missing, or a mid-chunk break — is an error, so a
+// truncated fetch never reports success (gap 1); once the declared
+// total has landed the stream is done and the rest goes unread.
+// Without a declared size the boundary is EOF itself, like the
+// body-push endpoint: a stream ending mid-chunk is that source's final
+// partial chunk, not a break (a requested digest still covers the
+// bytes that landed).
+//
+// limit caps how many bytes the volume may hold in total (offset
+// included); 0 disables the cap. It is the -import-max-size guard
+// against an unbounded source filling the cluster (gap 6).
 func streamImport(ctx context.Context, vol *client.Volume, src io.Reader, offset int64,
-	expected int64, hashOut io.Writer, progress func(int64), written *int64) error {
+	expected int64, hashOut io.Writer, progress func(int64), written *int64, limit int64) error {
 	size := int64(vol.Size())
 	buf := make([]byte, importChunk)
 	total := offset
@@ -701,8 +710,15 @@ func streamImport(ctx context.Context, vol *client.Volume, src io.Reader, offset
 		}
 	}
 	for {
+		if expected > 0 && landed >= expected {
+			return nil
+		}
 		n, err := io.ReadFull(src, buf)
 		if n > 0 {
+			if limit > 0 && total+int64(n) > limit {
+				report()
+				return fmt.Errorf("input exceeds import size limit %s at offset %d", humanSize(uint64(limit)), offset)
+			}
 			if total+int64(n) > size {
 				report()
 				return fmt.Errorf("input exceeds volume size %s at offset %d", humanSize(uint64(size)), offset)
@@ -730,17 +746,15 @@ func streamImport(ctx context.Context, vol *client.Volume, src io.Reader, offset
 			return nil
 		}
 		if err == io.ErrUnexpectedEOF {
-			if expected > 0 && landed < expected {
+			if expected <= 0 {
+				// Undeclared size: the stream's end is the image's end.
+				return nil
+			}
+			if landed < expected {
 				return fmt.Errorf("stream broke at %s of expected %s: %w",
 					humanSize(uint64(landed)), humanSize(uint64(expected)), err)
 			}
-			// A break with no data at all is a clean end; a break that
-			// landed a partial chunk while the total is already met
-			// means the source sent more than declared.
-			if n == 0 {
-				return nil
-			}
-			return fmt.Errorf("stream broke mid-chunk at %s: %w", humanSize(uint64(landed)), err)
+			return nil
 		}
 		if err != nil {
 			return err

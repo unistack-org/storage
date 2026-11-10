@@ -82,6 +82,9 @@ type adminAPI struct {
 	// importHTTP is the client used by URL imports (tests swap in their
 	// own transport).
 	importHTTP *http.Client
+	// importMaxSize caps how many bytes one import may land in a volume
+	// (-import-max-size, 0 = unlimited); see streamImport.
+	importMaxSize int64
 	// recoveryRecord feeds the recovery counters when metrics are
 	// enabled (nil = no-op); it never exposes metrics over REST.
 	recoveryRecord func(copies int, bytes uint64)
@@ -1018,7 +1021,7 @@ func (a *adminAPI) handleImportBody(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var n int64
-	err = streamImport(r.Context(), vol, r.Body, offset, 0, nil, nil, &n)
+	err = streamImport(r.Context(), vol, r.Body, offset, 0, nil, nil, &n, a.importMaxSize)
 	if lerr == nil && acquired {
 		defer func() { _ = meta.ReleaseImportLock(context.Background(), a.ms, name, lockJob) }()
 	}
