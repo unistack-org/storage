@@ -11,7 +11,7 @@
 #
 # Env:
 #   CHANNEL      develop|testing|stable — required
-#   OUT_DIR      output directory (default sds-nbd/dist)
+#   OUT_DIR      output directory (default dist)
 #   MAX_COMMITS  cap for the develop list (default 50)
 #   GITHUB_REF_NAME  tag name on tag runs
 #
@@ -21,7 +21,7 @@ set -euo pipefail
 
 CHANNEL="${CHANNEL:?CHANNEL is required}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-OUT_DIR="${OUT_DIR:-$ROOT/sds-nbd/dist}"
+OUT_DIR="${OUT_DIR:-$ROOT/dist}"
 MAX_COMMITS="${MAX_COMMITS:-50}"
 REF="${GITHUB_REF_NAME:-HEAD}"
 

@@ -62,7 +62,7 @@ func TestStatFSRoundTrip(t *testing.T) {
 	}
 
 	// Backend without the interface: NotSupp, connection stays usable.
-	s2 := serveTest(t, newMemBackend(1 << 20))
+	s2 := serveTest(t, newMemBackend(1<<20))
 	cc2, err := Dial(s2.Addr(), "vol", 2*time.Second)
 	if err != nil {
 		t.Fatal(err)

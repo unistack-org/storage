@@ -1,7 +1,7 @@
 package vduse
 
 // Backend is the block device a VDUSE virtio-blk device exports. It is
-// deliberately identical in shape to sds-nbd's nbd.Backend, so the same
+// deliberately identical in shape to pkg/nbd.Backend, so the same
 // volume adapter (sdsclient.Volume, FileBackend, ...) plugs into both.
 //
 // ReadAt/WriteAt must be safe for concurrent use (the runtime services

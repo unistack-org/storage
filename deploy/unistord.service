@@ -1,0 +1,54 @@
+# systemd-юнит VDUSE/NBD-демона unistord с keep-alive.
+#
+# Установка:
+#   install -Dm644 deploy/unistord.service /etc/systemd/system/unistord.service
+#   mkdir -p /etc/unistord && $EDITOR /etc/unistord/unistord.env   # UNISTORD_ARGS=...
+#   systemctl daemon-reload && systemctl enable --now unistord
+#
+# Конфиг демона — переменная окружения UNISTORD_ARGS в
+# /etc/unistord/unistord.env (EnvironmentFile), например:
+#   UNISTORD_ARGS=-cluster /var/lib/unistord/meta -osd 1@/var/lib/unistord/osd1 \
+#     -http 10.0.0.10:8443 -admin-token <токен клетки> -metrics 0.0.0.0:8080
+# (токен в EnvironmentFile с правами 0600)
+#
+# Plan-safe restart (см. deploy/README.md): перед рестартом погасите
+# гостевой I/O (unmount/quiesce), затем systemctl restart unistord.
+# A device that died mid-I/O needs a guest-visible reset — the unit's
+# Restart=always revives the daemon, not the stuck request.
+
+[Unit]
+Description=Unistack SDS daemon (unistord: OSD + NBD/VDUSE exports)
+Documentation=file:/usr/share/doc/unistord/deploy-README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/unistord ${UNISTORD_ARGS}
+EnvironmentFile=-/etc/unistord/unistord.env
+Restart=always
+RestartSec=1
+
+# The daemon must create and attach VDUSE devices.
+DeviceAllow=/dev/vduse/control rw
+DeviceAllow=char-vduse rw
+# Kernel vDPA char devices the QEMU side opens (created by udev/systemd).
+DeviceAllow=/dev/vhost-vdpa-* rw
+
+# Guest memory fault isolation (deploy/README.md): the daemon survives
+# SIGBUS from stale IOTLB mappings, so never convert faults into kills.
+IgnoreSIGPIPE=yes
+
+StateDirectory=unistord
+StateDirectoryMode=0700
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/unistord /etc/unistord
+LimitNOFILE=1048576
+OOMPolicy=continue
+OOMScoreAdjust=-500
+
+[Install]
+WantedBy=multi-user.target

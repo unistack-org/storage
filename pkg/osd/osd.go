@@ -48,6 +48,9 @@ type Options struct {
 	// concurrent Sync() calls coalesce into one fsync pass.
 	CommitMode store.CommitMode
 	FsyncBatch time.Duration
+	// Intent turns on the write intent log of the object store
+	// (vitastor-ideas §2.1); ignored in journal commit mode.
+	Intent bool
 	// Aggregate caps this disk (one store directory): every op from
 	// every client/export passes it before touching the store. This is
 	// the "limit iops on the NVMe" knob that keeps one volume from
@@ -114,6 +117,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 		Preallocate: d.opts.Preallocate,
 		CommitMode:  d.opts.CommitMode,
 		FsyncBatch:  d.opts.FsyncBatch,
+		Intent:      d.opts.Intent,
 	})
 	if err != nil {
 		return fmt.Errorf("osd: store: %w", err)
@@ -388,6 +392,20 @@ func (d *Daemon) MetaInfo() (objects, ramBytes int64) {
 		return 0, 0
 	}
 	return st.MetaInfo()
+}
+
+// IntentStats reports the write intent log counters of the daemon's
+// store (zero value when the intent log is not in use), and the damage
+// report from the last recovery: acknowledged writes that are not
+// durable on disk. The status API surfaces the report as warnings.
+func (d *Daemon) IntentStats() (store.IntentStats, []string) {
+	d.mu.Lock()
+	st := d.st
+	d.mu.Unlock()
+	if st == nil {
+		return store.IntentStats{}, nil
+	}
+	return st.IntentStats(), st.IntentMismatches()
 }
 
 // Close stops the daemon. Safe to call repeatedly and concurrently.

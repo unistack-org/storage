@@ -8,19 +8,16 @@ on:
 jobs:
   build-test:
     runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        module: [".", "sds-nbd"]
     defaults:
       run:
-        working-directory: ${{ matrix.module }}
+        working-directory: .
     env:
       GOWORK: off
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
-          go-version: "1.23"
+          go-version-file: go.mod
       - name: gofmt
         run: |
           files=$(gofmt -l .)
@@ -33,12 +30,9 @@ jobs:
         run: go vet ./...
       - name: test (race)
         run: go test -race -count=1 ./...
-      - name: zero-alloc data path gate (Phase 1)
-        if: matrix.module == 'sds-nbd'
-        run: go test -run TestNBDZeroAllocGate -count=1 -v ./nbd/
+      - name: zero-alloc NBD data path gate (Phase 4)
+        run: go test -run TestNBDZeroAllocGate -count=1 -v ./pkg/nbd/
       - name: zero-alloc cluster protocol gate (Phase 5)
-        if: matrix.module == '.'
         run: go test -run TestSDSNetZeroAllocGate -count=1 -v ./pkg/sdsnet/
       - name: zero-alloc volume data-path gate (Phase 5)
-        if: matrix.module == '.'
         run: go test -run TestClientZeroAllocGate -count=1 -v ./pkg/client/

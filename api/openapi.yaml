@@ -1,5 +1,5 @@
 # Unistack admin HTTP API (unistord -admin-addr).
-# Source of truth: sds-nbd/cmd/unistord/admin.go, exports.go, jobs.go.
+# Source of truth: cmd/unistord/admin.go, exports.go, jobs.go.
 # Keep in sync with the handlers; unistorctl talks to exactly this API.
 openapi: 3.0.3
 info:
@@ -398,7 +398,7 @@ paths:
   /v1/exports:
     get:
       tags: [exports]
-      summary: Live NBD/VDUSE exports
+      summary: Live NBD/VDUSE/vhost-user-blk exports
       responses:
         "200":
           description: export list
@@ -409,17 +409,43 @@ paths:
                 properties:
                   nbd:
                     type: array
-                    items: {type: object}
+                    items:
+                      type: object
+                      properties:
+                        name: {type: string}
+                        read_only: {type: boolean}
+                        size: {type: integer, format: int64}
+                        conns: {type: integer, description: live client connections}
                   vduse:
                     type: array
                     items:
                       type: object
                       properties:
-                        name: {type: string}
+                        name: {type: string, description: kernel device name}
                         volume: {type: string}
+                        read_only: {type: boolean}
+                        size: {type: integer, format: int64}
+                  vub:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        name: {type: string, description: export name}
+                        socket: {type: string, description: unix socket path for the hypervisor}
+                        volume: {type: string}
+                        read_only: {type: boolean}
+                        size: {type: integer, format: int64}
+                        attached: {type: boolean, description: a VM session is live}
     post:
       tags: [exports]
       summary: Attach a runtime export of a volume (cluster mode)
+      description: >
+        nbd registers the volume on the daemon's NBD TCP port; vduse
+        creates a kernel virtio-blk device (Linux, needs devname); vub
+        serves vhost-user-blk on a unix socket (QEMU/Dragonball;
+        devname optionally names the export, the socket path is
+        returned). Idempotent: re-attaching an existing export answers
+        200 with the live registration instead of 201.
       requestBody:
         required: true
         content:
@@ -428,7 +454,10 @@ paths:
       responses:
         "201":
           description: export attached
+        "200":
+          description: export was already attached (idempotent)
         "400": {$ref: "#/components/responses/BadRequest"}
+        "404": {$ref: "#/components/responses/NotFound"}
         "503":
           description: runtime exports not enabled (cluster mode required)
           content:
@@ -440,6 +469,11 @@ paths:
         in: path
         required: true
         schema: {type: string}
+      - name: type
+        in: query
+        required: false
+        description: export type (nbd = export name, vduse = devname, vub = export name)
+        schema: {type: string, enum: [nbd, vduse, vub], default: nbd}
     delete:
       tags: [exports]
       summary: Detach a runtime export
@@ -451,7 +485,7 @@ paths:
               schema:
                 type: object
                 properties:
-                  type: {type: string, enum: [nbd, vduse]}
+                  type: {type: string, enum: [nbd, vduse, vub]}
                   name: {type: string}
                   removed: {type: boolean, example: true}
         "404": {$ref: "#/components/responses/NotFound"}
@@ -721,8 +755,8 @@ components:
       required: [volume]
       properties:
         volume: {type: string}
-        type: {type: string, enum: [nbd, vduse], default: nbd}
-        devname: {type: string, description: "vduse kernel device name (required for vduse)"}
+        type: {type: string, enum: [nbd, vduse, vub], default: nbd}
+        devname: {type: string, description: "vduse kernel device name (required for vduse); vub export name (optional, defaults to the volume name)"}
         read_only: {type: boolean}
     Job:
       type: object

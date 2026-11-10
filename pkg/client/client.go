@@ -36,7 +36,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/unistack-org/crushkv/crushmap"
+	"github.com/unistack-org/storage/crushmap"
 	"github.com/unistack-org/storage/pkg/meta"
 	"github.com/unistack-org/storage/pkg/object"
 	"github.com/unistack-org/storage/pkg/placement"

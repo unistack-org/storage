@@ -20,7 +20,6 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
-	"io"
 	"net"
 	"os"
 
@@ -53,8 +52,6 @@ const (
 	ReqResetDevice           = 34
 	ReqGetMaxMemSlots        = 36
 	ReqGetVringBaseSkipDrain = 45
-	ReqGetProtocolFeaturesExt = 46
-	ReqSetProtocolFeaturesExt = 47
 )
 
 // VhostUserProtocolFeature bits (QEMU include/hw/virtio/vhost-user.h).
@@ -70,6 +67,17 @@ const (
 	protoFResetDevice = 13 // RESET_DEVICE: we support it
 	protoFStatus      = 16 // GET/SET_STATUS: not supported
 )
+
+// protoFeatures is the protocol-feature word we advertise: multi-queue
+// (per-queue enable + GET_QUEUE_NUM), REPLY_ACK (QEMU prefers acked
+// operation), CONFIG (virtio-blk sizing needs GET_CONFIG), and
+// RESET_DEVICE. Everything else (logging shm, pagefault, inflight shm,
+// host notifiers, status) is live-migration/advanced tooling we do not
+// implement.
+const protoFeatures = uint64(1<<protoFMQ) |
+	uint64(1<<protoFReplyAck) |
+	uint64(1<<protoFConfig) |
+	uint64(1<<protoFResetDevice)
 
 // virtio-blk / virtio-ring feature bits used in the GET_FEATURES word
 // (linux/virtio_blk.h, linux/virtio_ring.h). vduse keeps its copies
@@ -99,8 +107,10 @@ const (
 	maxPayload = 512
 	// maxFDs caps SCM_RIGHTS descriptors per message.
 	maxFDs = 64
-	// maxMemRegions caps parsed SET_MEM_TABLE regions.
+	// maxMemRegions caps parsed SET_MEM_TABLE regions. GET_MAX_MEM_SLOTS
+	// advertises the same bound: every region travels in one table.
 	maxMemRegions = 64
+	maxMemSlots   = maxMemRegions
 
 	flagVersion   = 0x1    // protocol version (low 2 bits)
 	flagReply     = 1 << 2 // reply flag on backend->front-end messages
@@ -135,9 +145,21 @@ func (c *Conn) Close() error { return c.c.Close() }
 // the kernel dup'd for us: the caller owns them (close, or hand to
 // fdOwner). A request with flagNeedReply set expects a ReplyU64 ack.
 func (c *Conn) ReadMessage() (Header, []byte, []int, error) {
+	// Two exact-size recvmsgs, like QEMU's vhost_user_read: reading
+	// the full payload in one large recvmsg would coalesce pipelined
+	// messages (QEMU fires SET_VRING_KICK/CALL/ENABLE back-to-back)
+	// and drop their fds' association. Ancillary data rides on the
+	// recvmsg that first consumes its datagram: QEMU sends
+	// header+body in one sendmsg, so the header read claims the fd;
+	// the body read carries an oob buffer too, in case the split
+	// falls the other way.
 	var hb [12]byte
-	if _, err := io.ReadFull(c.c, hb[:]); err != nil {
-		return Header{}, nil, nil, err
+	n, fds, err := c.recvMsg(hb[:])
+	if err != nil {
+		return Header{}, nil, fds, err
+	}
+	if n < 12 {
+		return Header{}, hb[:n], fds, fmt.Errorf("vub: short header read: %d", n)
 	}
 	h := Header{
 		Request: binary.LittleEndian.Uint32(hb[0:]),
@@ -145,54 +167,38 @@ func (c *Conn) ReadMessage() (Header, []byte, []int, error) {
 		Size:    binary.LittleEndian.Uint32(hb[8:]),
 	}
 	if h.Size > maxPayload {
-		return h, nil, nil, fmt.Errorf("vub: payload too big: %d", h.Size)
+		return h, nil, fds, fmt.Errorf("vub: payload too big: %d", h.Size)
 	}
 	body := make([]byte, h.Size)
-	fds, err := c.recv(body)
+	m, bfds, err := c.recvMsg(body)
+	fds = append(fds, bfds...)
 	if err != nil {
-		return h, nil, nil, err
+		return h, body, fds, err
+	}
+	if m < len(body) {
+		return h, body, fds, fmt.Errorf("vub: truncated payload: %d of %d", m, len(body))
 	}
 	return h, body, fds, nil
 }
 
-// recv reads exactly len(body) bytes plus any SCM_RIGHTS fds. QEMU
-// sends header and payload in one writev, so a single recvmsg with
-// ancillary data captures both; any short read is refilled with plain
-// reads (fds already belong to the first datagram).
-func (c *Conn) recv(body []byte) ([]int, error) {
-	rc, err := c.c.SyscallConn()
+// recvMsg performs one recvmsg with a caller-sized buffer (never more
+// than one message's worth, so pipelined messages stay separated) and
+// extracts any SCM_RIGHTS descriptors.
+func (c *Conn) recvMsg(buf []byte) (int, []int, error) {
+	var oob [cmsgSpace]byte
+	n, oobn, _, _, err := c.c.ReadMsgUnix(buf, oob[:])
 	if err != nil {
-		return nil, err
+		return n, nil, err
 	}
-	var fds []int
-	var readn int
-	var cerr error
-	ctrl := func(fd uintptr) bool {
-		var oob [cmsgSpace]byte
-		var oobn int
-		readn, oobn, _, _, cerr = unix.Recvmsg(int(fd), body, oob[:], 0)
-		if cerr != nil {
-			return false
-		}
-		fds, cerr = parseFDs(oob[:oobn])
-		return true
-	}
-	if err := rc.Read(ctrl); err != nil {
-		return fds, err
-	}
-	if cerr != nil {
-		return fds, cerr
-	}
-	if readn < len(body) {
-		if _, err := io.ReadFull(c.c, body[readn:]); err != nil {
-			return fds, err
-		}
-	}
-	return fds, nil
+	fds, err := parseFDs(oob[:oobn])
+	return n, fds, err
 }
 
-// cmsgSpace is the ancillary buffer size for maxFDs descriptors.
-const cmsgSpace = unix.CMSG_SPACE(maxFDs * 8)
+// cmsgSpace is the ancillary buffer size for maxFDs descriptors:
+// CMSG_SPACE(maxFDs*8) as a compile-time constant (the x/sys helper is
+// a function, unusable as an array length). CLEN is the 64-bit cmsghdr
+// (16 bytes) and the whole block is 8-byte aligned.
+const cmsgSpace = ((maxFDs * 8) + 16 + 7) &^ 7
 
 // parseFDs appends the rights from every SCM_RIGHTS control message.
 func parseFDs(oob []byte) ([]int, error) {
@@ -239,23 +245,12 @@ func (c *Conn) write(req, flags uint32, body []byte, fds []int) error {
 	binary.LittleEndian.PutUint32(buf[4:], flags)
 	binary.LittleEndian.PutUint32(buf[8:], uint32(len(body)))
 	copy(buf[12:], body)
-	rc, err := c.c.SyscallConn()
-	if err != nil {
-		return err
-	}
 	var rights []byte
 	if len(fds) > 0 {
 		rights = unix.UnixRights(fds...)
 	}
-	var werr error
-	ctrl := func(fd uintptr) bool {
-		_, _, werr = unix.Sendmsg(int(fd), buf, rights, nil, 0)
-		return true
-	}
-	if err := rc.Write(ctrl); err != nil {
-		return err
-	}
-	return werr
+	_, _, err := c.c.WriteMsgUnix(buf, rights, nil)
+	return err
 }
 
 // fdOwner wraps a raw descriptor in an *os.File so Go owns it (closed
@@ -288,12 +283,20 @@ func vringAddr(body []byte) (idx int, desc, used, avail uint64, err error) {
 // kickFD decodes the SET_VRING_KICK/CALL/ERR payload: bits 0-7 are the
 // queue index, bit 8 is the "no fd" flag (poll mode). The fd (when
 // present) arrives via SCM_RIGHTS.
+// kickFD decodes the SET_VRING_KICK/CALL payload: VhostUserVringState
+// {u32 index; u32 num} where the front-end packs num = (index << 8) |
+// fd, using the VHOST_USER_VRING_NOFD_MASK bit (1<<8) to mean "no fd
+// supplied" (poll mode / never signal). The queue index itself is the
+// payload's index field.
 func kickFD(body []byte) (idx int, noFD bool, err error) {
 	if len(body) < 8 {
 		return 0, false, errors.New("vub: vring kick payload too short")
 	}
-	v := binary.LittleEndian.Uint64(body)
-	return int(v & 0xff), v&(1<<8) != 0, nil
+	i, num, err := vringState(body)
+	if err != nil {
+		return 0, false, err
+	}
+	return i, num&(1<<8) != 0, nil
 }
 
 // getVringBaseReply packs the GET_VRING_BASE reply, which is a full

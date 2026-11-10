@@ -17,6 +17,7 @@ package store
 import (
 	"errors"
 	"fmt"
+	"hash/crc32"
 	"io"
 	"io/fs"
 	"os"
@@ -329,6 +330,14 @@ func (s *Store) Sync() error {
 		return s.applyPass(true)
 	}
 	if s.opts.FsyncBatch <= 0 {
+		if s.intent != nil {
+			// Intent records go down first: a durable intent in front
+			// of durable data is the safe ordering (a crash between the
+			// two is exactly what recovery is built to report).
+			if err := s.intent.sync(); err != nil {
+				return err
+			}
+		}
 		return s.syncPass(false)
 	}
 	w := batchWaiter{done: make(chan error, 1)}
@@ -357,6 +366,9 @@ func (s *Store) runBatch() {
 	s.batch = nil
 	s.batchMu.Unlock()
 
+	if s.intent != nil {
+		_ = s.intent.sync() // markers/intents join this fsync pass (best effort)
+	}
 	err := s.syncPass(true)
 	for _, w := range waiters {
 		w.done <- err
@@ -606,6 +618,18 @@ func (s *Store) WriteZeroes(oid object.OID, off, n uint64, sparse bool) error {
 	if s.jrn != nil {
 		return s.journalZeroes(oid, off, n, sparse)
 	}
+	// Intent: the region must read as zeroes after this op, so announce
+	// the zero-CRC before the punch/zero-fill and commit only on success
+	// (a failed zero-fill leaves the promise open: recovery re-verifies
+	// it and honestly reports the region as damaged).
+	var intentOn bool
+	if s.intent != nil {
+		syncIt := s.opts.CommitMode == CommitFlush || s.opts.CommitMode == CommitSync
+		if err := s.intent.appendIntent(oid, int64(off), int(n), zeroCRCLen(n), syncIt); err != nil {
+			return err
+		}
+		intentOn = true
+	}
 	e, err := s.open(oid, true)
 	if err != nil {
 		return err
@@ -622,6 +646,9 @@ func (s *Store) WriteZeroes(oid object.OID, off, n uint64, sparse bool) error {
 				if err := s.zeroFill(oid, e, off+tail, n-tail); err != nil {
 					return err
 				}
+				if intentOn {
+					s.intent.appendCommit(oid, int64(off))
+				}
 				return s.commitSync(e)
 			}
 			// Punch failed: fall through to a zero-fill. Correctness
@@ -630,6 +657,9 @@ func (s *Store) WriteZeroes(oid object.OID, off, n uint64, sparse bool) error {
 	}
 	if err := s.zeroFill(oid, e, off, n); err != nil {
 		return err
+	}
+	if intentOn {
+		s.intent.appendCommit(oid, int64(off))
 	}
 	return s.commitSync(e)
 }
@@ -709,6 +739,13 @@ func (s *Store) Remove(oid object.OID) error {
 }
 
 func (s *Store) removeFile(oid object.OID) error {
+	if s.intent != nil {
+		// The durable delete marker leads the unlink (see appendDelete).
+		syncIt := s.opts.CommitMode == CommitFlush || s.opts.CommitMode == CommitSync
+		if err := s.intent.appendDelete(oid, syncIt); err != nil {
+			return err
+		}
+	}
 	s.mu.Lock()
 	e := s.files[oid]
 	delete(s.files, oid)
@@ -956,6 +993,16 @@ func (s *Store) Close() error {
 			firstErr = err
 		}
 		delete(s.files, oid)
+	}
+	// Close the intent log after the object fsyncs: every acknowledged
+	// write is durable, so no open intents remain to verify and the log
+	// can be compacted (a crash before this point keeps the records,
+	// and recovery re-verifies regions whose data did not make the
+	// fsyncs above).
+	if s.intent != nil {
+		if err := s.intent.closeClean(); err != nil && journalErr == nil {
+			journalErr = err
+		}
 	}
 	if journalErr != nil && firstErr == nil {
 		firstErr = journalErr

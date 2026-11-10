@@ -20,8 +20,8 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/unistack-org/crushkv/crush"
-	"github.com/unistack-org/crushkv/crushmap"
+	"github.com/unistack-org/storage/crush"
+	"github.com/unistack-org/storage/crushmap"
 )
 
 // ErrNoTarget means a PG has fewer live replicas than requested
@@ -278,7 +278,6 @@ func encodeRuleText(b *strings.Builder, r *crushmap.Rule) {
 	}
 	b.WriteString("}\n")
 }
-
 
 // decodeAny auto-detects the encoding: JSON (leading '{'), Ceph binary
 // map (leading CRUSH magic), otherwise the text format.

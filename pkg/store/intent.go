@@ -64,9 +64,36 @@ const intentFileName = "intent.log"
 // ~1% device traffic — the price of a power-loss damage map.
 const intentRecSize = 24
 
+// intentFlagCommit marks the completion of the intent for (oid, off).
 const intentFlagCommit = 1
 
+// intentFlagDelete marks an object deletion: the open set drops every
+// intent for the oid (a deleted object must not be reported as a lost
+// write at recovery).
+const intentFlagDelete = 2
+
 var crc32cTable = crc32.MakeTable(crc32.Castagnoli)
+
+// zeroCRCLen is CRC-32C of n zero bytes, memoised per length. WriteZeroes
+// announces the region it zeroes with this CRC.
+var zeroCRCLen = func() func(n uint64) uint32 {
+	var (
+		mu sync.Mutex
+		m  = map[uint64]uint32{}
+	)
+	return func(n uint64) uint32 {
+		mu.Lock()
+		defer mu.Unlock()
+		if c, ok := m[n]; ok {
+			return c
+		}
+		c := crc32.Checksum(make([]byte, n), crc32cTable)
+		if len(m) < 4096 { // bounded: lengths come from guest IO sizes
+			m[n] = c
+		}
+		return c
+	}
+}()
 
 // intentKey identifies an open intent; the commit marker carries the
 // same key fields. A repeated (oid,off) collapses to the newest intent:
@@ -110,7 +137,7 @@ type intentState struct {
 	records  atomic.Int64
 	syncs    atomic.Int64
 	checked  atomic.Int64
-	misatch  atomic.Int64
+	mismatch atomic.Int64
 	recorded sync.Mutex // serialises Append(+Sync) pairs on the shared log
 }
 
@@ -133,10 +160,18 @@ func openIntentLog(dir string, logf func(string, ...any)) (*intentState, error) 
 			}
 			k := intentKey{
 				oid: object.OID(binary.BigEndian.Uint64(payload[4:12])),
-				off: uint32(binary.BigEndian.Uint32(payload[12:16])),
+				off: uint64(binary.BigEndian.Uint32(payload[12:16])),
 			}
 			if payload[0]&intentFlagCommit != 0 {
 				delete(open, k)
+				return nil
+			}
+			if payload[0]&intentFlagDelete != 0 {
+				for kk := range open {
+					if kk.oid == k.oid {
+						delete(open, kk)
+					}
+				}
 				return nil
 			}
 			open[k] = intentRec{
@@ -162,7 +197,7 @@ func openIntentLog(dir string, logf func(string, ...any)) (*intentState, error) 
 			}
 		}
 	}
-	j, err := journal.Open(p)
+	j, err := journal.OpenPacked(p, intentRecSize)
 	if err != nil {
 		return nil, err
 	}
@@ -206,7 +241,7 @@ func (is *intentState) verify(dir string, open map[intentKey]intentRec, logf fun
 		is.mu.Unlock()
 	}
 	is.checked.Add(int64(len(open)))
-	is.misatch.Add(mismatches)
+	is.mismatch.Add(mismatches)
 }
 
 // regionMatches reads [off, off+len) of the object file and compares its
@@ -246,7 +281,7 @@ func (is *intentState) appendIntent(oid object.OID, off int64, length int, want 
 	binary.BigEndian.PutUint32(rec[20:24], want)
 
 	is.recorded.Lock()
-	_, err := is.j.Append(rec)
+	_, err := is.j.AppendPacked(rec)
 	if err == nil && syncIt {
 		err = is.j.Sync()
 	}
@@ -270,13 +305,57 @@ func (is *intentState) appendCommit(oid object.OID, off int64) {
 	binary.BigEndian.PutUint64(rec[4:12], uint64(oid))
 	binary.BigEndian.PutUint32(rec[12:16], uint32(off))
 	is.recorded.Lock()
-	_, _ = is.j.Append(rec) // best effort by design
+	_, _ = is.j.AppendPacked(rec) // best effort by design
 	is.recorded.Unlock()
 	is.records.Add(1)
 }
 
 // sync makes buffered intent records durable (CommitNone path).
-func (is *intentState) sync() error { return is.j.Sync() }
+func (is *intentState) sync() error {
+	if err := is.j.Sync(); err != nil {
+		return err
+	}
+	is.syncs.Add(1)
+	return nil
+}
+
+// closeClean compacts the log (a clean shutdown leaves no open intents
+// to verify) and closes it. Keeping the log bounded across restarts is
+// what makes replay cheap: its cost is proportional to the records
+// written since the last clean close, not to the lifetime of the store.
+func (is *intentState) closeClean() error {
+	// Truncate flushes buffered markers first; if it fails the log
+	// stays valid (just big), so fall back to a plain close.
+	_ = is.j.Truncate(is.j.Seq())
+	return is.j.Close()
+}
+
+// appendDelete marks the object as deleted: its open intents are dropped
+// at recovery, so a delete is never reported as a lost write. In flush /
+// sync modes the marker is fsynced before the caller unlinks the file:
+// the durable marker must lead the unlink (a crash in between leaves a
+// present file whose intents still verify clean, while a lost marker
+// would make recovery chase regions of a gone object and report a false
+// mismatch). CommitNone keeps it buffered: Sync covers it.
+func (is *intentState) appendDelete(oid object.OID, syncIt bool) error {
+	rec := make([]byte, intentRecSize)
+	rec[0] = intentFlagDelete
+	binary.BigEndian.PutUint64(rec[4:12], uint64(oid))
+	is.recorded.Lock()
+	_, err := is.j.AppendPacked(rec)
+	if err == nil && syncIt {
+		err = is.j.Sync()
+	}
+	is.recorded.Unlock()
+	if err != nil {
+		return err
+	}
+	is.records.Add(1)
+	if syncIt {
+		is.syncs.Add(1)
+	}
+	return nil
+}
 
 // intentStats returns a snapshot of the intent counters.
 func (is *intentState) intentStats() IntentStats {
@@ -284,7 +363,7 @@ func (is *intentState) intentStats() IntentStats {
 		Records:    is.records.Load(),
 		Syncs:      is.syncs.Load(),
 		Checked:    is.checked.Load(),
-		Mismatches: is.misatch.Load(),
+		Mismatches: is.mismatch.Load(),
 	}
 }
 
@@ -301,3 +380,22 @@ func (is *intentState) recentMismatches() []string {
 // close flushes and closes the log (clean shutdown: buffered commit
 // markers reach disk, the reopen finds an empty open set cheaply).
 func (is *intentState) close() error { return is.j.Close() }
+
+// IntentStats returns intent-log counters; the zero value when the
+// intent log is not in use (journal mode, or Options.Intent=false).
+func (s *Store) IntentStats() IntentStats {
+	if s.intent == nil {
+		return IntentStats{}
+	}
+	return s.intent.intentStats()
+}
+
+// IntentMismatches returns the damage report from the last recovery:
+// acknowledged writes that are not durable on disk (torn regions,
+// holes, missing objects). Empty on every clean reopen.
+func (s *Store) IntentMismatches() []string {
+	if s.intent == nil {
+		return nil
+	}
+	return s.intent.recentMismatches()
+}

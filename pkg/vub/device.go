@@ -90,6 +90,10 @@ func Listen(path string, b vduse.Backend, sizeBytes uint64, opts Options) (*Expo
 // Path is the socket path the exporter listens on.
 func (e *Exporter) Path() string { return e.path }
 
+// Attached reports whether a front-end (QEMU/Dragonball) session is
+// live on the socket right now.
+func (e *Exporter) Attached() bool { return e.dev.attached() }
+
 // Serve accepts QEMU connections until Close. One client at a time; when
 // the client disconnects the queues are torn down and Serve waits for the
 // next connection. Returns nil after Close.
@@ -182,6 +186,14 @@ func newDevice(b vduse.Backend, sizeBytes uint64, opts Options) *device {
 		features: feat,
 		queues:   make([]*queue, opts.NumQueues),
 	}
+}
+
+// attached reports a live session (serve bound the connection and the
+// device was not reset since).
+func (d *device) attached() bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.conn != nil && !d.closed
 }
 
 // serve runs one vhost-user session until the peer disconnects.
@@ -277,12 +289,20 @@ func (d *device) handle(c *Conn, h Header, body []byte, fds []int) error {
 			return err
 		}
 		return d.setVringBase(idx, uint16(avail))
-	case ReqGetVringBase:
+	case ReqGetVringBase, ReqGetVringBaseSkipDrain:
+		// QEMU sends SKIP_DRAIN (45) on teardown; draining is our
+		// documented behaviour and is always safe (workers finish
+		// published jobs), so both requests are handled identically.
 		idx, _, err := vringState(body)
 		if err != nil {
 			return err
 		}
 		return c.ReplyU64(h.Request, d.getVringBase(idx), false)
+	case ReqGetMaxMemSlots:
+		// QEMU 8+ queries this before SET_MEM_TABLE. We accept an
+		// arbitrary number of regions in one table, so advertise a
+		// generous bound.
+		return c.ReplyU64(h.Request, maxMemSlots, false)
 	case ReqSetVringKick:
 		return d.setVringFD(body, fds, true)
 	case ReqSetVringCall:
@@ -298,7 +318,7 @@ func (d *device) handle(c *Conn, h Header, body []byte, fds []int) error {
 		if qerr != nil {
 			return qerr
 		}
-		if en {
+		if en != 0 {
 			q.start()
 		} else {
 			q.stop()
@@ -358,7 +378,7 @@ func (d *device) setMemTable(body []byte, fds []int) error {
 	if len(fds) < len(regions) {
 		return fmt.Errorf("vub: SET_MEM_TABLE: %d regions, %d fds", len(regions), len(fds))
 	}
-	iotlb := vduse.NewIOTLB()
+	iotlb := &vduse.IOTLB{}
 	files := make([]*os.File, 0, len(regions))
 	closeAll := func() {
 		for _, f := range files {
@@ -462,13 +482,19 @@ func (d *device) setVringAddr(body []byte) error {
 		return errors.New("vub: SET_VRING_ADDR before SET_MEM_TABLE")
 	}
 	// NewSplitRing validates the ring addresses against the memory
-	// table. Resume from the base QEMU set earlier in this session
-	// (SET_VRING_BASE precedes SET_VRING_ADDR in QEMU's start path);
-	// a first start has base=0.
-	_, usedIdx := q.ring.State()
-	q.base = base32(body)
+	// table. Ring state (avail/used cursors) is kept in the device
+	// across ring recreation: a QEMU save/restore cycle sends
+	// SET_VRING_BASE (avail resume) followed by SET_VRING_ADDR; the
+	// used cursor is whatever we last had (fresh rings start at 0,
+	// matching QEMU's rebuilt used ring).
+	var availIdx, usedIdx uint16
+	if q.ring != nil {
+		availIdx, usedIdx = q.ring.State()
+	} else {
+		availIdx, usedIdx = q.base, q.lastUsed
+	}
 	q.ring = vduse.NewSplitRing(d.gm, q.num, desc, avail, used)
-	q.ring.SetState(q.base, usedIdx)
+	q.ring.SetState(availIdx, usedIdx)
 	return nil
 }
 
@@ -498,8 +524,14 @@ func (d *device) getVringBase(idx int) uint64 {
 		return getVringBaseReply(idx, 0)
 	}
 	q.stop()
-	_, availIdx := q.ring.State()
-	return getVringBaseReply(idx, availIdx)
+	d.mu.Lock()
+	if q.ring != nil {
+		availIdx, usedIdx := q.ring.State()
+		q.base, q.lastUsed = availIdx, usedIdx
+	}
+	base := q.base
+	d.mu.Unlock()
+	return getVringBaseReply(idx, base)
 }
 
 // setVringFD attaches a kick (isKick) or call fd to a queue. Payload is
@@ -745,6 +777,7 @@ func (d *device) reset() {
 	d.mem = nil
 	d.gm = nil
 	d.regionFds = nil
+	d.conn = nil
 	d.negotiated = 0
 	d.protoNegot = 0
 	d.mu.Unlock()

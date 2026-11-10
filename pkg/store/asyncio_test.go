@@ -84,7 +84,7 @@ func TestAsyncRingConcurrent(t *testing.T) {
 	}
 	defer s.Close()
 	oid := object.OID(0x12)
-	const blocks, writers, size = 32, 8, 16<<10
+	const blocks, writers, size = 32, 8, 16 << 10
 	done := make(chan error, writers)
 	for w := 0; w < writers; w++ {
 		go func(w int) {

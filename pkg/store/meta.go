@@ -43,7 +43,7 @@ import (
 
 // objMeta is the index entry for one object.
 type objMeta struct {
-	size int64  // apparent file size
+	size int64 // apparent file size
 	// alloc is the physically allocated bytes (st_blocks*512), valid
 	// only when allocKnown; a punch invalidates it (set allocKnown to
 	// false so the next StatInfo re-measures).

@@ -164,14 +164,18 @@ type journalState struct {
 	maxSeq uint64
 	// draining parks writers while a Remove/Close checkpoint applies
 	// the whole log; drainDone is closed when the drain ends.
-	draining bool
+	draining  bool
 	drainDone chan struct{}
 
 	// applyMu guards applying (at most one applier pass at a time);
 	// applyCV lets drain callers wait for the in-flight pass to end
 	// (a lost single-flight race must retry, not return early).
-	applyCV    sync.Cond
-	applying   bool
+	applyCV  sync.Cond
+	applying bool
+	// paused (guarded by mu): test hook — the background applier skips
+	// its ticks while set, so staged records provably stay in the
+	// overlay. Drain passes (Sync, Remove, Close) ignore it.
+	paused bool
 
 	quit chan struct{} // closes the applier goroutine
 	done chan struct{} // closed when the applier goroutine exits
@@ -477,6 +481,14 @@ func (s *Store) applyPass(drain bool) error {
 	js := s.jrn
 	if js == nil {
 		return nil
+	}
+	if !drain {
+		js.mu.Lock()
+		paused := js.paused
+		js.mu.Unlock()
+		if paused {
+			return nil // test freeze: background flattening only
+		}
 	}
 	for {
 		js.applyCV.L.Lock()

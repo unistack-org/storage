@@ -286,7 +286,7 @@
 
 ## Фаза 5 — Производительность до уровня Vitastor (постоянно, с замерами на каждую фазу)
 
-> Статус (2026-11-10): 171–177K 4K randread (цель 100K — перекрыта), отказоустойчивость (min_size/out_time/пресеты) закрыта; закрыты in-memory мета-индекс (ADR) и замер WA в sdsbench (WA=2.01), метрика свободного места журнала; открыто: write-intent journal + AWUPF (цель WA→1), бенч-стенд 3–5 нод, cpubench, per-CPU оптимизации, цель >200K.
+> Статус (2026-11-10): 171–177K 4K randread (цель 100K — перекрыта), отказоустойчивость (min_size/out_time/пресеты) закрыта; закрыты in-memory мета-индекс (ADR), замер WA в sdsbench (WA=2.01), метрика свободного места журнала, write-intent journal (`-intent`, damage report при восстановлении) и упаковка journal-записей (packed-пачки в `pkg/journal`, intent-лог 40→24 Б/запись); открыто: AWUPF/`RWF_ATOMIC` (цель WA→1), VDUSE read-ahead, бенч-стенд 3–5 нод, cpubench, per-CPU оптимизации, цель >200K.
 
 - [ ] **Чем обгоняем Vitastor (принято: они реально быстрее Ceph, мы целимся выше).**
       Их сильные стороны перенимаем 1:1: мета в RAM, journal-ring + кворум
@@ -405,7 +405,17 @@
       закрыт 2026-11-10** (`todos/vitastor-ideas.md` §2.3): счётчики
       `store.WriteStats` → `/v1/status` → gauge `unistor_osd_write_bytes` →
       `sdsbench -admin` печатает `WA=`; на живом journal-кластере randwrite 4K
-      даёт WA=2.01. Остаётся: сам intent-журнал (§2.1) и AWUPF-детект (§2.2).
+      даёт WA=2.01. **Intent-журнал закрыт 2026-11-10** (§2.1):
+      `pkg/store/intent.go`, флаг `unistord -intent` (только non-journal
+      режимы — journal уже имеет WAL), durable-интент 24 Б перед данными +
+      буферный commit-маркер, recovery = одноразовый damage report
+      (открытые интенты → `regionMatches` → warnings в `/v1/status` →
+      truncate лога), delete-маркер на `Remove`, компакция при чистом
+      закрытии; gauge `unistor_osd_intent` в том же exporter; тесты
+      `pkg/store/intent_test.go` (в т.ч. torn write под `-race`).
+      Стоимость ~1% трафика на 4K, WA не меняет (это про целостность,
+      не про усиление). Остаётся: AWUPF-детект + `RWF_ATOMIC` (§2.2) —
+      именно он даёт WA → 1 на атомарных 4K.
       Детали: `todos/vitastor-ideas.md` §2.1–2.3
 - [x] **Клиентские I/O-потоки** (урок Vitastor: 7–8 GB/s линейно) — сделано:
       `sdsnet.Stream` (один конн = десятки горутин-сабмиттеров, один батч-

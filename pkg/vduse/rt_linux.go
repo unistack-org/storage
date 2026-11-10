@@ -154,10 +154,10 @@ type queueState struct {
 	// only touch ctrlMu/cond when the decrement REACHES zero (the
 	// quiesce wake-up), not on every completion — under load 256
 	// workers used to convoy on this mutex once per request.
-	cond   *sync.Cond // guards the inflight==0 wake-up (guards ctrlMu)
-	ctrlMu sync.Mutex // guards cond/closed
-	closed bool       // Close: dispatcher must not enqueue
-	workers  sync.WaitGroup
+	cond    *sync.Cond // guards the inflight==0 wake-up (guards ctrlMu)
+	ctrlMu  sync.Mutex // guards cond/closed
+	closed  bool       // Close: dispatcher must not enqueue
+	workers sync.WaitGroup
 
 	// irqPending coalesces interrupt requests: completions set it, and
 	// it is flushed (one injectIRQ ioctl) when the queue goes idle

@@ -3,10 +3,11 @@
 Распределённая блочная СХД на чистом Go. Цели (зафиксированы владельцем):
 
 1. **CRUSH-крашмапы как в Ceph** — размещение объектов по topology-карте
-   (region → zone → rack → host → disk). Движок:
-   [crushkv](https://github.com/unistack-org/crushkv) — byte-exact порт
-   C-ядра Ceph, golden-тесты против настоящего Ceph, 0 аллокаций на
-   горячем пути (см. `crushkv/docs/GC_ARENA.md`).
+   (region → zone → rack → host → disk). Движок: `crush/` + `crushmap/`
+   (byte-exact порт C-ядра Ceph из репозитория
+   [crushkv](https://github.com/unistack-org/crushkv), влит в этот
+   репозиторий; golden-тесты против настоящего Ceph, 0 аллокаций на
+   горячем пути, см. `docs/GC_ARENA.md`, лицензия — `LICENSE-crushkv`).
 2. **Только Go, скорость не ниже [Vitastor](https://vitastor.io/docs/)**
    (~0.14 мс на 4K, миллионы IOPS на узел). Стратегия: минимум
    копирований/аллокаций, no-alloc data path, io_uring (Linux), свой
@@ -15,12 +16,16 @@
 
 ## Статус
 
-- ✅ **MVP экспорта (фаза 4a)**: [`sds-nbd/`](sds-nbd/) — NBD-сервер на
-  stdlib Go + демон `sdsd`. Проверено end-to-end: QEMU 11 отдаёт экспорт
+- ✅ **MVP экспорта (фаза 4a)**: `pkg/nbd/` — NBD-сервер на stdlib Go +
+  демон `cmd/unistord`. Проверено end-to-end: QEMU 11 отдаёт экспорт
   как `/dev/nvme0n1` гостю, mkfs/mount/запись работают, данные в
-  backing-файле. Детали: [`sds-nbd/README.md`](sds-nbd/README.md).
-- ✅ CRUSH: готов в отдельном репозитории crushkv (движок + формат карты
-  Ceph + арена без GC).
+  backing-файле.
+- ✅ **Экспорт-устройства**: `unistord` отдаёт том по NBD (TCP),
+  VDUSE (`/dev/vduseX`, Linux) и vhost-user-blk (UNIX-сокет для
+  QEMU/Dragonball); управление через REST `POST/GET/DELETE /v1/exports`
+  и `unistorctl export …`.
+- ✅ CRUSH: `crush/` + `crushmap/` (движок + формат карты Ceph + арена
+  без GC) — влиты в этот репозиторий из crushkv.
 - ✅ Метрики: `unistord -metrics 0.0.0.0:8080` → `GET /metrics` в формате
   Prometheus (скрейп VictoriaMetrics): состояние кластера, raft (состояние
   и участники), статус и диски всех OSD (в т.ч. удалённых — зонд StatFS),
@@ -35,19 +40,32 @@
 
 ## Модули
 
-| Модуль | Путь | Назначение |
-|---|---|---|
-| `github.com/unistack-org/storage` | `.` | ядро SDS (в разработке) |
-| `github.com/unistack-org/sds-nbd` | `sds-nbd/` | NBD-сервер + `sdsd` (MVP экспорта) |
+Единый Go-модуль `github.com/unistack-org/storage` (корень репозитория):
+
+| Пакет / команда | Назначение |
+|---|---|
+| `cmd/unistord` | демон SDS: тома, кластер, REST admin API, экспорты (NBD/VDUSE/vhost-user-blk) |
+| `cmd/unistorctl` | CLI: тома, кластер, `export create/ls/rm` |
+| `cmd/sdsbench` | бенчмарк data path |
+| `pkg/nbd` | NBD-сервер (stdlib, zero-alloc data path) |
+| `pkg/vduse` | VDUSE (Linux) — userspace virtio-blk бэкенд |
+| `pkg/vub` | vhost-user-blk бэкенд (UNIX-сокет, QEMU/Dragonball) |
+| `pkg/store`, `pkg/object`, `pkg/volume`, … | ядро SDS |
+| `crush/`, `crushmap/` | CRUSH-движок (порт C-ядра Ceph, ex-crushkv) |
 
 ## Сборка / тесты
 
 ```sh
 GOWORK=off go build ./... && GOWORK=off go test -race ./...
-cd sds-nbd && GOWORK=off go build ./... && GOWORK=off go test ./...
 ```
 
 `GOWORK=off` обязателен, если рядом лежит внешний `go.work`.
 
-Быстрый старт экспорта: см. [`sds-nbd/README.md`](sds-nbd/README.md).
+Быстрый старт:
+
+```sh
+GOWORK=off go build -o unistord ./cmd/unistord
+./unistord -listen 127.0.0.1:10809 -export vol0=/tmp/vol0.img:1G
+qemu-img info nbd://127.0.0.1:10809/vol0
+```
 

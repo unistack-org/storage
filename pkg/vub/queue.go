@@ -1,12 +1,13 @@
 package vub
 
 import (
-	"runtime/debug"
 	"encoding/binary"
 	"fmt"
 	"os"
+	"runtime/debug"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/unistack-org/storage/pkg/vduse"
 )
@@ -33,13 +34,13 @@ type job struct {
 // eventfd and publishes jobs; Workers goroutines execute them against
 // the backend and publish used entries, signalling the call eventfd.
 type queue struct {
-	idx     int
-	d       *device
-	num     uint16
-	base    uint16 // avail index from SET_VRING_BASE (resume point)
-	ring    *vduse.SplitRing
-	kick    *os.File // readable: guest published buffers
-	call    *os.File // writable: notify guest of used buffers
+	idx  int
+	d    *device
+	num  uint16
+	ring *vduse.SplitRing
+	kick *os.File // readable: guest published buffers
+	call *os.File // writable: notify guest of used buffers
+
 	running bool
 
 	// stopCh asks the dispatcher to exit; closing kick is the nudge
@@ -48,6 +49,12 @@ type queue struct {
 	stopCh chan struct{}
 	jobs   chan *job
 	wg     sync.WaitGroup
+
+	// base/lastUsed are the resume indices kept across ring
+	// (re)creation: GET_VRING_BASE stores them, SET_VRING_BASE/ADDR
+	// restore them.
+	base     uint16
+	lastUsed uint16
 
 	inflight atomic.Int64 // published-and-not-completed jobs
 }
@@ -60,6 +67,11 @@ func (q *queue) start() {
 		return
 	}
 	q.running = true
+	if q.kick != nil {
+		// A prior stop() armed a past read deadline to unblock the
+		// dispatcher; clear it before parking a new one.
+		_ = q.kick.SetReadDeadline(time.Time{})
+	}
 	q.stopCh = make(chan struct{})
 	q.jobs = make(chan *job, 2*q.d.opts.Workers)
 	q.wg.Add(1)
@@ -68,14 +80,14 @@ func (q *queue) start() {
 		q.wg.Add(1)
 		go q.work()
 	}
-	// QEMU does not always inject a kick after SET_VRING_ENABLE; scan
-	// the ring once so anything already published gets picked up.
-	q.pump()
 }
 
 // stop stops the queue and waits for all inflight requests to complete
 // (the spec requires a stopped vring to have no inflight I/O before
-// GET_VRING_BASE answers).
+// GET_VRING_BASE answers). The kick/call fds stay attached: QEMU stops
+// queues (GET_VRING_BASE) to resume them later on the same connection
+// without resending the fds, so only reset() (via closeFDs) releases
+// them.
 func (q *queue) stop() {
 	if !q.running {
 		return
@@ -83,11 +95,11 @@ func (q *queue) stop() {
 	q.running = false
 	close(q.stopCh)
 	if q.kick != nil {
-		// Unblock a dispatcher parked in kick.Read. The fd itself is
-		// QEMU's (we own a dup from SCM_RIGHTS); closing our copy is
-		// safe and expected.
-		_ = q.kick.Close()
-		q.kick = nil
+		// Unblock a dispatcher parked in kick.Read without destroying
+		// the fd: the kick dup is registered with Go's poller, so a
+		// past deadline makes the blocked Read fail and the dispatcher
+		// exits through its stopCh check.
+		_ = q.kick.SetReadDeadline(time.Now())
 	}
 	close(q.jobs)
 	q.wg.Wait()
@@ -103,11 +115,6 @@ func (q *queue) closeFDs() {
 		_ = q.call.Close()
 		q.call = nil
 	}
-}
-
-// pump injects a synthetic scan: dispatch everything the ring has.
-func (q *queue) pump() {
-	q.dispatchOnce()
 }
 
 // dispatch is the dispatcher goroutine: park on the kick eventfd, then
@@ -205,7 +212,7 @@ func (q *queue) dispatchOnce() bool {
 			for _, p := range refs {
 				p.Release()
 			}
-			q.d.iotlb.EvictAll(addrsOf(br.DataSegs), 0)
+			q.evict(br.DataSegs)
 			q.completeSafe(ring, br, vduse.StatusOK, 0) // best effort
 			continue
 		}
@@ -244,7 +251,7 @@ func (q *queue) execJob(j *job, irqPending *bool) {
 		if r := recover(); r != nil {
 			q.logf("vub: q%d: guest memory fault in worker (%v) head=%d — completing with I/O error",
 				q.idx, r, j.br.Head)
-			q.d.iotlb.EvictAll(addrsOf(j.br.DataSegs), 0)
+			q.evict(j.br.DataSegs)
 			q.completeSafe(j.ring, j.br, vduse.StatusIOErr, 0)
 		}
 		for _, p := range j.refs {
@@ -320,4 +327,16 @@ func fmtSegs(segs []vduse.Seg) string {
 		s += fmt.Sprintf(" [%d %x len=%d w=%v]", i, sg.Addr, sg.Len, sg.Write)
 	}
 	return s
+}
+
+// evict drops mappings covering the given guest addresses (a fault
+// means the table is stale for them; the next SET_MEM_TABLE or
+// pull-on-miss refresh re-establishes them).
+func (q *queue) evict(segs []vduse.Seg) {
+	q.d.mu.Lock()
+	t := q.d.mem
+	q.d.mu.Unlock()
+	if t != nil {
+		t.EvictAll(addrsOf(segs), 0)
+	}
 }

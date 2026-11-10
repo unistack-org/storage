@@ -370,10 +370,10 @@ func (s *syncGuest) Acquire(iova uint64, length int) (*RegionRef, error) {
 func TestPushUsedConcurrent(t *testing.T) {
 	g := newMemGuest()
 	const (
-		desc, avail, used  = 0x0, 0x1000, 0x2000
-		ringSize           = 256
-		pushes             = 1024
-		writers            = 32
+		desc, avail, used = 0x0, 0x1000, 0x2000
+		ringSize          = 256
+		pushes            = 1024
+		writers           = 32
 	)
 	sg := &syncGuest{g: g}
 	ring := NewSplitRing(sg, ringSize, desc, avail, used)

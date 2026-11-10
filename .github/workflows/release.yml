@@ -40,7 +40,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  GO_VERSION_FILE: sds-nbd/go.mod
+  GO_VERSION_FILE: go.mod
 
 jobs:
   meta:
@@ -128,14 +128,14 @@ jobs:
           go-version-file: ${{ env.GO_VERSION_FILE }}
 
       - name: Build binaries
-        working-directory: sds-nbd
+        working-directory: .
         env:
           VERSION: ${{ needs.meta.outputs.version }}
           CHANNEL: ${{ needs.meta.outputs.channel }}
         run: make release VERSION="$VERSION" CHANNEL="$CHANNEL"
 
       - name: Verify stamped version
-        working-directory: sds-nbd
+        working-directory: .
         env:
           VERSION: ${{ needs.meta.outputs.version }}
         run: |
@@ -155,7 +155,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: dist
-          path: sds-nbd/dist
+          path: dist
           retention-days: 7
 
   packages:
@@ -168,20 +168,20 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: dist
-          path: sds-nbd/dist
+          path: dist
 
       - name: Build deb + rpm
         env:
           VERSION: ${{ needs.meta.outputs.version }}
-        run: bash sds-nbd/scripts/package.sh
+        run: bash scripts/package.sh
 
       - name: Upload packages
         uses: actions/upload-artifact@v4
         with:
           name: packages
           path: |
-            sds-nbd/dist/*.deb
-            sds-nbd/dist/*.rpm
+            dist/*.deb
+            dist/*.rpm
           retention-days: 7
 
   apk:
@@ -202,17 +202,17 @@ jobs:
           adduser -D builder
           addgroup builder abuild
           echo "builder ALL=(ALL) NOPASSWD: ALL" >/etc/sudoers.d/builder
-          mkdir -p sds-nbd/dist
+          mkdir -p dist
           chown -R builder:builder "$GITHUB_WORKSPACE"
 
       - name: Download dist
         uses: actions/download-artifact@v4
         with:
           name: dist
-          path: sds-nbd/dist
+          path: dist
 
       - name: Chown dist (artifact extraction runs as root)
-        run: chown -R builder:builder sds-nbd/dist
+        run: chown -R builder:builder dist
 
       - name: Build apk
         env:
@@ -231,7 +231,7 @@ jobs:
               set -euo pipefail
               cd "$WORKDIR"
               abuild-keygen -a -i -n
-              bash sds-nbd/scripts/package.sh
+              bash scripts/package.sh
             '
           chown -R "$(id -u):$(id -g)" "$APK_DIR" || true
 
@@ -254,19 +254,19 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: dist
-          path: sds-nbd/dist
+          path: dist
 
       - name: Download packages
         uses: actions/download-artifact@v4
         with:
           name: packages
-          path: sds-nbd/dist
+          path: dist
 
       - name: Download apks
         uses: actions/download-artifact@v4
         with:
           name: apk
-          path: sds-nbd/dist
+          path: dist
 
       - name: Ensure tag exists
         env:
@@ -284,7 +284,7 @@ jobs:
           git push "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "refs/tags/$TAG"
 
       - name: Finalize SHA256SUMS over all assets
-        working-directory: sds-nbd/dist
+        working-directory: dist
         run: |
           set -euo pipefail
           rm -f SHA256SUMS
@@ -302,7 +302,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          cd sds-nbd
+          cd .
           EXTRA=()
           [ "$PRERELEASE" = "true" ] && EXTRA+=(--prerelease)
           if gh release view "$TAG" >/dev/null 2>&1; then
