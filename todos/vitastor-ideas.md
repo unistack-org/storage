@@ -147,12 +147,15 @@ randread QD128: 41.6K против их 128K (×3). Their bottleneck = CPU + с�
 - [ ] **3.2 Кэш-индекс меты в клиенте/OSD** — снять lookup из пути чтения
       (следствие 2.5); на loopback 4K randread уже даёт 171–177K, значит
       узкое место — не диск. `[hl2025]`
-- [ ] **3.3 `MSG_ZEROCOPY` с порогом** (`pkg/sdsnet`) — у них опция
-      `min_zerocopy_send_size`, по умолчанию 32K. Уже в роадмапе, фиксировать
-      порог как опцию. `[3.0.x]`
-- [ ] **3.4 Клиентские I/O-потоки** (`pkg/client`) — у них вынос I/O в
-      отдельные потоки даёт 7–8 GB/s линейно; у нас 4 конн × 10.4K →
-      масштабирование по коннам, нужен внутренний параллелизм. `[3.0.x]`
+- [x] **3.3 `MSG_ZEROCOPY` с порогом** (`pkg/sdsnet`) — сделано:
+      `StreamConfig.ZerocopyThreshold` (0 = выкл), TCP-only, кэш проб-запроса
+      SO_ZEROCOPY;
+      Linux: sendto(MSG_ZEROCOPY)+MSG_ERRQUEUE-синхронизация, авто-fallback
+      на kernel copy; другие ОС/TLS — обычный путь. `[3.0.x]`
+- [x] **3.4 Клиентские I/O-потоки** (`pkg/client`) — сделано: `sdsnet.Stream`
+      (pipelined: writer-горутина батчит кадры, reader сопоставляет по seq,
+      окно backpressure, ctx/дедлайны на оп, protocol-ошибки не убивают
+      стрим); приём через io_uring — `store.Options.AsyncRing` (см. §1). `[3.0.x]`
 - [ ] **3.5 Клиентский writeback-буфер** (`pkg/client`) — `client_enable_writeback`.
       Важно и для честности бенча: без writeback их rep3-запись падает до
       3.4K IOPS QD32, а наш hard-режим сравнивать с их writeback-режимом
@@ -190,9 +193,15 @@ randread QD128: 41.6K против их 128K (×3). Their bottleneck = CPU + с�
       «object-granular recovery» из роадмапа. `[3.0.x]`
 - [ ] **4.4 `noout`/`pg_minsize` в CLI + `describe`** — операционный доступ к
       уже реализованной семантике (см. §7). `[2.3.x]`
-- [ ] **4.5 Онлайн-resize экспорта** (`sds-nbd`, `pkg/vduse`) — рост размера
-      на лету у NBD/VDUSE/QEMU + online expand в CSI. У нас размер
-      фиксируется при `CmdGo` (`cs.size = Backend.Size()`). `[3.2.x]`
+- [x] **4.5 Онлайн-resize экспорта** (`sds-nbd`, `pkg/vduse`) — рост размера
+      на лету у NBD/VDUSE/QEMU + online expand в CSI. Реализовано: размер в
+      transmission больше не фиксируется при `CmdGo` — `cs.size` атомарный и
+      обновляется из бэкенда при запросе за старую границу (checkRange),
+      рост через `unistorctl volume resize` обслуживается следующим же
+      запросом без реконнекта (тест TestOnlineGrowServedWithoutReconnect);
+      VDUSE уже сообщал рост гостю за ~2 с (watchCapacity/SetCapacity).
+      Уменьшение под живым гостем в NBD небезопасно по протоколу — только
+      через реконнект. Online expand в CSI — вне нашего репозитория. `[3.2.x]`
 
 ---
 

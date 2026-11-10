@@ -105,7 +105,9 @@
       серверный `Close` рвёт живые соединения (нет висящих handler-ов)
 - [x] Бенчмарк: `BenchmarkClientWrite4K` (loopback, mem-backend): 41.4 µs/op
       ≈ 98.9 MB/s, 5 allocs/op — запас под zero-copy/pipe-lining есть
-- [ ] pipeline/batch запросов, `MSG_ZEROCOPY` (Linux), приём через io_uring
+- [x] pipeline/batch запросов (`sdsnet.Stream`: окно+батч-флаш+backpressure),
+      `MSG_ZEROCOPY` (Linux, `ZerocopyThreshold`, errqueue-синхронизация),
+      приём через io_uring (`store.Options.AsyncRing`, fallback pread/pwrite)
 - [ ] heartbeat, деградация при потере реплики, recovery-трафик приоритетом
 - [x] Тесты: chaos (смерть сервера, frozen replica, пул-давление, обрывы), `-race`
 - Примечание: исправлен дедлок `iouring.fallbackRing.Submit` (mutex держался при
@@ -335,10 +337,11 @@
       важна именно атомарность при power-loss) и **замер WA в sdsbench**
       (записано на диск / записано клиентом) — без числа эффект не виден.
       Детали: `todos/vitastor-ideas.md` §2.1–2.3
-- [ ] **Клиентские I/O-потоки** (урок Vitastor: 7–8 GB/s линейно) — у нас
-      масштабирование только по соединениям (4 конн × 10.4K), нужен
-      внутренний параллелизм в `pkg/client`; `MSG_ZEROCOPY` оформить опцией
-      с порогом (у них `min_zerocopy_send_size` = 32K по умолчанию)
+- [x] **Клиентские I/O-потоки** (урок Vitastor: 7–8 GB/s линейно) — сделано:
+      `sdsnet.Stream` (один конн = десятки горутин-сабмиттеров, один батч-
+      флаш на кадры, окно Window, ctx-отмена, protocol-ошибки изолированы);
+      `MSG_ZEROCOPY` опцией `ZerocopyThreshold` (аналог их
+      `min_zerocopy_send_size`); io_uring в `pkg/store` опцией `AsyncRing`
 - [ ] **`cpubench`-аналог** — цена чексумм/шифрования на ядро (у них
       xxhash3 1M ≈ 104 GB/s, AES-XTS+GCM ≈ 12.6 GB/s на EPYC). Без этого
       числа нельзя включать csum/шифрование на горячем пути (Фаза 5b)
@@ -436,7 +439,7 @@
       (rate/histogram_quantile), не «сумма средних». Осталось: длины
       очередей, write amplification, сам дашборд Grafana.
       Детали: `vitastor-ideas.md` §6.1–6.2
-- [ ] **Graceful SIGINT/SIGTERM** во всех серверах (`sdsd`, `sds-nbd`,
+- [x] **Graceful SIGINT/SIGTERM** во всех серверах (`sdsd`, `sds-nbd`,
       `pkg/vduse`): дрейн и закрытие сокетов схемой `SO_LINGER` + `shutdown()`
       + `close()` (у них без этого мусор в io_uring); `/healthcheck` в
       meta/мониторе для оркестрации. Детали: `vitastor-ideas.md` §6.3–6.4
@@ -455,9 +458,11 @@
 - [ ] **`recovery_tune_interval`** — авторегулирование скорости
       recovery/rebalance по влиянию на клиентский I/O, приоритет клиента над
       восстановлением; стыкуется с «восстановление пообъектное» выше
-- [ ] **Онлайн-resize экспорта** (`sds-nbd`, `pkg/vduse`) — размер сейчас
-      фиксируется при `CmdGo` (`cs.size = Backend.Size()`); нужен рост на
-      лету + online expand в CSI. Детали: `vitastor-ideas.md` §4.5
+- [x] **Онлайн-resize экспорта** (`sds-nbd`, `pkg/vduse`) — рост на лету
+      реализован: `cs.size` атомарный, обновляется из бэкенда при запросе за
+      старую границу; resize без реконнекта, VDUSE уведомляет гостя за ~2 с.
+      Осталось: online expand в CSI (внешний проект). Детали:
+      `vitastor-ideas.md` §4.5
 - [ ] **`unistorage serve`: HTTP API + OpenAPI** — наш CLI проектируется как
       оболочка над HTTP API (у них это дало интеграции с CSI/дашбордами);
       вместе с `status` (машиночитаемым, с предупреждениями: 100% OSD,
