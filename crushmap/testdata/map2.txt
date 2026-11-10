@@ -1,0 +1,140 @@
+# begin crush map
+tunable choose_local_tries 0
+tunable choose_local_fallback_tries 0
+tunable choose_total_tries 50
+tunable chooseleaf_descend_once 1
+tunable chooseleaf_vary_r 1
+tunable straw_calc_version 1
+tunable chooseleaf_stable 1
+# devices
+device 0 osd.0
+device 1 osd.1
+device 2 osd.2
+device 3 osd.3
+device 4 osd.4
+device 5 osd.5
+device 6 osd.6
+device 7 osd.7
+device 8 osd.8
+device 9 osd.9
+# types
+type 0 osd
+type 1 host
+type 10 root
+# buckets
+host h0 {
+id -2
+# weight 2.000
+alg straw2
+hash 0 # rjenkins1
+item osd.0 weight 1.000
+item osd.1 weight 1.000
+}
+host h1 {
+id -3
+# weight 2.000
+alg straw2
+hash 0 # rjenkins1
+item osd.2 weight 1.000
+item osd.3 weight 1.000
+}
+host h2 {
+id -4
+# weight 2.000
+alg straw2
+hash 0 # rjenkins1
+item osd.4 weight 1.000
+item osd.5 weight 1.000
+}
+root all {
+id -1
+# weight 6.000
+alg straw2
+hash 0 # rjenkins1
+item h0 weight 2.000
+item h1 weight 2.000
+item h2 weight 2.000
+}
+root unif {
+id -11
+# weight 6.000
+alg uniform
+hash 0 # rjenkins1
+item osd.0 weight 1.000
+item osd.1 weight 1.000
+item osd.2 weight 1.000
+item osd.3 weight 1.000
+item osd.4 weight 1.000
+item osd.5 weight 1.000
+}
+root lst {
+id -21
+# weight 3.000
+alg list
+hash 0 # rjenkins1
+item osd.0 weight 1.000
+item osd.2 weight 1.000
+item osd.4 weight 1.000
+}
+root tr {
+id -31
+# weight 4.000
+alg tree
+hash 0 # rjenkins1
+item osd.6 weight 1.000
+item osd.7 weight 1.000
+item osd.8 weight 1.000
+item osd.9 weight 1.000
+}
+# rules
+rule r0 {
+id 0
+type replicated
+step take all
+step chooseleaf firstn 0 type osd
+step emit
+}
+rule r1 {
+id 1
+type replicated
+step take all
+step choose firstn 2 type host
+step emit
+}
+rule r2 {
+id 2
+type replicated
+step take unif
+step chooseleaf indep 0 type osd
+step emit
+}
+rule r3 {
+id 3
+type replicated
+step take lst
+step choose firstn 3 type osd
+step emit
+}
+rule r4 {
+id 4
+type replicated
+step set_chooseleaf_tries 5
+step take tr
+step chooseleaf indep 2 type osd
+step emit
+}
+rule r5 {
+id 5
+type replicated
+step take lst
+step choose indep 3 type osd
+step emit
+}
+rule r6 {
+id 6
+type replicated
+step take all
+step choose firstn 1 type host
+step emit
+}
+# end crush map
