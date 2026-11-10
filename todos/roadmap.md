@@ -216,8 +216,13 @@
       ⚠ Проверено: домашний хост (macOS, homebrew QEMU 11.1.3) НЕ имеет
       `vhost-user-blk-pci`/`vfio-pci`/vhost-объектов — 4b валидируется только
       на Linux+KVM (x86_64 или aarch64 Linux-хост с QEMU ≥ 8)
-- [ ] Интеграция с `unistack/pkg/storage` (Provider-драйвер `unistorage`:
-      CreateVolume/DeleteVolume/Attach) и `pkg/qemu` (`Drive.VfioUser`)
+- [x] **Интеграция с `unistack/pkg/storage` (ушла в VDUSE-транспорт).**
+      Клетка подключается драйвером `unistack-sds`
+      (`unistack/pkg/storage/unistack_sds.go`) к admin API unistord
+      (ADR-059): volumes/import-jobs/snapshots/exports + bearer-токен.
+      Attach — VDUSE (`POST /v1/exports type=vduse` → `vdpa dev add` →
+      QEMU `vhost-vdpa-device-pci`), вариант `pkg/qemu Drive.VfioUser`
+      не потребовался
 - [x] **4c VDUSE-экспорт (код готов; e2e — на Linux-хосте)**: `storage/pkg/vduse` —
       userspace-блочное устройство через `/dev/vduse` (VDUSE), без QEMU и без
       «устаревшего» vhost-user: гость цепляет устройство стандартно
@@ -241,7 +246,8 @@
       IOTLB-маппинги при закрытии fd — запросы «в полёте» на момент смерти
       завершить нельзя; плановый restart — только с quiesce гостя, аварийный —
       лечится hot-unplug/plug устройства VM. Детали: `bench-stand.md`
-- [ ] systemd keep-alive юнит для VDUSE-демона + runbook восстановления
+- [x] systemd keep-alive юнит для VDUSE-демона + runbook восстановления
+      (`sds-nbd/deploy/unistord.service` + `sds-nbd/deploy/README.md`)
 - [ ] e2e-тест: Linux+KVM, гость пишет/читает, fio внутри гостя
       (нужна чистая загрузка стенда 1.100 — согласовать окно)
 

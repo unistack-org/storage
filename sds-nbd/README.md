@@ -58,6 +58,46 @@ mount -t ext4 /dev/nvme0n1 /mnt
 echo secret > /mnt/secret.txt && sync && umount /mnt
 ```
 
+## Кластерный режим: admin API, runtime-экспорты, VDUSE
+
+Полноценный режим SDS — `unistord` как узел кластера `storage/`
+(см. `todos/roadmap.md` фазы 3–5 и ADR-059 в репозитории unistack):
+
+```sh
+./unistord -cluster /var/lib/unistord/meta \
+  -osd 1@/var/lib/unistord/osd1 -crushmap crush.json -epoch 1 \
+  -http 10.0.0.10:8443 -admin-token "$ADMIN_TOKEN" \
+  -metrics 0.0.0.0:8080
+```
+
+Административный HTTP API (`-http`, bearer-токен `-admin-token`,
+`/healthz` без токена) — контракт контрольной плоскости unistack
+(«клетки»):
+
+- `POST/GET/DELETE /v1/volumes…` — тома (`size` — строка в байтах),
+  `read_only`/`shared`/`owner` в записи тома (`meta.VolumeSpec`);
+  `PUT /v1/volumes/{name}/resize` — только рост (уменьшение → 400 «shrink»);
+- `POST /v1/volumes/{name}/import {"url","sha256"?,"offset"?,"async"}` →
+  `202 {"job_id"}`; `GET /v1/jobs/{id}` → `state|written|error`.
+  Ingest ограничивается QoS-классом тома; sha256 проверяется по записанным
+  байтам;
+- снапшоты/rollback: `POST /v1/volumes/{name}/snapshot`,
+  `GET …/snapshots`, `DELETE …/snapshot/{gen}`, `POST …/rollback`;
+- **runtime-экспорты**: `POST /v1/exports
+  {"volume","type":"nbd"|"vduse","devname"?,"read_only"?}` → 201/200
+  (идемпотентно), `DELETE /v1/exports/{name}?type=…` (409 — устройство
+  занято, 503 — нет кворума). `read_only` персистится в записи тома и
+  воспроизводится при рестарте;
+- VDUSE (Linux): том становится устройством virtio-blk через
+  `vdpa dev add name <devname> mgmtdev vduse`; QEMU подключает его
+  `-device vhost-vdpa-device-pci,vhostdev=/dev/vhost-vdpa-<minor>`
+  (vIOMMU в госте обязателен; read-only — бит `VIRTIO_BLK_F_RO`,
+  запись в data-path отклоняется). детали — `deploy/README.md`.
+
+Пример контракта клетки: `POST /v1/exports {"volume":"iso-42","type":"vduse",
+"devname":"sdsv-42","read_only":true}` → `vdpa dev add` на узле →
+QEMU-диск с ISO.
+
 ## Что проверено (MVP-критерии)
 
 - `go test ./... -count=1` и `-race` — все тесты зелёные (7 тестов, 1 skip —

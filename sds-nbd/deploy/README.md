@@ -2,10 +2,12 @@
 
 ## Файлы
 
-- `sdsd.service` — systemd-юнит с keep-alive (`Restart=always`, `RestartSec=1`).
-  Демон защищён от падения на гостевых memory-fault (см. ниже), так что
-  перезапуск — это лечение внешних причин (OOM, systemd-рестарт, upgrade),
-  а не защита от собственных багов.
+- `unistord.service` — systemd-юнит с keep-alive (`Restart=always`, `RestartSec=1`).
+  Аргументы демона берутся из `UNISTORD_ARGS` в `/etc/unistord/unistord.env`
+  (EnvironmentFile), права на `/dev/vduse/control` юнит выдаёт через
+  `DeviceAllow`. Демон защищён от падения на гостевых memory-fault (см. ниже),
+  так что перезапуск — это лечение внешних причин (OOM, systemd-рестарт,
+  upgrade), а не защита от собственных багов.
 
 ## Реконнект VDUSE (что гарантировано)
 
@@ -34,7 +36,7 @@
 Практический вывод:
 
 - **Плановый restart безопасен**, когда гостевой I/O в полёте нет
-  (unmount/quiesce в госте → `systemctl restart sdsd`).
+  (unmount/quiesce в госте → `systemctl restart unistord`).
 - **Аварийный kill посреди I/O** оставляет гостевой диск залипшим до
   guest-visible сброса устройства:
   - VM: hot-unplug/hot-plug `vhost-vdpa-pci` из QEMU — предпочтительный путь;
@@ -57,8 +59,22 @@
 
 ```sh
 cd sds-nbd && GOWORK=off GOOS=linux GOARCH=amd64 CGO_ENABLED=0 \
-  go build -o sdsd ./cmd/sdsd
+  go build -o unistord ./cmd/unistord
 ```
 
 Требования хоста: ядро с `CONFIG_VDUSE` (`modprobe vduse virtio_vdpa vdpa`),
 `/dev/vduse` доступен рантайму (юнит выдаёт права через `DeviceAllow`).
+
+Подключение тома как диска QEMU (после `POST /v1/exports` с `type=vduse`):
+
+```sh
+vdpa dev add name <devname> mgmtdev vduse
+vdpa -j dev show <devname>                       # minor чардева vhost_vdpa
+mknod /dev/vhost-vdpa-<minor> c 10 <minor>       # если udev не создал
+qemu-system-x86_64 ... \
+  -device virtio-iommu-pci \
+  -device vhost-vdpa-device-pci,vhostdev=/dev/vhost-vdpa-<minor>,bootindex=N
+```
+
+(создание vDPA-устройства и mknod делает `storageagent` клетки; блок приведён
+для ручного воспроизведения).

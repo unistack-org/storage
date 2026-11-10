@@ -127,7 +127,15 @@ func (a *adminAPI) startImportURL(w http.ResponseWriter, r *http.Request, name s
 		return
 	}
 	async := req.Async == nil || *req.Async
-	volume, err := a.openAdmin(r.Context(), name)
+	// Deliberately not openAdmin: an import must not saturate the OSDs,
+	// so the ingest is throttled by the volume's own QoS class
+	// (OpenVolume resolves it and the meta watch keeps it live). A
+	// volume without a class imports at full speed.
+	if _, err := a.cl.Refresh(r.Context()); err != nil {
+		jsonError(w, http.StatusServiceUnavailable, "placement: %v", err)
+		return
+	}
+	volume, err := a.cl.OpenVolume(r.Context(), name)
 	if err != nil {
 		if errors.Is(err, meta.ErrNotFound) {
 			jsonError(w, http.StatusNotFound, "volume %q not found", name)

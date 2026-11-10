@@ -34,17 +34,21 @@ type vduseDevice struct {
 // On the host the kernel device is attached with:
 //
 //	modprobe vdpa vduse virtio_vdpa
-//	vdpa dev add name <devname> mgmtdev vduse     -> /dev/vdX
+//	vdpa dev add name <devname> mgmtdev vduse   -> vdpa bus device
+//	vdpa -j dev show <devname>                  -> "vhost_vdpa" chardev minor
+//	mknod /dev/vhost-vdpa-<minor> c 10 <minor>  (if udev has not made it)
 //
 // and a VM uses it as a virtio-blk disk:
 //
-//	-device vhost-vdpa-device-pci,vhostdev=/dev/vdX,bus=pci.0,addr=0x5
+//	-device vhost-vdpa-device-pci,vhostdev=/dev/vhost-vdpa-<minor>,bus=pci.0,addr=0x5
 //
-// (the vhost-vdpa driver binds to the vduse bus device; QEMU 9+ speaks
-// to /dev/vdX directly — there is no -chardev vdpa). A read-only
-// device advertises VIRTIO_BLK_F_RO and refuses writes in the data
-// path; write-bearing guests need a vIOMMU (virtio-iommu/intel-iommu)
-// in front of the device for the virtio-dma mappings.
+// (the vhost-vdpa driver binds to the vduse bus device and exposes a
+// /dev/vhost-vdpa-N character device — that node, not a /dev/vdX block
+// device, is what QEMU's vhostdev property takes; there is no -chardev
+// vdpa). A read-only device advertises VIRTIO_BLK_F_RO and refuses
+// writes in the data path; write-bearing guests need a vIOMMU
+// (virtio-iommu/intel-iommu) in front of the device for the
+// virtio-dma mappings.
 type vduseManager struct {
 	logger *log.Logger
 	flags  vduseFlags
@@ -111,7 +115,10 @@ func (m *vduseManager) add(volume, devname string, cl *client.Cluster, spec meta
 	if err != nil {
 		return false, err
 	}
-	vol.SetQoS(meta.VolumeSpec{}) // the export class is not tenant-limited
+	// No SetQoS reset here: OpenVolume resolved the volume's QoS class
+	// and the meta watch keeps it live, so the guest's throttle is the
+	// SDS-side QoS class (ADR-059: for vduse the throttle is delegated
+	// to SDS, the QEMU-side cap does not apply).
 	if vol.Size() != spec.Size {
 		// The record was re-read between the caller's GetVolume and the
 		// open (a resize landed); use the live size.
