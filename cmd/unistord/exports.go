@@ -16,6 +16,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/unistack-org/storage/pkg/client"
 	"github.com/unistack-org/storage/pkg/meta"
@@ -196,6 +197,7 @@ func (a *adminAPI) handleAddExport(w http.ResponseWriter, r *http.Request) {
 			a.exportError(w, req.Volume, err)
 			return
 		}
+		a.persistExport("nbd", req.Volume, req.Volume, req.ReadOnly)
 		if created {
 			a.logger.Printf("admin: exported volume %q over nbd (%s, ro=%v)", req.Volume, humanSize(info.Size), info.ReadOnly)
 			writeJSON(w, http.StatusCreated, info)
@@ -234,6 +236,7 @@ func (a *adminAPI) handleAddExport(w http.ResponseWriter, r *http.Request) {
 			a.exportError(w, req.DevName, err)
 			return
 		}
+		a.persistExport("vduse", req.DevName, req.Volume, req.ReadOnly)
 		code := http.StatusOK
 		if created {
 			code = http.StatusCreated
@@ -273,6 +276,7 @@ func (a *adminAPI) handleAddExport(w http.ResponseWriter, r *http.Request) {
 			a.exportError(w, name, err)
 			return
 		}
+		a.persistExport("vub", info.Name, req.Volume, req.ReadOnly)
 		code := http.StatusOK
 		if created {
 			code = http.StatusCreated
@@ -303,6 +307,7 @@ func (a *adminAPI) handleDeleteExport(w http.ResponseWriter, r *http.Request) {
 			a.exportError(w, name, err)
 			return
 		}
+		a.forgetExport("nbd", name)
 		a.logger.Printf("admin: removed nbd export %q", name)
 		writeJSON(w, http.StatusOK, map[string]any{"type": "nbd", "name": name, "removed": true})
 	case "vduse":
@@ -310,6 +315,7 @@ func (a *adminAPI) handleDeleteExport(w http.ResponseWriter, r *http.Request) {
 			a.exportError(w, name, err)
 			return
 		}
+		a.forgetExport("vduse", name)
 		a.logger.Printf("admin: removed vduse device %q", name)
 		writeJSON(w, http.StatusOK, map[string]any{"type": "vduse", "name": name, "removed": true})
 	case "vub":
@@ -321,10 +327,118 @@ func (a *adminAPI) handleDeleteExport(w http.ResponseWriter, r *http.Request) {
 			a.exportError(w, name, err)
 			return
 		}
+		a.forgetExport("vub", name)
 		a.logger.Printf("admin: removed vub export %q", name)
 		writeJSON(w, http.StatusOK, map[string]any{"type": "vub", "name": name, "removed": true})
 	default:
 		jsonError(w, http.StatusBadRequest, "type must be nbd, vduse or vub")
+	}
+}
+
+// ---------- durable export records (gap: restart survival) ----------
+
+// persistExport records a live export in meta so a daemon restart can
+// replay it (attach is not lost when unistord restarts under a running
+// VM). The record is a reconstruction hint, not the truth: failures are
+// logged, never fatal to the live export the caller just created.
+func (a *adminAPI) persistExport(typ, name, volume string, readOnly bool) {
+	_, err := meta.PutExportRecord(context.Background(), a.ms, meta.ExportRecord{
+		Type: typ, Name: name, Volume: volume, ReadOnly: readOnly,
+		CreatedAt: time.Now().Unix(),
+	})
+	if err != nil && !meta.IsReadOnly(err) {
+		a.logger.Printf("admin: persist export %s:%s: %v", typ, name, err)
+	}
+}
+
+// forgetExport drops the record; a missing record is fine.
+func (a *adminAPI) forgetExport(typ, name string) {
+	if err := meta.DeleteExportRecord(context.Background(), a.ms, typ, name); err != nil && !meta.IsReadOnly(err) && !errors.Is(err, meta.ErrNotFound) {
+		a.logger.Printf("admin: forget export %s:%s: %v", typ, name, err)
+	}
+}
+
+// replayExports re-creates the recorded exports after a restart. It is
+// best-effort and idempotent (add* paths return created=false when the
+// export is already live, e.g. from a -export boot spec): NBD waits for
+// the server to listen, VDUSE and VUB run right away. A volume that is
+// gone (deleted while the daemon was down) drops its record.
+func (a *adminAPI) replayExports(ctx context.Context) {
+	if a.exports == nil || a.ms == nil {
+		return
+	}
+	recs, err := meta.ListExportRecords(ctx, a.ms)
+	if err != nil {
+		a.logger.Printf("admin: export replay: list: %v", err)
+		return
+	}
+	if len(recs) == 0 {
+		return
+	}
+	// NBD exports need the listening server; serve() binds it after
+	// the admin starts, so wait (bounded) for it.
+	nbdReady := make(chan struct{})
+	go func() {
+		for i := 0; i < 600; i++ {
+			if _, err := a.exports.liveNBD(); err == nil {
+				close(nbdReady)
+				return
+			}
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(100 * time.Millisecond):
+			}
+		}
+	}()
+	for _, rec := range recs {
+		if ctx.Err() != nil {
+			return
+		}
+		spec, err := meta.GetVolume(ctx, a.ms, rec.Volume)
+		if errors.Is(err, meta.ErrNotFound) {
+			a.logger.Printf("admin: export replay: volume %q gone, dropping %s:%s", rec.Volume, rec.Type, rec.Name)
+			a.forgetExport(rec.Type, rec.Name)
+			continue
+		}
+		if err != nil {
+			a.logger.Printf("admin: export replay: volume %q: %v", rec.Volume, err)
+			continue
+		}
+		switch rec.Type {
+		case "nbd":
+			select {
+			case <-nbdReady:
+			case <-ctx.Done():
+				return
+			}
+			_, created, err := a.exports.addNBD(rec.Name, rec.ReadOnly)
+			if err != nil {
+				a.logger.Printf("admin: export replay: nbd %q: %v", rec.Name, err)
+			} else if created {
+				a.logger.Printf("admin: export replay: nbd %q restored (ro=%v)", rec.Name, rec.ReadOnly)
+			}
+		case "vduse":
+			if a.exports.vduse == nil {
+				continue
+			}
+			created, err := a.exports.vduse.add(rec.Volume, rec.Name, a.cl, spec, rec.ReadOnly)
+			if err != nil {
+				a.logger.Printf("admin: export replay: vduse %q: %v", rec.Name, err)
+			} else if created {
+				a.logger.Printf("admin: export replay: vduse %q -> %q restored (ro=%v)", rec.Name, rec.Volume, rec.ReadOnly)
+			}
+		case "vub":
+			if a.exports.vub == nil {
+				continue
+			}
+			_, created, err := a.exports.vub.add(rec.Volume, rec.Name, a.cl, spec, rec.ReadOnly)
+			if err != nil {
+				a.logger.Printf("admin: export replay: vub %q: %v", rec.Name, err)
+			} else if created {
+				a.logger.Printf("admin: export replay: vub %q -> %q restored (ro=%v)", rec.Name, rec.Volume, rec.ReadOnly)
+			}
+		}
 	}
 }
 

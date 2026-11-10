@@ -437,6 +437,11 @@ func main() {
 			// registry (nil-safe); the admin itself never serves them.
 			admin.recoveryRecord = mreg.recoveryRecorder()
 			go admin.serve(ctx)
+			// Restart survival: re-create runtime exports recorded in
+			// meta (each add path is idempotent against -export boot
+			// specs) and resume ingest jobs this daemon owned.
+			go admin.replayExports(ctx)
+			go admin.resumeJobs(ctx)
 		}
 		if !witness {
 			var err error

@@ -40,6 +40,8 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -51,7 +53,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/unistack-org/storage/crushmap"
+	"github.com/unistack-org/storage/crush"
 	"github.com/unistack-org/storage/internal/buildinfo"
 	"github.com/unistack-org/storage/pkg/client"
 	"github.com/unistack-org/storage/pkg/meta"
@@ -283,12 +285,14 @@ func volCmd(ctx context.Context, cl *client.Cluster, ms meta.Store, args []strin
 	case "import":
 		fs := flag.NewFlagSet("vol import", flag.ExitOnError)
 		offset := fs.Uint64("offset", 0, "byte offset inside the volume")
+		size := fs.Int64("size", 0, "expected input size in bytes (0 = take the whole source)")
+		sum := fs.String("sha256", "", "expected sha256 hex digest of the input")
 		mustParse(fs, rest)
 		if fs.NArg() != 2 {
 			fs.Usage()
 			return errors.New(`vol import: <name> <file|http(s)://url>`)
 		}
-		return volImport(ctx, cl, fs.Arg(0), fs.Arg(1), *offset)
+		return volImport(ctx, cl, fs.Arg(0), fs.Arg(1), *offset, *size, *sum)
 
 	case "export":
 		if len(rest) != 2 {
@@ -471,7 +475,12 @@ func volSnap(ctx context.Context, cl *client.Cluster, args []string) error {
 	}
 }
 
-func volImport(ctx context.Context, cl *client.Cluster, name, src string, offset uint64) error {
+// volImport streams a local file or HTTP(S) URL into a volume. The
+// byte accounting is strict: a declared size (-size, or the server's
+// Content-Length for HTTP) that the stream ends short of is an error,
+// and -sha256 is verified over exactly the bytes written, so a torn
+// transfer can never pass as a finished import.
+func volImport(ctx context.Context, cl *client.Cluster, name, src string, offset uint64, size int64, want string) error {
 	v, err := cl.OpenVolume(ctx, name)
 	if err != nil {
 		return err
@@ -480,7 +489,19 @@ func volImport(ctx context.Context, cl *client.Cluster, name, src string, offset
 	if offset%512 != 0 || offset > v.Size() {
 		return fmt.Errorf("import: offset %d must be 512-aligned and within the volume (%s)", offset, humanSize(v.Size()))
 	}
+	if size < 0 {
+		return fmt.Errorf("import: size must not be negative")
+	}
+	if size > 0 && int64(v.Size())-int64(offset) < size {
+		return fmt.Errorf("import: volume has %s at offset %d, need %s", humanSize(v.Size()-offset), offset, humanSize(uint64(size)))
+	}
+	if want != "" {
+		if _, err := hex.DecodeString(want); err != nil || len(want) != 64 {
+			return fmt.Errorf("import: -sha256 must be 64 hex digits")
+		}
+	}
 	var r io.Reader
+	var expected int64 // declared input size (0 = unbounded: EOF ends it)
 	if strings.HasPrefix(src, "http://") || strings.HasPrefix(src, "https://") {
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, src, nil)
 		if err != nil {
@@ -495,18 +516,40 @@ func volImport(ctx context.Context, cl *client.Cluster, name, src string, offset
 			return fmt.Errorf("import: fetch %s: HTTP %s", src, resp.Status)
 		}
 		r = resp.Body
+		if size == 0 && resp.ContentLength > 0 {
+			expected = resp.ContentLength
+		}
 	} else {
 		f, err := os.Open(src)
 		if err != nil {
 			return err
 		}
 		defer f.Close()
+		if size == 0 {
+			if fi, serr := f.Stat(); serr == nil && !fi.IsDir() {
+				expected = fi.Size()
+			}
+		}
 		r = f
 	}
+	if size > 0 {
+		expected = size
+	}
+	if expected > 0 && int64(v.Size())-int64(offset) < expected {
+		return fmt.Errorf("import: declared %s does not fit (volume has %s at offset %d)",
+			humanSize(uint64(expected)), humanSize(v.Size()-offset), offset)
+	}
 	fmt.Fprintf(os.Stderr, "import: streaming %s -> volume %q\n", src, name)
+	var hr io.Writer
+	hasher := sha256.New()
+	if want != "" {
+		hr = hasher
+	}
 	buf := make([]byte, chunk)
 	var total uint64
 	for {
+		// Read at most the declared remainder so the digest covers
+		// exactly the declared input.
 		n, err := io.ReadFull(r, buf)
 		if n > 0 {
 			if offset+uint64(n) > v.Size() {
@@ -515,6 +558,11 @@ func volImport(ctx context.Context, cl *client.Cluster, name, src string, offset
 			if _, werr := v.WriteAt(ctx, buf[:n], offset); werr != nil {
 				return fmt.Errorf("import: write at %d: %w", offset, werr)
 			}
+			if hr != nil {
+				if _, herr := hr.Write(buf[:n]); herr != nil {
+					return fmt.Errorf("import: hash: %w", herr)
+				}
+			}
 			offset += uint64(n)
 			total += uint64(n)
 			if total%(64<<20) < chunk { // progress every 64 MiB
@@ -522,10 +570,24 @@ func volImport(ctx context.Context, cl *client.Cluster, name, src string, offset
 			}
 		}
 		if err == io.EOF || err == io.ErrUnexpectedEOF {
+			// A mid-chunk break that did land data at a declared
+			// size that is not met means the transfer ended short.
+			if expected > 0 && int64(total) < expected {
+				return fmt.Errorf("import: stream ended at %s of expected %s", humanSize(total), humanSize(uint64(expected)))
+			}
 			break
 		}
 		if err != nil {
 			return fmt.Errorf("import: read: %w", err)
+		}
+	}
+	if expected > 0 && int64(total) > expected {
+		return fmt.Errorf("import: source sent %s, more than the declared %s", humanSize(total), humanSize(uint64(expected)))
+	}
+	if want != "" {
+		got := hex.EncodeToString(hasher.Sum(nil))
+		if got != strings.ToLower(want) {
+			return fmt.Errorf("import: sha256 mismatch: input is %s", got)
 		}
 	}
 	if total%chunk != 0 {
@@ -946,9 +1008,9 @@ func mapCmd(ctx context.Context, cl *client.Cluster, ms meta.Store, args []strin
 	}
 }
 
-// formatMapVerdict печатает вердикт crushmap-валидатора.
-func formatMapVerdict(r *crushmap.CheckResult) string {
-	return crushmap.FormatCheckResult(r)
+// formatMapVerdict печатает вердикт crush-валидатора.
+func formatMapVerdict(r *crush.CheckResult) string {
+	return crush.FormatCheckResult(r)
 }
 
 func mapLookupErr(err error) error {
