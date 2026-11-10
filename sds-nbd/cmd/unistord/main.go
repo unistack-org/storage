@@ -474,6 +474,7 @@ func main() {
 			Logger:            logger,
 			EnableTrim:        *trim,
 			EnableWriteZeroes: *writeZeroes,
+			TLSServerConfig:   tlsServer,
 		}, es)
 		return
 	}
@@ -534,6 +535,7 @@ func main() {
 		Logger:            logger,
 		EnableTrim:        *trim,
 		EnableWriteZeroes: *writeZeroes,
+		TLSServerConfig:   tlsServer,
 	}, es)
 }
 

@@ -200,4 +200,47 @@ func (b *StoreBackend) punch(off, length int64) error {
 	return nil
 }
 
+// BlockStatus answers base:allocation at object granularity: an object
+// whose file exists (or whose data is still in the journal overlay) is
+// reported fully allocated; a thin object that has never been written is
+// a hole. Sub-object holes inside an existing file are not exposed —
+// allocation is reported conservatively as data.
+func (b *StoreBackend) BlockStatus(off int64, length uint32) ([]Extent, error) {
+	if off < 0 || uint64(off) >= b.size.Load() || length == 0 {
+		return nil, io.EOF
+	}
+	if uint64(off)+uint64(length) > b.size.Load() {
+		length = uint32(b.size.Load() - uint64(off))
+	}
+	var ext []Extent
+	pos := off
+	remaining := int64(length)
+	for remaining > 0 {
+		idx, inObj := object.Split(uint64(pos))
+		n := remaining
+		if room := int64(object.Size - inObj); n > room {
+			n = room
+		}
+		present, pending, err := b.st.ObjectState(object.OID(idx + 1))
+		if err != nil {
+			return nil, err
+		}
+		var flags uint32
+		if !present && !pending {
+			flags = nbdStateHole | nbdStateZero
+		}
+		// Merge with the previous extent when the flags match, keeping
+		// replies compact (QEMU caps them).
+		if m := len(ext); m > 0 && ext[m-1].Flags == flags {
+			ext[m-1].Length += uint32(n)
+		} else {
+			ext = append(ext, Extent{Length: uint32(n), Flags: flags})
+		}
+		pos += n
+		remaining -= n
+	}
+	return ext, nil
+}
+
 var _ Backend = (*StoreBackend)(nil)
+var _ StatusReporter = (*StoreBackend)(nil)

@@ -307,6 +307,55 @@ func (v *Volume) Recover(ctx context.Context, rep *RecoveryReport, opts Recovery
 	return st, nil
 }
 
+// ObjectPresent reports whether object index of the volume occupies space
+// on any replica: it stats the placement row directly (like RecoveryCheck,
+// bypassing the quorum rules of targets()) and returns present=true when
+// at least one answering replica has the object. A thin object (absent on
+// every answering replica) reads as zeroes, so present=false is a hole.
+// It is the base:allocation primitive behind NBD BLOCK_STATUS over
+// clustered volumes; granularity is one object (4 MiB).
+//
+// If no replica answers (fully down row), an error is returned: the
+// allocation state is unknown, which must not be reported as a hole.
+func (v *Volume) ObjectPresent(ctx context.Context, index uint64) (bool, error) {
+	snap, err := v.cluster.Refresh(ctx)
+	if err != nil {
+		return false, fmt.Errorf("client: object present %q/%d: %w", v.spec.Name, index, err)
+	}
+	oid, ok := v.oid(index)
+	if !ok {
+		return false, fmt.Errorf("client: object present %q/%d: index outside volume", v.spec.Name, index)
+	}
+	epoch := v.cluster.epochSnapshot()
+	scratch := make([]int32, 0, maxReplicas)
+	row := v.rowFor(snap, index, scratch)
+	answered := false
+	for _, id := range row {
+		ref, ok := snap.LookupRef(id)
+		if !ok {
+			continue
+		}
+		pp, err := v.cluster.pool(id, ref.Addr)
+		if err != nil {
+			return false, err
+		}
+		pp.SetEpoch(epoch)
+		_, present, err := pp.Stat(ctx, uint64(oid))
+		if err != nil {
+			continue // this replica is down: try the next one
+		}
+		answered = true
+		if present {
+			return true, nil
+		}
+	}
+	// Distinguish "every replica answered: thin" from "nobody answered".
+	if !answered && len(row) > 0 {
+		return false, fmt.Errorf("client: object present %q/%d: no replica answered", v.spec.Name, index)
+	}
+	return false, nil
+}
+
 // rowFor is targets() without the min_size quorum rule: recovery must
 // classify replicas on degraded volumes, where targets() (rightly)
 // refuses to serve. Negative row entries (CRUSH-out devices) are

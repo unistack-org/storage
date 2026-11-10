@@ -280,7 +280,22 @@ func (m *clusterMetrics) trackExport(name string, vol *client.Volume, b nbd.Back
 		m.exports = map[string]*client.Volume{}
 	}
 	m.exports[name] = vol
+	if _, ok := b.(nbd.StatusReporter); ok {
+		return &metricsStatus{metricsBackend{b: b, m: m, name: name}}
+	}
 	return &metricsBackend{b: b, m: m, name: name}
+}
+
+// metricsStatus mirrors the wrapped backend's StatusReporter capability
+// (the NBD server detects base:allocation via type assertion, which an
+// explicit delegating wrapper hides). Allocation queries are metadata:
+// they pass through without per-request counters.
+type metricsStatus struct {
+	metricsBackend
+}
+
+func (ms *metricsStatus) BlockStatus(off int64, length uint32) ([]nbd.Extent, error) {
+	return ms.b.(nbd.StatusReporter).BlockStatus(off, length)
 }
 
 // metricsBackend is the instrumented nbd.Backend wrapper: one label

@@ -109,18 +109,34 @@ QEMU-диск с ISO.
 - Реальный гость: Alpine aarch64 стартует, `nvme nvme0: pci function ...`,
   `/dev/nvme0n1` 1 GiB; mkfs.ext4 + mount + запись файла; magic `53 EF`
   (ext4 superblock) и содержимое файла видны в backing-файле на хосте.
+- Живой кластерный экспорт (unistord + 3 OSD): LIST/SET meta-context,
+  BLOCK_STATUS (hole→mapped после write, REQ_ONE, EINVAL без SET), CACHE
+  ACK, PEEK_EXPORT, START_TLS ERR_POLICY без сертификатов — зелёный
+  e2e-протокол-пробник поверх TCP.
 
 ## Реализация протокола
 
 - Handshake: **18 байт** — u64 `NBDMAGIC` + u64 `IHAVEOPT` + u16 флагов
   (FIXED_NEWSTYLE, NO_ZEROES). Старый 10-байтовый hello QEMU 11 не читает.
-- Опции: EXPORT_NAME (legacy), ABORT, LIST, INFO, GO, STRUCTURED_REPLY;
-  LIST_META/SET_META/STARTTLS/EXTENDED_HEADERS — вежливый отказ (QEMU
-  корректно деградирует).
+- Опции: EXPORT_NAME (legacy), ABORT, LIST, INFO, GO, STRUCTURED_REPLY,
+  LIST_META_CONTEXT, SET_META_CONTEXT, PEEK_EXPORT (инфо об экспорте без
+  занятия слота: INFO+ACK, для несуществующего — ERR_EXPORT_NOT_FOUND);
+  START_TLS — принимается при настроенных `-tls-*` флагах (тот же
+  сертификат, что и у control-plane; после ACK соединение переводится в TLS
+  и negotiation сбрасывается), без них — вежливый ERR_POLICY, соединение
+  остаётся usable. EXTENDED_HEADERS — вежливый отказ (QEMU корректно
+  деградирует).
 - Transmission: READ, WRITE (+FUA→fsync), FLUSH, DISC; TRIM/WRITE_ZEROES —
   при включённых флагах (Linux: `fallocate punches`, macOS: `F_PUNCHHOLE`;
-  на прочих ОС флаги выключают — zero-fill). BLOCK_STATUS — отказ
-  (meta-контекстов нет).
+  на прочих ОС флаги выключают — zero-fill); CACHE — no-op ACK (флаг
+  SEND_CACHE в GO advertised всегда).
+- BLOCK_STATUS + meta-контекст `base:allocation` (NBD_OPT_SET_META_CONTEXT):
+  файл-бэкенд — точная карта дыр на Linux (SEEK_DATA/SEEK_HOLE); на прочих
+  ОС (включая macOS, где APFS-фейлконтролы сломаны) консервативно «всё
+  выделено»; кластерный том —
+  гранулярность объекта 4 MiB по `ObjectPresent` (объект есть хотя бы на
+  одной реплике → MAPPED, тонкий том → HOLE|ZERO). Без выбранного
+  контекста — structured EINVAL, как требует спека.
 - Все ответы передачи учитывают согласованный формат: после
   STRUCTURED_REPLY **каждый** ответ (включая WRITE/FLUSH/TRIM и ошибки)
   идёт structured-чанками; simple-ответ на WRITE QEMU считает протокольной
@@ -131,8 +147,8 @@ QEMU-диск с ISO.
 
 ## Ограничения MVP и путь дальше
 
-- Один файл-бэкенд на экспорт; репликация/EC появятся с интеграцией в
-  `storage/` (OSD-слой).
+- Бэкенды: файл, `Store` (локальный OSD) и кластерный том (`-cluster`,
+  клиент `pkg/client`); репликация/EC — за счёт кластера.
 - NVMe-эмуляция QEMU даёт «честный» `/dev/nvme*` в госте, но с лишними
   копированиями; целевой путь фазы 4b — vhost-user / vfio-user (см.
   `todos/roadmap.md`).

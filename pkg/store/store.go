@@ -663,6 +663,31 @@ func (s *Store) Stat(oid object.OID) (uint64, error) {
 	return uint64(fi.Size()), nil
 }
 
+// ObjectState reports, for NBD base:allocation queries, whether an object
+// occupies space. present is true when the object file exists on disk.
+// pending is true when the journal holds un-applied writes for the object
+// (so the object reads as data even though its file is not yet created).
+// A thin (never-written) object in writeback mode is neither: it reads as
+// zeroes, i.e. a hole. statErr carries the os.Stat error when present is
+// false and the stat failed for a reason other than "not exist".
+func (s *Store) ObjectState(oid object.OID) (present, pending bool, statErr error) {
+	if _, err := s.Stat(oid); err == nil {
+		return true, false, nil
+	} else if !errors.Is(err, fs.ErrNotExist) {
+		return false, false, err
+	}
+	if s.jrn != nil {
+		for _, r := range s.overlayFor(oid) {
+			// A sparse-zeroes record leaves the object a hole when
+			// applied; only writes and full zero-fills make it data.
+			if r.data != nil || (r.n > 0 && !r.sparse) {
+				return false, true, nil
+			}
+		}
+	}
+	return false, false, nil
+}
+
 // StatInfo reports both the apparent size and the physically allocated
 // bytes (st_blocks*512) of an existing object. Vacuum uses the pair to
 // tell a punched (freed) object from one that still occupies blocks:

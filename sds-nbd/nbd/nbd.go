@@ -43,7 +43,7 @@ const (
 // ROTATIONAL=bit4 SEND_TRIM=bit5 SEND_WRITE_ZEROES=bit6 SEND_DF=bit7
 // CAN_MULTI_CONN=bit8.
 const (
-	transmissionHasFlags        = 1 << 0 // mandatory, bit is always set
+	transmissionHasFlags        = 1 << 0  // mandatory, bit is always set
 	transmissionReadOnly        = 1 << 1
 	transmissionSendFlush       = 1 << 2
 	transmissionSendFUA         = 1 << 3
@@ -52,6 +52,7 @@ const (
 	transmissionSendWriteZeroes = 1 << 6
 	transmissionSendDF          = 1 << 7
 	transmissionCanMultiConn    = 1 << 8
+	transmissionSendCache       = 1 << 14 // bit 10, defined by the CACHE extension
 )
 
 // Option requests (u32).
@@ -119,6 +120,7 @@ const (
 	CmdDisc        = 2
 	CmdFlush       = 3
 	CmdTrim        = 4
+	CmdCache       = 5 // cache/preflush hint (CACHE extension)
 	CmdWriteZeroes = 6
 	CmdBlockStatus = 7
 )
@@ -154,3 +156,17 @@ const (
 // issue requests up to 2 MiB, so 4 MiB leaves headroom and avoids EINVAL
 // replies to large guest I/O.
 const MaxPayload = 4 << 20
+
+// Metadata contexts. The server supports the single standardized context of
+// the base namespace: "base:allocation", which feeds NBD_CMD_BLOCK_STATUS.
+const (
+	metaBaseAllocation = "base:allocation"
+)
+
+// Extent flags inside an NBD_CMD_BLOCK_STATUS reply (u32 per the spec):
+// bit 0 NBD_STATE_HOLE (reads return zeroes / region is unwritten),
+// bit 1 NBD_STATE_ZERO (reads return zeroes).
+const (
+	nbdStateHole = 1 << 0
+	nbdStateZero = 1 << 1
+)

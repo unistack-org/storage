@@ -31,6 +31,27 @@ type Backend interface {
 	Close() error
 }
 
+// Extent is one entry of an NBD_CMD_BLOCK_STATUS reply: Length bytes
+// starting at the queried position carrying Flags (nbdStateHole /
+// nbdStateZero bits). Extents are contiguous and their lengths sum to the
+// requested range.
+type Extent struct {
+	Length uint32
+	Flags  uint32
+}
+
+// StatusReporter is an optional Backend capability: the export can answer
+// allocation queries (NBD_CMD_BLOCK_STATUS / base:allocation metadata
+// context). The server advertises the context only when the export backend
+// implements this interface; backends that answer from a cheap
+// presence/absence model (object stores) are good candidates, backends with
+// no hole information at all (plain buffers) simply don't implement it.
+type StatusReporter interface {
+	// BlockStatus reports allocation of [off, off+length) as contiguous
+	// extents whose flags use the nbdStateHole / nbdStateZero bits.
+	BlockStatus(off int64, length uint32) ([]Extent, error)
+}
+
 // FileBackend is a sparse-file Backend backed by a single regular file.
 // It is the MVP storage target and the reference implementation for
 // higher-level backends (CRUSH-mapped volumes, journal, etc.).

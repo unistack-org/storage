@@ -3,6 +3,7 @@ package nbd
 import (
 	"bufio"
 	"context"
+	"crypto/tls"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -54,6 +55,12 @@ type ServerOptions struct {
 	// requests out of order, so a slow read no longer blocks the next
 	// request on the same connection. Zero means the default (32).
 	MaxReadWorkers int
+	// TLSServerConfig enables NBD_OPT_START_TLS: when set, clients may
+	// upgrade the connection to TLS during option negotiation. Nil
+	// (default) replies NBD_REP_ERR_POLICY to START_TLS. The daemon
+	// passes the same material it uses for the REST/gRPC planes
+	// (pkg/tlsconf), so mutual TLS applies on the NBD port too.
+	TLSServerConfig *tls.Config
 }
 
 // Server is a concurrent NBD server serving a set of named exports over
@@ -269,8 +276,18 @@ type connState struct {
 	noZeroes   bool
 	structured bool // NBD_OPT_STRUCTURED_REPLY negotiated
 	multiCon   bool // CAN_MULTI_CONN advertised
-	readOnly   bool
-	backend    Backend
+	tlsOn      bool // NBD_OPT_START_TLS completed
+	// metaCtxs lists the metadata contexts selected with
+	// NBD_OPT_SET_META_CONTEXT for this connection (by position: the
+	// context ID a client sees is its index). Only base:allocation is
+	// ever selectable, so the slice is empty or one element.
+	metaCtxs []string
+	// metaExport is the export name the current metaCtxs selection
+	// belongs to; BLOCK_STATUS is only legal when it matches the
+	// export used to enter transmission.
+	metaExport string
+	readOnly bool
+	backend  Backend
 	// size is the cached export size for range checks. It is atomic
 	// because an online grow (backend.Size() growing under a live
 	// transmission, e.g. a volume resized via unistorctl) must be
@@ -388,9 +405,21 @@ func (s *Server) handleConn(conn net.Conn) {
 	if tc, ok := conn.(*net.TCPConn); ok {
 		tc.SetNoDelay(true)
 	}
-	if err := s.handshake(cs); err != nil {
-		s.logf("nbd: handshake with %s failed: %v", conn.RemoteAddr(), err)
-		return
+	// A completed START_TLS aborts the current negotiation with
+	// errTLSUpgraded and resets state; the client then redoes the whole
+	// newstyle handshake over the encrypted connection. A second
+	// START_TLS is refused (tlsOn), so at most one loop occurs.
+	for {
+		err := s.handshake(cs)
+		if errors.Is(err, errTLSUpgraded) {
+			s.logf("nbd: %s START_TLS completed; renegotiating over TLS", conn.RemoteAddr())
+			continue
+		}
+		if err != nil {
+			s.logf("nbd: handshake with %s failed: %v", conn.RemoteAddr(), err)
+			return
+		}
+		break
 	}
 	if cs.exp != nil {
 		defer func() {
@@ -532,21 +561,35 @@ func (s *Server) handshake(cs *connState) error {
 			}
 			cs.structured = true
 		case optStartTLS:
-			if err := s.replyOptionErr(cs, option, repErrPolicy, "TLS not supported"); err != nil {
+			upgraded, err := s.handleStartTLS(cs, option, data)
+			if err != nil {
 				return err
 			}
+			if upgraded {
+				return errTLSUpgraded
+			}
 		case optListMetaContext:
-			// We support no meta contexts; reply with ACK (no REP_META_CONTEXT).
-			if err := s.replyOption(cs, option, repACK, nil); err != nil {
+			if err := s.handleListMetaContext(cs, option, data); err != nil {
 				return err
 			}
 		case optSetMetaContext:
-			// Requesting any context must fail (we have none).
-			if err := s.replyOptionErr(cs, option, repErrInvalid, "no meta contexts"); err != nil {
+			if err := s.handleSetMetaContext(cs, option, data); err != nil {
 				return err
 			}
 		case optPeekExport:
-			if err := s.replyOptionErr(cs, option, repErrUnsup, "not supported"); err != nil {
+			// Withdrawn PEEK_EXPORT extension: request is the raw
+			// export name (no length prefix), reply like NBD_OPT_INFO
+			// (NBD_REP_INFO INFO_EXPORT + ACK) and stay in options
+			// mode. Answering is harmless and lets legacy clients
+			// probe exports.
+			name := string(data)
+			if _, ok := s.getExport(name); !ok {
+				if err := s.replyOptionErr(cs, option, repErrNotFound, fmt.Sprintf("export %q not found", name)); err != nil {
+					return err
+				}
+				continue
+			}
+			if err := s.handleInfo(cs, option, name, nil); err != nil {
 				return err
 			}
 		default:
@@ -714,6 +757,9 @@ func (s *Server) transmissionFlags(cs *connState, e *Export) uint16 {
 	if s.opts.EnableWriteZeroes && !e.ReadOnly {
 		flags |= transmissionSendWriteZeroes
 	}
+	// SEND_CACHE (deprecated in favour of SEND_FLUSH): we accept
+	// NBD_CMD_CACHE as a no-op prefetch hint, so advertise it.
+	flags |= transmissionSendCache
 	if cs.structured {
 		flags |= transmissionSendDF
 	}
@@ -754,6 +800,13 @@ func (s *Server) enterTransmission(cs *connState, e *Export, exportNameStyle boo
 	cs.backend = e.Backend
 	cs.size.Store(e.Backend.Size())
 	cs.readOnly = e.ReadOnly
+	// Meta contexts are scoped to an export: a selection made for a
+	// different export must not authorise BLOCK_STATUS on this one
+	// (START_TLS also clears the selection, so TLS resets it too).
+	if cs.metaExport != e.Name {
+		cs.metaCtxs = nil
+		cs.metaExport = ""
+	}
 	// Count this transmission against the export: RemoveExport refuses
 	// to unregister an export with live transmissions. One reference
 	// per connection (handleInfo may call us for the LIST probe, where
@@ -890,8 +943,27 @@ func (s *Server) transmission(cs *connState) error {
 				return err
 			}
 		case CmdBlockStatus:
-			// We advertise no meta contexts, so per spec we must refuse.
-			if err := s.replyStructuredError(cs, req.handle, ErrEOPNOTSUPP, "no meta contexts"); err != nil {
+			payload, code, msg := s.computeBlockStatus(cs, req)
+			if code != ErrOK {
+				// BLOCK_STATUS replies are always structured (spec).
+				if err := s.replyStructuredError(cs, req.handle, code, msg); err != nil {
+					return err
+				}
+				continue
+			}
+			if err := cs.writeBlockStatusReply(req.handle, payload, ErrOK, ""); err != nil {
+				return err
+			}
+		case CmdCache:
+			// Cache hint: we read straight through the page cache, so
+			// the hint is a no-op. Acknowledge it (SEND_CACHE is
+			// advertised) so clients do not treat it as an error.
+			if req.length != 0 {
+				if err := drain(cs.br, int64(req.length)); err != nil {
+					return err
+				}
+			}
+			if err := s.replyOK(cs, req.handle); err != nil {
 				return err
 			}
 		default:
@@ -1076,7 +1148,19 @@ func (s *Server) transmissionPipelined(cs *connState) error {
 				return cs.writeStructuredReply(req.handle, code, msg, 0, nil)
 			})
 		case CmdBlockStatus:
-			if err := s.replyPipelinedErr(cs, req.handle, ErrEOPNOTSUPP, "no meta contexts"); err != nil {
+			// The status walk can touch many replicas: run it on a
+			// worker so the decode loop keeps reading.
+			s.dispatch(cs, func(cs *connState) error {
+				payload, code, msg := s.computeBlockStatus(cs, req)
+				return cs.writeBlockStatusReply(req.handle, payload, code, msg)
+			})
+		case CmdCache:
+			if req.length != 0 {
+				if err := drain(cs.br, int64(req.length)); err != nil {
+					return err
+				}
+			}
+			if err := s.replyPipelinedReply(cs, req.handle, ErrOK, ""); err != nil {
 				return err
 			}
 		default:

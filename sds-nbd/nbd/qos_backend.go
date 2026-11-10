@@ -28,7 +28,11 @@ func WithQoS(b Backend, limits *qos.Pair) Backend {
 	if !limits.Limited() {
 		return b
 	}
-	return &qosBackend{Backend: b, limits: limits}
+	q := &qosBackend{Backend: b, limits: limits}
+	if _, ok := b.(StatusReporter); ok {
+		return &qosStatus{q}
+	}
+	return q
 }
 
 func (q *qosBackend) ReadAt(p []byte, off int64) (int, error) {
@@ -70,4 +74,16 @@ func (q *qosBackend) Close() error {
 	err := q.Backend.Close()
 	q.limits.Close()
 	return err
+}
+
+// qosStatus is a qosBackend that mirrors the wrapped backend's
+// StatusReporter capability: the server detects base:allocation via a
+// type assertion, which embedding alone does not propagate. Allocation
+// queries are metadata, not data traffic, so they pass unthrottled.
+type qosStatus struct {
+	*qosBackend
+}
+
+func (q *qosStatus) BlockStatus(off int64, length uint32) ([]Extent, error) {
+	return q.Backend.(StatusReporter).BlockStatus(off, length)
 }
