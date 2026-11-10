@@ -126,8 +126,10 @@ func newAdminServer(ms meta.Store, addr string, logger *log.Logger, raftSt *meta
 	mux.HandleFunc("DELETE /v1/volumes/{name}/snapshot/{gen}", a.handleSnapshotDelete)
 	mux.HandleFunc("POST /v1/volumes/{name}/rollback", a.handleRollback)
 	mux.HandleFunc("POST /v1/volumes/{name}/clone", a.handleClone)
+	mux.HandleFunc("PUT /v1/volumes/{name}/flags", a.handleVolumeFlags)
 	mux.HandleFunc("PUT /v1/volumes/{name}/import", a.handleImportBody)
 	mux.HandleFunc("POST /v1/volumes/{name}/import", a.handleImportURL)
+	mux.HandleFunc("POST /v1/volumes/probe", a.handleProbe)
 	mux.HandleFunc("GET /v1/volumes/{name}/export", a.handleExport)
 	mux.HandleFunc("GET /v1/qos/classes", a.handleListClasses)
 	mux.HandleFunc("PUT /v1/qos/classes/{name}", a.handlePutClass)
@@ -971,36 +973,8 @@ func (a *adminAPI) handleDeleteClass(w http.ResponseWriter, r *http.Request) {
 
 // ---------- byte-stream routes ----------
 
-// streamImport writes src into vol from offset and returns the byte
-// count. Shared by the body-import and URL-import handlers.
-func streamImport(ctx context.Context, vol *client.Volume, src io.Reader, offset int64, hash io.Writer) (int64, error) {
-	size := int64(vol.Size())
-	buf := make([]byte, importChunk)
-	total := offset
-	for {
-		n, err := io.ReadFull(src, buf)
-		if n > 0 {
-			if total+int64(n) > size {
-				return total - offset, fmt.Errorf("input exceeds volume size %s at offset %d", humanSize(uint64(size)), offset)
-			}
-			if _, werr := vol.WriteAt(ctx, buf[:n], uint64(total)); werr != nil {
-				return total - offset, fmt.Errorf("write at %d: %w", total, werr)
-			}
-			if hash != nil {
-				if _, herr := hash.Write(buf[:n]); herr != nil {
-					return total - offset, fmt.Errorf("hash: %w", herr)
-				}
-			}
-			total += int64(n)
-		}
-		if err == io.EOF || err == io.ErrUnexpectedEOF {
-			return total - offset, nil
-		}
-		if err != nil {
-			return total - offset, err
-		}
-	}
-}
+// streamImport lives in jobs.go (shared with the URL ingest): it
+// tracks per-stream bytes and refuses a stream that ends short.
 
 func (a *adminAPI) handleImportBody(w http.ResponseWriter, r *http.Request) {
 	name := volumeName(r)
@@ -1028,7 +1002,26 @@ func (a *adminAPI) handleImportBody(w http.ResponseWriter, r *http.Request) {
 	}
 	defer vol.Close()
 	a.logger.Printf("admin: import %q from body at offset %d", name, offset)
-	n, err := streamImport(r.Context(), vol, r.Body, offset, nil)
+	// A body import has no declared size: the request body itself is
+	// the boundary (EOF = done). The per-volume ingest lock guards it
+	// too: a body push and a URL ingest interleaving would corrupt.
+	lockJob := "body:" + a.owner()
+	acquired, cur, lerr := meta.AcquireImportLock(r.Context(), a.ms, name,
+		meta.ImportLock{JobID: lockJob, Owner: a.owner(), Heartbeat: time.Now().Unix()})
+	if lerr != nil && !meta.IsReadOnly(lerr) {
+		jsonError(w, http.StatusInternalServerError, "import lock: %v", lerr)
+		return
+	}
+	if lerr == nil && !acquired && time.Now().Unix()-cur.Heartbeat < meta.ImportStaleSeconds {
+		jsonError(w, http.StatusConflict,
+			"volume %q is already being imported (job %s)", name, cur.JobID)
+		return
+	}
+	var n int64
+	err = streamImport(r.Context(), vol, r.Body, offset, 0, nil, nil, &n)
+	if lerr == nil && acquired {
+		defer func() { _ = meta.ReleaseImportLock(context.Background(), a.ms, name, lockJob) }()
+	}
 	if err != nil {
 		a.logger.Printf("admin: import %q: %v", name, err)
 		jsonError(w, http.StatusInternalServerError, "import: %v", err)
