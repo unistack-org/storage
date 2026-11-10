@@ -477,3 +477,91 @@ device-wide батчинг completions/IRQ, и только затем повт�
 — главный подозреваемый, т.к. MQ показывает упор именно там;
 (2) XROW-репликация (3 копии → 1 запись + 2 лёгких); (3) чистый стенд без
 AI-нагрузок и MCE-шторма.
+
+## 11 ноя: восстановление стенда после reboot + новая деградация
+
+### Полный recipe поднятия стенда после перезагрузки
+
+1. `sudo mount /dev/mapper/vg-sdsdata /mnt/sdsdata` — в fstab его нет,
+   после ребута точка монтирования пустая (данные на месте).
+2. `sudo modprobe vduse && sudo modprobe virtio_vdpa`.
+   **Грабли:** `modprobe vduse` НЕ подтягивает `virtio_vdpa`. Без него
+   `vdpa dev add` проходит, `vdpa dev show` показывает устройство,
+   `/dev/vduse/<name>` создаётся — но `/sys/bus/vdpa/drivers/` пуст и
+   блочного устройства в `/dev` не появляется никогда. Diagnosis:
+   `ls /sys/bus/vdpa/drivers/` (пусто ⇒ не хватает модуля).
+3. Запуск демона из `/mnt/sdsdata/bench`:
+   ```
+   sudo -n setsid env GOMAXPROCS=8 nohup ~/bench/new-sdsd10 \
+     -cluster meta -osd 0@osd0 -osd 1@osd1 -osd 2@osd2 -crushmap map.txt \
+     -epoch 1 -pg-num 64 -replicas 3 -export vol0 -direct -preallocate \
+     -listen 127.0.0.1:10809 -pprof 127.0.0.1:6061 \
+     -vduse vol0=sds-vol2 >> /mnt/sdsdata/sdsd10.log 2>&1 < /dev/null &
+   ```
+   Обязательны `setsid` + `nohup` + `</dev/null`: без перенаправления
+   stdin ssh-сессия не отдаёт управление (демон наследует трубу).
+4. `sudo vdpa dev add name sds-vol2 mgmtdev vduse`.
+5. **Имя блочного устройства после чистого ребута — `/dev/vda`**, не
+   `/dev/vdb` (vdb был в прошлой загрузке из-за уже занятых имён).
+   Все скрипты/замеры, где указан vdb, после ребута слепы: брать имя из
+   `lsblk`/`vdpa dev show`, не хардкодить.
+
+### APST: фикс пережил reboot, деградация вернулась в другой форме
+
+`nvme_core.default_ps_max_latency_us=0` в /proc/cmdline и в BLS,
+`/sys/module/nvme_core/parameters/default_ps_max_latency_us == 0` —
+подтверждено после ребута 11.11. Сырые диски здоровы: nvme0 602K
+randread, nvme1 450K, LV поверх md127 730K sustained 60s (qd32×8),
+ни одного QID-timeout за эти прогоны, SMART/temperatures в норме
+(29 °C), md127 [UU].
+
+Но randread через стек (fio на /dev/vda) даёт 13.8–37.7K IOPS с
+max-clat ровно ~30.0 s (потолок = `opTimeout` в pkg/sdsnet/client.go),
+тогда как средний clat 2–5 ms и вторая копия теста даёт 75K в тех же
+секундах. Т.е. 3 реплики из 300+ дают норму, а отдельные запросы
+зависают на 30 с до client-side дедлайна.
+
+Ключевые наблюдения за 60-секундным прогоном:
+- профиль по секундам: нормальные секунды 70–77K IOPS, провалы в
+  32–37K и в 11–17K; провалы длятся 1–2 с, не 30 с;
+- во время провала демон сидит в 0 % CPU; pprof: 21 worker припаркован
+  в `client.(*Volume).batchRead` (pkg/client/volume_batch.go:305),
+  3 в `runBatchGroup` (:155), 255 queueWorkers в idle — т.е. узкое
+  место НЕ vduse и не CPU, а ожидание ответов от OSD;
+- на OSD-стороне pread в `store.(*Store).ReadAt` (pkg/store/store.go:424)
+  тоже висит;
+- в dmesg по 1–2 события `nvme nvmeX: I/O tag N QID N timeout,
+  completion polled` в минуту на обоих P4510 — одиночный зависший
+  запрос в очереди NVMe-контроллера.
+
+### Что добавлено в конфиг ядра
+
+`nvme_core.io_timeout=5 nvme_core.admin_timeout=5` через grubby (BLS
+проверен), живьём выставлено в sysfs. Смысл: зависший запрос
+переотправляется через 5 с, а не вешает клиента на 30 с.
+**Эффект измерен: не помог** — max-clat остался 30.0 s. Значит 30-се-
+кундный потолок создаёт не NVMe-таймаут, а `opTimeout` клиента: запрос
+ушёл в OSD, OSD не ответил (его pread сидит в ядре), клиент дождался
+собственного дедлайна. sysfs-параметр меняет только поведение
+множителя blk-mq, а не уже ушедший в NVMe-очередь request.
+
+### Диагноз: аппаратный, не программный
+
+`ras-mc-ctl --summary` после ребута: **1 037 223 corrected MCE**
+(bank 27, `status=0xd82000000002080b`, CPU 2, "Power, Interrupts"),
+**153 corrected на DIMM 1:0:1** и **PCIe AER: Receiver Error, Bad TLP**,
+`0:64768 has 37 errors` в disk summary. Это на порядок хуже, чем было
+до ребута (одна L3-серия в ~4 мин). Плюс на хосте два процесса sglang
+по ~95 % CPU. Вывод: стенд деградировал по питанию/памяти/линии PCIe к
+NVMe; одиночные зависающие запросы — следствие, а не причина. Лечится
+железом (переустановка/замена P4510 и DIMM, отключение AI-нагрузки), не
+кодом.
+
+### Рабочее правило замеров на деградировавшем стенде
+
+Медиана по 1-секундным окнам честнее среднего за прогон: прогон с
+30-секундными выбросами даёт «15K IOPS» при реальной производительности
+пути 75K. Замерять: (a) 60 с, (b) `--log_avg_msec=1000`, (c) считать
+медиану и долю секунд ниже 50 % пика; (d) отдельно считать число
+QID-timeout в dmesg за время прогона — это счётчик аппаратных провалов,
+он и есть объяснение просадки.
