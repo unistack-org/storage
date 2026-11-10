@@ -149,10 +149,14 @@ type queueState struct {
 	// of loopback TCP, and doing it serially capped us at ~18K IOPS —
 	// then complete (status + used + IRQ) and release their pins.
 	jobs     chan *job
-	inflight int        // claimed jobs not fully finished
-	cond     *sync.Cond // signals inflight == 0 (guards ctrlMu)
-	ctrlMu   sync.Mutex // guards inflight/cond/closed
-	closed   bool       // Close: dispatcher must not enqueue
+	inflight atomic.Int32 // claimed jobs not fully finished
+	// cond signals inflight == 0. The counter is atomic: completions
+	// only touch ctrlMu/cond when the decrement REACHES zero (the
+	// quiesce wake-up), not on every completion — under load 256
+	// workers used to convoy on this mutex once per request.
+	cond   *sync.Cond // guards the inflight==0 wake-up (guards ctrlMu)
+	ctrlMu sync.Mutex // guards cond/closed
+	closed bool       // Close: dispatcher must not enqueue
 	workers  sync.WaitGroup
 
 	// irqPending coalesces interrupt requests: completions set it, and
@@ -180,6 +184,10 @@ type job struct {
 	refs []*RegionRef
 	ring *SplitRing // ring the request was claimed from (completion target)
 	t0   time.Time  // dispatch time (debug timing only)
+	// evict addrs is the dispatch-time copy of the data-segment
+	// addresses: releaseJob drops all their mappings in one EvictAll
+	// (one table mutation instead of one per segment).
+	evictAddrs []uint64
 }
 
 // queueWorkers is the per-queue worker pool size. A request spends
@@ -229,7 +237,7 @@ func (d *Device) quiesce(q *queueState) {
 		return
 	}
 	q.cond.L.Lock()
-	for q.inflight > 0 {
+	for q.inflight.Load() > 0 {
 		q.cond.Wait()
 	}
 	q.cond.L.Unlock()
@@ -243,19 +251,21 @@ func (d *Device) releaseJob(q *queueState, j *job) {
 		p.Release()
 	}
 	j.refs = nil
-	for _, sg := range j.br.DataSegs {
-		d.iotlb.Evict(sg.Addr, evictMaxSize)
+	if len(j.evictAddrs) > 0 {
+		d.iotlb.EvictAll(j.evictAddrs, evictMaxSize)
+		j.evictAddrs = j.evictAddrs[:0]
 	}
-	q.cond.L.Lock()
-	q.inflight--
-	idle := q.inflight == 0
-	if idle {
+	if q.inflight.Add(-1) == 0 {
+		// Last worker out. Broadcast under ctrlMu so a quiesce that
+		// tested inflight>0 before our decrement cannot miss the
+		// wake-up (it holds ctrlMu until it enters cond.Wait). Only
+		// the transition to zero takes the lock: mid-burst
+		// completions never touch ctrlMu at all.
+		q.cond.L.Lock()
 		q.cond.Broadcast()
-	}
-	q.cond.L.Unlock()
-	if idle {
-		// Last worker out: the burst's completions are all in the used
-		// ring now, so one interrupt covers them.
+		q.cond.L.Unlock()
+		// The burst's completions are all in the used ring now, so
+		// one interrupt covers them.
 		d.flushIRQ(q)
 	}
 }
@@ -279,7 +289,7 @@ func (d *Device) execJob(q *queueState, j *job) {
 		if r := recover(); r != nil {
 			fmt.Fprintf(os.Stderr, "sdsd: vduse %s q%d: guest memory fault in worker (%v) head=%d — completing with I/O error\n",
 				d.name, q.idx, r, j.br.Head)
-			d.faultEvict(j.br.DataSegs)
+			d.faultEvict(j.br.DataSegs) // rare path: per-seg evict is fine
 			complete(StatusIOErr, 0)
 		}
 		d.releaseJob(q, j)
@@ -1235,10 +1245,19 @@ func (d *Device) dispatchLocked(q *queueState, ring *SplitRing) {
 			continue
 		}
 		j := &job{br: br, hdr: hdr, refs: refs, ring: ring, t0: pinStart}
+		// Snapshot the data-segment addresses now: releaseJob drops all
+		// their mappings with a single EvictAll (one table mutation per
+		// request instead of one per segment).
+		if len(br.DataSegs) > 0 {
+			j.evictAddrs = make([]uint64, len(br.DataSegs))
+			for i, sg := range br.DataSegs {
+				j.evictAddrs[i] = sg.Addr
+			}
+		}
 		// inflight accounting must be incremented before the job is
-		// visible to workers (releaseJob decrements): take ctrlMu
-		// first, publish under it, so quiesce can never observe
-		// "inflight==0" with a job still in flight.
+		// visible to workers (releaseJob decrements): publish under
+		// ctrlMu so a concurrent Close (which sets closed, then drains)
+		// can never observe "inflight==0" with a job still in flight.
 		q.ctrlMu.Lock()
 		if q.closed {
 			q.ctrlMu.Unlock()
@@ -1248,7 +1267,7 @@ func (d *Device) dispatchLocked(q *queueState, ring *SplitRing) {
 			d.completeSafe(q, ring, br, StatusIOErr, 0)
 			return
 		}
-		q.inflight++
+		q.inflight.Add(1)
 		q.ctrlMu.Unlock()
 		q.jobs <- j
 	}

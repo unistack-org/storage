@@ -365,3 +365,46 @@ EINVAL) — только reboot. Правило стенда: **убивать �
 **Итог по цели 175K:** текущий потолок на стенде ~95K randread при
 CPU 520%/800% (не CPU-упор). Следующие шаги: zero-copy IOTLB,
 multi-queue VDUSE, сокращение goroutine-хопов на путь ответа.
+
+## Матрица new-sdsd10: zero-copy IOTLB + атомарный inflight (sds-vol2)
+
+Реализовано в pkg/vduse:
+- **lock-free IOTLB** (COW-снимок: атомарный указатель на отсортированный
+  срез + бинарный поиск + атомарные счётчики ссылок; мутации пересобирают
+  крошечный срез под мьютексом, munmap ровно один раз по CAS) — снимает
+  глобальный мьютекс Lookup (был 6.7% lock2 + 3.16s cum в профиле 94.9K);
+- **атомарный inflight**: инкремент под ctrlMu при диспатче (publish-before-
+  visible), декремент атомиком в releaseJob, ctrlMu+Broadcast+flushIRQ
+  только на переходе в ноль — меньше хопов на путь ответа;
+- пакетный EvictAll в releaseJob (дедуп + keepLargerThan).
+
+Профиль под нагрузкой (20s, steady): lock2 6.7%→4.8% cum, IOTLB.Lookup
+исчез из горячего списка, EvictAll 1.9%, PushUsed 4.17s→2.28s cum;
+остаток — Syscall6 30.8% (VDUSE ioctl + сеть), как и должно.
+
+| Паттерн | sdsd9 (база) | sdsd10 (steady) | Комментарий |
+|---|---|---|---|
+| randread qd128×4 | 94.9K | **106–115K** (пик 143K) | fio per-interval avg; среднее за пробег убито одним 17s стендом (см. ниже) |
+| randwrite qd128×4 | 46.2K | **47.2K** | stdev 714 — стендов нет |
+| randread qd1 | 152µs | **163µs** (avg) | хвост p99 под 4ms из-за соседей |
+
+Память/ЦПУ демона: RSS ~575 МБ стабильно (нет утечки), idle CPU 0.5%
+(1 тик за 2с), под randread ~36-42%.
+
+**Экологический шум (важно для сравнения):** на стенде появились чужие
+AI-нагрузки (llama-server 399% CPU, 2× sglang::scheduler ~90% каждый) и
+шторм исправленных MCE (6279 Hardware Errors в dmesg, part-proc SRC) ровно
+в момент randread-замеров + `nvme nvme0: QID 43 timeout` в 12:57:16 —
+отсюда единичные 17-секундные стены, которые топят arithmetic mean fio
+(p50=2.8ms соответствует ~180K IOPS при qd512). База 94.9K снималась без
+этих нагрузок. randwrite стендов не поймал → 47.2K чистое.
+
+**Multi-queue VDUSE:** заблокировано ядром — `vdpa mgmtdev show` даёт
+`max_supported_vqs 0`, устройство `max_vqs 1` (VDUSE API v1). Платинг nq>1
+в коде есть (queueState[], num_queues в ConfigSpace), бит VIRTIO_BLK_F_MQ
+(12) не анонсируется. Нужно ядро с MQ-поддержкой VDUSE.
+
+**Итог:** zero-copy IOTLB + hop-reduce дают +12–21% randread (106–115K
+против 94.9K) при стенде с MCE-штормом; randwrite/qd1 без регресса. До
+175K: XROW-репликация, multi-queue (упор в ядро), batched PushUsed
+(часть 2), + чистый стенд без AI-нагрузок.

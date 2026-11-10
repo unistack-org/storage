@@ -1,6 +1,10 @@
 package vduse
 
-import "testing"
+import (
+	"sync"
+	"testing"
+	"time"
+)
 
 
 func TestIOTLBEvictPinnedDefersMunmap(t *testing.T) {
@@ -85,6 +89,107 @@ func TestIOTLBAddOverlappingPinned(t *testing.T) {
 	ref.Release()
 	if got := tlb.Pinned(0x4000); got != 0 {
 		t.Fatalf("Pinned = %d after Release, want 0", got)
+	}
+	tlb.ReleaseAll()
+}
+
+func TestIOTLBEvictAllBatch(t *testing.T) {
+	var tlb IOTLB
+	mem := func(n int) []byte { return make([]byte, n) }
+	// Three per-request regions and one permanent region that is bigger
+	// than the keep bound.
+	tlb.Add(Region{Start: 0x1000, Last: 0x1FFF, Mem: mem(0x1000)})
+	tlb.Add(Region{Start: 0x2000, Last: 0x2FFF, Mem: mem(0x1000)})
+	tlb.Add(Region{Start: 0x3000, Last: 0x3FFF, Mem: mem(0x1000)})
+	perm := Region{Start: 0x100000, Last: 0x100FFF, Mem: mem(0x2000)} // 8 KiB > bound 4 KiB
+	tlb.Add(perm)
+
+	addrs := []uint64{0x1234, 0x2234, 0x2400 /* same region as 0x2234 */, 0x100010 /* perm */}
+	tlb.EvictAll(addrs, 0x1000)
+
+	for _, a := range []uint64{0x1000, 0x2000} {
+		if _, err := tlb.Lookup(a, 16); err == nil {
+			t.Fatalf("EvictAll left region at %x mapped", a)
+		}
+	}
+	if _, err := tlb.Lookup(0x3000, 16); err != nil {
+		t.Fatalf("EvictAll dropped an untouched region: %v", err)
+	}
+	if _, err := tlb.Lookup(0x100000, 16); err != nil {
+		t.Fatalf("EvictAll evicted a region above the keep bound: %v", err)
+	}
+	// A bound of 0 disables the bound: the permanent region goes too.
+	tlb.EvictAll([]uint64{0x100010}, 0)
+	if _, err := tlb.Lookup(0x100000, 16); err == nil {
+		t.Fatalf("EvictAll with bound 0 spared the permanent region")
+	}
+	tlb.ReleaseAll()
+}
+
+func TestIOTLBConcurrentPinEvict(t *testing.T) {
+	// Stress the lock-free reader against evict/mutate writers: pins,
+	// lookups and slices racing Add/Evict/EvictAll/RemoveRange. Run
+	// under -race. The invariant is "no crash, no use of a region the
+	// table has fully dropped" (a returned Slice must stay readable
+	// for the ref's lifetime, evicted regions must never be handed out
+	// by a fresh Acquire).
+	var tlb IOTLB
+	const regionSize = 0x1000
+	base := uint64(0x10000)
+	tlb.Add(Region{Start: base, Last: base + regionSize - 1, Mem: make([]byte, regionSize)})
+
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	// Readers: acquire, touch a distinct slice, release.
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func(off uint64) {
+			defer wg.Done()
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				ref, err := tlb.Acquire(base+off, 64)
+				if err != nil {
+					continue
+				}
+				b, ok := ref.Slice(base+off, 64)
+				if ok {
+					b[0] = 0xAB // must not fault: pin keeps pages mapped
+					_ = b[0]
+				}
+				ref.Release()
+			}
+		}(uint64(i) * 64)
+	}
+	// Writer: churn the mapping the readers target.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; ; i++ {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			tlb.Evict(base, 0)
+			tlb.Add(Region{Start: base, Last: base + regionSize - 1, Mem: make([]byte, regionSize)})
+			tlb.EvictAll([]uint64{base, base}, 0)
+			tlb.Add(Region{Start: base, Last: base + regionSize - 1, Mem: make([]byte, regionSize)})
+		}
+	}()
+	for i := 0; i < 2000; i++ {
+		if ref, err := tlb.Acquire(base, 8); err == nil {
+			ref.Release()
+		}
+	}
+	time.Sleep(50 * time.Millisecond)
+	close(stop)
+	wg.Wait()
+	if got := tlb.Pinned(base); got != 0 {
+		t.Fatalf("Pinned = %d after quiesce, want 0", got)
 	}
 	tlb.ReleaseAll()
 }
