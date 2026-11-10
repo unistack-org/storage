@@ -320,5 +320,5 @@ jobs:
           else
             gh release create "$TAG" dist/* --title "$TAG" --notes-file dist/release-notes.md "${EXTRA[@]}"
           fi
-          gh release view "$TAG" --json tagName,prerelease,assets \
-            --jq '{tag:.tagName, prerelease:.prerelease, assets:[.assets[].name]}'
+          gh release view "$TAG" --json tagName,isPrerelease,assets \
+            --jq '{tag:.tagName, prerelease:.isPrerelease, assets:[.assets[].name]}'
