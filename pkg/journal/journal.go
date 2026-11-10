@@ -276,6 +276,22 @@ func (j *Journal) Truncate(kept uint64) error {
 	return nil
 }
 
+// Seq returns the last assigned sequence number.
+func (j *Journal) Seq() uint64 {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	return j.seq
+}
+
+// HardClose closes the file without flushing the buffer: a simulated
+// crash for tests (the buffered tail is lost exactly as a power loss
+// would lose it). The Journal must not be used afterwards.
+func (j *Journal) HardClose() error {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	return j.f.Close()
+}
+
 // Close flushes and closes.
 func (j *Journal) Close() error {
 	j.mu.Lock()

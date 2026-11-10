@@ -30,12 +30,10 @@ func NewStoreBackend(dir string, size uint64, opts store.Options) (*StoreBackend
 	if object.NumObjects(size) == 0 {
 		return nil, fmt.Errorf("store backend: volume size must be > 0")
 	}
+	// store.New performs the initial Load: Usage and the meta index are
+	// populated before the first call returns.
 	st, err := store.New(dir, opts)
 	if err != nil {
-		return nil, err
-	}
-	if err := st.Load(); err != nil {
-		st.Close()
 		return nil, err
 	}
 	b := &StoreBackend{st: st}

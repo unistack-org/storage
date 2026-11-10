@@ -344,6 +344,52 @@ func (d *Daemon) DiskStats() (usage, free, total int64, ok bool) {
 	return st.Usage(), free, total, ok
 }
 
+// JournalStats reports the journal staging footprint for the status
+// API: the WAL file size, pending (acknowledged, unapplied) records,
+// and the filesystem free/total the journal grows into (ok=false when
+// the store is not in journal mode or is not open yet).
+func (d *Daemon) JournalStats() (logBytes, pending, free, total int64, ok bool) {
+	d.mu.Lock()
+	st := d.st
+	d.mu.Unlock()
+	if st == nil {
+		return 0, 0, 0, 0, false
+	}
+	logBytes, pending, ok = st.JournalStats()
+	if !ok {
+		return 0, 0, 0, 0, false
+	}
+	free, total, _ = st.DiskSpace()
+	return logBytes, pending, free, total, true
+}
+
+// WriteStats returns the store's write-amplification counters (bytes
+// the client asked us to write, bytes the journal fsynced, bytes the
+// applier flattened into objects, fill and punch traffic, and journal
+// syncs). The status API and Prometheus export these so write
+// amplification can be measured against the offered load (sdsbench).
+func (d *Daemon) WriteStats() store.WriteStats {
+	d.mu.Lock()
+	st := d.st
+	d.mu.Unlock()
+	if st == nil {
+		return store.WriteStats{}
+	}
+	return st.WriteStats()
+}
+
+// MetaInfo reports the in-memory object meta index population
+// (indexed objects and the RAM they occupy).
+func (d *Daemon) MetaInfo() (objects, ramBytes int64) {
+	d.mu.Lock()
+	st := d.st
+	d.mu.Unlock()
+	if st == nil {
+		return 0, 0
+	}
+	return st.MetaInfo()
+}
+
 // Close stops the daemon. Safe to call repeatedly and concurrently.
 func (d *Daemon) Close() error {
 	d.mu.Lock()

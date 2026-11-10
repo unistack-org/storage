@@ -267,6 +267,40 @@ type diskStatView struct {
 	UsageHuman string `json:"usage_human,omitempty"`
 	FreeHuman  string `json:"free_human,omitempty"`
 	TotalHuman string `json:"total_human,omitempty"`
+	// Write amplification counters (lifetime sums since process
+	// start): what the client offered, what the journal fsynced, what
+	// the applier flattened into objects, fill/punch traffic, journal
+	// syncs. sdsbench snapshots these before/after a run to compute
+	// WA = (journal+flatten+fill) / client bytes.
+	Writes writeStatView `json:"writes"`
+	// Meta index population (in-memory object metadata).
+	MetaObjects int64 `json:"meta_objects"`
+	MetaRAM     int64 `json:"meta_ram"`
+	// Journal is set only for OSDs running in journal commit mode:
+	// the WAL footprint and the filesystem the journal grows into.
+	Journal *journalStatView `json:"journal,omitempty"`
+}
+
+// journalStatView is the journal staging footprint of one locally
+// hosted OSD (§4.2 ENOSPC): WAL file size, acknowledged-but-unapplied
+// records, and the free/total of the filesystem the log lives on.
+type journalStatView struct {
+	LogBytes   int64  `json:"log_bytes"`
+	Pending    int64  `json:"pending_records"`
+	Free       int64  `json:"free"`
+	Total      int64  `json:"total"`
+	FreeHuman  string `json:"free_human,omitempty"`
+	TotalHuman string `json:"total_human,omitempty"`
+}
+
+// writeStatView mirrors store.WriteStats in JSON form.
+type writeStatView struct {
+	ClientBytes  int64 `json:"client_bytes"`
+	JournalBytes int64 `json:"journal_bytes"`
+	JournalSyncs int64 `json:"journal_syncs"`
+	FlattenBytes int64 `json:"flatten_bytes"`
+	FillBytes    int64 `json:"fill_bytes"`
+	PunchBytes   int64 `json:"punch_bytes"`
 }
 
 // statusProbeTimeout bounds the liveness fan-out in handleStatus. The
@@ -381,6 +415,9 @@ func (a *adminAPI) handleStatus(w http.ResponseWriter, r *http.Request) {
 					if d.Total > 0 && d.Free*10 < d.Total {
 						warnings = append(warnings, fmt.Sprintf("osd %d disk is low on space: %s free of %s", d.OSD, d.FreeHuman, d.TotalHuman))
 					}
+				}
+				if d.Journal != nil {
+					d.Journal.FreeHuman, d.Journal.TotalHuman = humanSize(uint64(d.Journal.Free)), humanSize(uint64(d.Journal.Total))
 				}
 			}
 			st["disks"] = ds

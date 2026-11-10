@@ -143,9 +143,9 @@ func TestJournalCrashSurvival(t *testing.T) {
 	copy(want[500:], recs[1].p)
 	copy(want[4096:], recs[2].p)
 
-	// Simulate the crash: abandon the handle without Close, leaving the
-	// objects behind the log.
-	_ = st
+	// Simulate the crash: halt the applier without draining, leaving
+	// the objects behind the log.
+	st.crash()
 
 	st2, err := New(dir, Options{CommitMode: CommitJournal})
 	if err != nil {
@@ -188,8 +188,8 @@ func TestJournalTornTail(t *testing.T) {
 	if _, err := st.WriteAt(oid, payload, 0); err != nil {
 		t.Fatal(err)
 	}
-	// Abandon without Close so the log keeps the record.
-	_ = st
+	// Halt the applier without draining so the log keeps the record.
+	st.crash()
 
 	// Append a torn header (a partial 16-byte record header) to the log.
 	jp := filepath.Join(dir, journalFileName)
@@ -241,7 +241,7 @@ func TestJournalRemoveCheckpoint(t *testing.T) {
 	if err := st.Remove(oid); err != nil {
 		t.Fatal(err)
 	}
-	_ = st // "crash" right after the checkpoint
+	st.crash() // "crash" right after the checkpoint
 
 	st2, err := New(dir, Options{CommitMode: CommitJournal})
 	if err != nil {

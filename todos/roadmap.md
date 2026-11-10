@@ -160,8 +160,11 @@
         получают вес 0 (is_out), как и документировано.
   - [x] Валидатор карты CLI-командой `map check` — сделано: компиляция карты
         против реестра + ценз PG-таблицы (full/degraded/down), reweight in/out
-        покрыт тестами (см. выше). Отдельный rule-валидатор под volume-class
-        (SSD/HDD) не делался — классов в крашмапе пока нет.
+        покрыт тестами (см. выше). Rule-валидатор под volume-class (SSD/HDD)
+        **сделано 2026-11-10** (crushkv `crushmap.CheckClass`/`CheckWeights`):
+        `map check -class <name>` — правила без class-фильтра против устройств
+        класса, warnings на недостижимые max_size/chooseleaf-домены; при живом
+        реестре — веса (OSD вне реестра = 0).
 - [x] sds-nbd: бэкенд `VolumeBackend` (том → NBD-экспорт) и режим `sdsd
       -cluster <meta-каталог>`: OSD в процессе (`-osd id@dir[@addr]`),
       публикация карты (`-crushmap -epoch`), `-create имя:размер`,
@@ -208,8 +211,11 @@
         против реестра + ценз PG-таблицы full/degraded/down, non-zero exit при
         down-строках); reweight покрыт `map reweight` + тестами. Эмуляция
         отказов и chi-square равномерность покрыты тестами:
-        `storage/pkg/placement/uniformity_test.go`. Отдельный rule-валидатор
-        под volume-class (SSD/HDD) не делался — классов в крашмапе пока нет.
+        `storage/pkg/placement/uniformity_test.go`. Rule-валидатор под
+        volume-class (SSD/HDD) **сделано 2026-11-10**: crushkv `crushmap.Check`
+        (AST: правила/step/классы, pop-count rep3/rep2) + `CheckClass`/
+        `CheckWeights` (правила против устройств класса и весов реестра), в CLI —
+        `unistorctl map check [-class ssd|hdd]` (exit 1 на ошибках).
 - [x] CLI `unistorctl`: osd add/ls/out/in, vol create/ls/rm/info/quota/resize/
       qos/import/export/snap/clone, map dump/check/publish/reweight (dump
       -format raw|text|json/yaml/binary), vacuum ls/run (включая пер-томный),
@@ -218,7 +224,7 @@
 
 ## Фаза 4 — Экспорт в ВМ: «NVMe внутри виртуалки» (2–4 недели)
 
-> Статус (2026-11-09): NBD + VDUSE (мультиочерёдный, online-resize, reconnect) готовы; открыто: Go vhost-user-blk (`pkg/vub`) и e2e Linux+KVM.
+> Статус (2026-11-10): NBD + VDUSE (мультиочерёдный, online-resize, reconnect, base:allocation, lock-free IOTLB) готовы; `pkg/vub` (vhost-user-blk) — код пишется, валидация только на Linux+KVM; открыто: 4b/e2e Linux+KVM.
 
 Порядок от простого к целевому (детали и команды —
 `unistack/todos/storage-nvme-vfio-user.md`):
@@ -280,7 +286,7 @@
 
 ## Фаза 5 — Производительность до уровня Vitastor (постоянно, с замерами на каждую фазу)
 
-> Статус (2026-11-09): 171–177K 4K randread (цель 100K — перекрыта), отказоустойчивость (min_size/out_time/пресеты) закрыта; открыто: бенч-стенд 3–5 нод, in-memory мета-индекс, write-intent/WA, cpubench, per-CPU оптимизации.
+> Статус (2026-11-10): 171–177K 4K randread (цель 100K — перекрыта), отказоустойчивость (min_size/out_time/пресеты) закрыта; закрыты in-memory мета-индекс (ADR) и замер WA в sdsbench (WA=2.01), метрика свободного места журнала; открыто: write-intent journal + AWUPF (цель WA→1), бенч-стенд 3–5 нод, cpubench, per-CPU оптимизации, цель >200K.
 
 - [ ] **Чем обгоняем Vitastor (принято: они реально быстрее Ceph, мы целимся выше).**
       Их сильные стороны перенимаем 1:1: мета в RAM, journal-ring + кворум
@@ -345,14 +351,24 @@
       (GOGC off на data-потоках / ballast), hugepages для буферов,
       NUMA-affinity, опционально kernel-bypass (netmap/eBPF) — только если
       perf покажет сеть узким местом
-- [ ] **In-memory мета-индекс объектов** (урок Vitastor: метаданные всегда в
-      RAM, ~512 МБ/ТБ при блоке 128K; журнал по умолчанию тоже в RAM — 32 МБ
-      на SSD-кластер): OSD не читает заголовок объекта с диска на пути
-      запроса; per-object версия живёт в RAM-индексе (дешёвый CAS/версионность).
-      Оформить как ADR с их числами из доклада Highload'2025 (663/371/152 МБ
-      на ТБ: сырьё+btree+журнал / +11% / +18% худший случай) и инвариантом
-      «все записи одного объекта — в одном блоке меты» (иначе потеря блока
-      меты = «выбросить весь диск»). Детали: `todos/vitastor-ideas.md` §2.5
+- [x] **In-memory мета-индекс объектов** — закрыто 2026-11-10 (ADR:
+      `todos/adr-meta-index.md`). `objMeta{size,alloc,allocKnown}` — 24 Б на
+      объект, `map` под `Store.mu`; инвариант «один объект — одна запись меты»
+      выполняется тривиально (блок меты = объект; durable-меты нет, индекс —
+      кэш поверх POSIX-файлов, восстанавливается одним `ReadDir` без per-file
+      stat). Цена ~72 Б/объект ≈ **18 МБ на ТБ** (3 порядка против их
+      663/371/152 МБ/ТБ — у них индекс на 4K-блок, у нас на объект 4 МиБ).
+      OSD не делает `os.Stat` на пути запроса: `Load` (внутри `New`) +
+      `openSlow`/запись/рост/punch/удаление ведут индекс под тем же замком,
+      что и учёт. В journal-режиме `Stat`/`StatInfo` берут max(индекс, оверлей)
+      (alloc — нижняя граница, не кэшируется), новый объект с оверлейными
+      записями: `Stat` = not-exist (контракт уровня файла), `ObjectState` =
+      present=false/pending=true (NBD base:allocation видит данные до файла).
+      Наблюдаемость: `MetaInfo` → `/v1/status` (`meta_objects`/`meta_ram`) и
+      gauge `unistor_osd_meta` (существующий экспорт под VictoriaMetrics).
+      Тесты: `pkg/store/stats_test.go`, `stat_overlay_test.go`,
+      `statinfo_test.go`. Осталось по желанию: per-object версия в индексе
+      (версионность/CAS на OSD — только когда понадобится linearizable read).
 - [x] **Чтение с любой реплики + выбор primary по номеру PG** — закрыто:
       чтение и так падало на любую живую реплику (fall-through в `readChunk`),
       добавлен порядок предпочтений `Volume.orderReadRefs` (`pkg/client`):
@@ -368,10 +384,16 @@
       (не в `noteFailure`), клиент превращает его в `ErrNoSpace` без зависания
       (`pkg/client/client.go`, writeChunk); journal: полный журнал →
       `ErrNoSpace` из `pkg/journal` (sticky poison) наружу, не падение OSD;
-      `/v1/status` отдаёт warnings (диск/OSD). Осталось по желанию: отдельная
-      метрика свободного места под журнал.
+      `/v1/status` отдаёт warnings (диск/OSD). Метрика свободного места под
+      журнал **закрыта 2026-11-10**: `store.JournalStats` (размер WAL +
+      неповыгнанные записи) → `diskStatView.journal` в `/v1/status` и gauge
+      `unistor_osd_journal{name=log_bytes|pending_records|free_bytes|total_bytes}`
+      (`free/total` — ФС, в которую растёт журнал; журнал живёт в каталоге
+      store, поэтому это же `DiskSpace`); тест `TestJournalStats`. Попутно
+      исправлен протухший alloc-hint мета-индекса (StatInfo/вакуум видели
+      alloc=0 у записанных объектов) — регресс `TestStatInfoTracksAllocation`.
       Тесты: `pkg/sdsnet/nospace_test.go`, `pkg/client/quota_test.go`,
-      `pkg/journal/space_linux_test.go`.
+      `pkg/journal/space_linux_test.go`, `pkg/store/statinfo_test.go`.
       `pkg/store` + `pkg/osd` + `pkg/client`. Детали: `todos/vitastor-ideas.md` §4.2
 - [ ] **Write Intent Journal + атомарные записи NVMe (цель WA → 1)** — смысл их
       доклада Highload'2025: перед записью данных пишем намерение «обновлю
@@ -379,8 +401,11 @@
       блок считается старым. Лечит torn writes без двойной записи. Плюс
       детект AWUPF (у Micron 7450/7500 и Kioxia CD7/CD8-R = 256K, у нашего
       PM9A3 = 0 — атомарен только 4K; флаг RWF_ATOMIC в ядре был сломан,
-      важна именно атомарность при power-loss) и **замер WA в sdsbench**
-      (записано на диск / записано клиентом) — без числа эффект не виден.
+      важна именно атомарность при power-loss). **Замер WA в sdsbench
+      закрыт 2026-11-10** (`todos/vitastor-ideas.md` §2.3): счётчики
+      `store.WriteStats` → `/v1/status` → gauge `unistor_osd_write_bytes` →
+      `sdsbench -admin` печатает `WA=`; на живом journal-кластере randwrite 4K
+      даёт WA=2.01. Остаётся: сам intent-журнал (§2.1) и AWUPF-детект (§2.2).
       Детали: `todos/vitastor-ideas.md` §2.1–2.3
 - [x] **Клиентские I/O-потоки** (урок Vitastor: 7–8 GB/s линейно) — сделано:
       `sdsnet.Stream` (один конн = десятки горутин-сабмиттеров, один батч-

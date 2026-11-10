@@ -176,8 +176,15 @@ type journalState struct {
 	quit chan struct{} // closes the applier goroutine
 	done chan struct{} // closed when the applier goroutine exits
 
+	// noDrain (guarded by mu): when set, the applier exits on quit
+	// without the final drain. Used by tests that simulate a crash:
+	// the log must stay ahead of the objects, and the goroutine must
+	// stop touching the (temporary) data directory.
+	noDrain bool
+
 	appliedRecs atomic.Int64 // stats: records flattened into objects
 	truncations atomic.Int64 // stats: log truncations
+	syncs       atomic.Int64 // stats: log fsyncs (ack points)
 }
 
 // openJournal replays the log at path, returning the surviving records
@@ -263,7 +270,12 @@ func (s *Store) startApplier(js *journalState) {
 		for {
 			select {
 			case <-js.quit:
-				s.applyPass(true) // final drain
+				js.mu.Lock()
+				noDrain := js.noDrain
+				js.mu.Unlock()
+				if !noDrain {
+					s.applyPass(true) // final drain
+				}
 				return
 			case <-t.C:
 				s.applyPass(false)
@@ -325,6 +337,7 @@ func (s *Store) journalAppend(rec *journalRec) error {
 		js.mu.Unlock()
 		return mapJournalErr(err)
 	}
+	s.journalBytes.Add(int64(journal.HeaderSize + len(payload)))
 	rec.seq = seq
 	js.maxSeq = seq
 	js.log = append(js.log, rec)
@@ -336,6 +349,7 @@ func (s *Store) journalAppend(rec *journalRec) error {
 	if err := js.j.Sync(); err != nil {
 		return mapJournalErr(err)
 	}
+	js.syncs.Add(1)
 	return nil
 }
 
@@ -408,10 +422,12 @@ func (s *Store) applyOne(r *journalRec) error {
 		if r.sparse && punchSupported {
 			if head, tail, ok := alignRange(r.off, r.n, punchAlign); ok {
 				if perr := punchHole(e.f, int64(r.off+head), int64(tail-head)); perr == nil {
-					if err := s.zeroFill(e, r.off, head); err != nil {
+					s.punchBytes.Add(int64(tail - head))
+					s.metaInvalidateAlloc(r.oid)
+					if err := s.zeroFill(r.oid, e, r.off, head); err != nil {
 						return err
 					}
-					if err := s.zeroFill(e, r.off+tail, r.n-tail); err != nil {
+					if err := s.zeroFill(r.oid, e, r.off+tail, r.n-tail); err != nil {
 						return err
 					}
 					e.dirty.Add(1)
@@ -419,7 +435,7 @@ func (s *Store) applyOne(r *journalRec) error {
 				}
 			}
 		}
-		if err := s.zeroFill(e, r.off, r.n); err != nil {
+		if err := s.zeroFill(r.oid, e, r.off, r.n); err != nil {
 			return err
 		}
 		e.dirty.Add(1)
@@ -431,10 +447,19 @@ func (s *Store) applyOne(r *journalRec) error {
 		}
 		return err
 	}
+	s.flattenBytes.Add(int64(len(r.data)))
 	s.mu.Lock()
+	// The write may have allocated blocks (fresh sparse file, refill
+	// of a punched hole): drop the stale allocation hint.
+	s.metaInvalidate(r.oid)
 	if grow := int64(r.off) + int64(len(r.data)) - e.size; grow > 0 {
 		e.size += grow
 		s.usage += grow
+		if m, ok := s.meta[r.oid]; ok {
+			m.size = e.size
+			s.meta[r.oid] = m
+		}
+		s.metaInvalidate(r.oid)
 	}
 	s.mu.Unlock()
 	e.dirty.Add(1)
@@ -588,6 +613,24 @@ func (s *Store) journalRemove(oid object.OID) error {
 	return removeErr
 }
 
+// crash stops the applier without the final drain and closes the log,
+// simulating a process crash for tests: the log stays ahead of the
+// objects, and no goroutine keeps touching the (temporary) data
+// directory. The store must not be used afterwards.
+func (s *Store) crash() {
+	js := s.jrn
+	if js == nil {
+		return
+	}
+	js.mu.Lock()
+	js.noDrain = true
+	js.mu.Unlock()
+	close(js.quit)
+	<-js.done
+	_ = js.j.Close()
+	s.jrn = nil
+}
+
 // journalClose drains, stops the applier, and closes the log (clean
 // shutdown: the reopen sees an empty log).
 func (s *Store) journalClose() error {
@@ -624,4 +667,24 @@ func mapJournalErr(err error) error {
 		return ErrNoSpace
 	}
 	return err
+}
+
+// JournalStats reports the journal staging footprint: the log file's
+// size on disk (bytes the journal occupies on its filesystem) and the
+// number of acknowledged records not yet flattened into objects. ok is
+// false when the store is not in journal mode. The log lives in the
+// store directory, so the free space the journal grows into is the
+// store's DiskSpace answer; this pair completes the ENOSPC picture
+// (how much a full journal costs) for status and metrics.
+func (s *Store) JournalStats() (logBytes, pending int64, ok bool) {
+	if s.jrn == nil {
+		return 0, 0, false
+	}
+	s.jrn.mu.Lock()
+	pending = int64(len(s.jrn.log))
+	s.jrn.mu.Unlock()
+	if fi, err := os.Stat(path.Join(s.dir, journalFileName)); err == nil {
+		logBytes = fi.Size()
+	}
+	return logBytes, pending, true
 }

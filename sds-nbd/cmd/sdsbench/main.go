@@ -6,20 +6,31 @@
 // and latency percentiles. It measures the NBD data path end to end
 // (TCP + server backend) without needing a VM.
 //
+// With -admin pointed at the unistord admin API (cluster mode, e.g.
+// http://127.0.0.1:8081), sdsbench also snapshots the server's write
+// counters (per-OSD sum from /v1/status) before and after the run and
+// reports device write amplification: bytes the journal fsynced plus
+// bytes flattened into objects, per byte of guest data.
+//
 // Usage:
 //
 //	sdsbench -addr 127.0.0.1:10809 -export vol0 -rw randread -bs 4K -size 64M -qd 32 -runtime 10s
+//	sdsbench -addr ... -rw randwrite -admin http://127.0.0.1:8081 -admin-token SECRET
 package main
 
 import (
 	"bufio"
+	"bytes"
+	"context"
 	"encoding/binary"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"math/rand"
 	"net"
+	"net/http"
 	"os"
 	"sort"
 	"strings"
@@ -68,6 +79,8 @@ func main() {
 	qd := flag.Int("qd", 32, "queue depth (in-flight requests) per connection")
 	conns := flag.Int("conns", 1, "number of parallel connections (total QD = qd*conns)")
 	runDur := flag.Duration("runtime", 10*time.Second, "duration (0 = one pass over size)")
+	adminURL := flag.String("admin", "", "unistord admin API base URL (cluster mode, e.g. http://127.0.0.1:8081): when set, the server's write counters are snapshotted before and after the run and write amplification is reported")
+	adminToken := flag.String("admin-token", "", "bearer token for -admin (matches unistord -admin-token)")
 	showVersion := flag.Bool("version", false, "print version and exit")
 	flag.Parse()
 	if *showVersion {
@@ -141,6 +154,15 @@ func main() {
 		err        error
 	}
 	results := make([]res, len(work))
+	var waBefore *writeSnap
+	// Reads cannot amplify device writes; only bracket write runs.
+	if *adminURL != "" && strings.Contains(*rw, "write") {
+		if snap, err := fetchWriteSnap(*adminURL, *adminToken); err != nil {
+			fmt.Printf("wa: pre-run admin query failed: %v\n", err)
+		} else {
+			waBefore = &snap
+		}
+	}
 	start := time.Now()
 	var wgC sync.WaitGroup
 	for i := range work {
@@ -164,6 +186,89 @@ func main() {
 		lats = append(lats, r.lats...)
 	}
 	report(*rw, ops, bytes, elapsed, lats)
+	if *adminURL != "" && waBefore != nil {
+		reportWA(*adminURL, *adminToken, waBefore, ops, bytes)
+	}
+}
+
+// --- server write-amplification snapshot (admin /v1/status) ---
+
+// writeSnap is the sum of the per-OSD write counters that every OSD
+// hosted by the queried unistord process reports.
+type writeSnap struct {
+	ClientBytes  int64 `json:"client_bytes"`
+	JournalBytes int64 `json:"journal_bytes"`
+	FlattenBytes int64 `json:"flatten_bytes"`
+	FillBytes    int64 `json:"fill_bytes"`
+}
+
+// fetchWriteSnap queries /v1/status and sums the disk write counters.
+func fetchWriteSnap(base, token string) (writeSnap, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, strings.TrimSuffix(base, "/")+"/v1/status", nil)
+	if err != nil {
+		return writeSnap{}, err
+	}
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return writeSnap{}, err
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+	if err != nil {
+		return writeSnap{}, err
+	}
+	if resp.StatusCode != http.StatusOK {
+		return writeSnap{}, fmt.Errorf("status %d: %s", resp.StatusCode, strings.TrimSpace(string(bytes.TrimSpace(body))))
+	}
+	var st struct {
+		Disks []struct {
+			Writes writeSnap `json:"writes"`
+		} `json:"disks"`
+	}
+	if err := json.Unmarshal(body, &st); err != nil {
+		return writeSnap{}, fmt.Errorf("parse /v1/status: %v", err)
+	}
+	var sum writeSnap
+	for _, d := range st.Disks {
+		sum.ClientBytes += d.Writes.ClientBytes
+		sum.JournalBytes += d.Writes.JournalBytes
+		sum.FlattenBytes += d.Writes.FlattenBytes
+		sum.FillBytes += d.Writes.FillBytes
+	}
+	return sum, nil
+}
+
+// reportWA prints the device write amplification measured across the
+// benchmark: device bytes (journal fsyncs + object flattening + fills)
+// per byte of guest data the server received. Only a run with net
+// writes produces a meaningful number.
+func reportWA(base, token string, before *writeSnap, ops, benchBytes int64) {
+	// The journal applier flattens on a 20 ms tick after the last
+	// record: settle so the flattening of the final batch lands in
+	// the "after" snapshot.
+	time.Sleep(300 * time.Millisecond)
+	after, err := fetchWriteSnap(base, token)
+	if err != nil {
+		fmt.Printf("wa: post-run admin query failed: %v\n", err)
+		return
+	}
+	dClient := after.ClientBytes - before.ClientBytes
+	dDev := (after.JournalBytes - before.JournalBytes) +
+		(after.FlattenBytes - before.FlattenBytes) +
+		(after.FillBytes - before.FillBytes)
+	if dClient <= 0 {
+		fmt.Printf("wa: server reported no client writes (is the volume's data on this unistord? the counters are per-process local OSDs)\n")
+		return
+	}
+	fmt.Printf("wa: dev_writes=%.1f MiB client_writes=%.1f MiB WA=%.2f (journal+flatten+fill per client byte; bench ops=%d offered %.1f MiB)\n",
+		float64(dDev)/(1<<20), float64(dClient)/(1<<20),
+		float64(dDev)/float64(dClient),
+		ops, float64(benchBytes)/(1<<20))
 }
 
 // bench issues pipelined NBD requests on a connection. Structured-reply

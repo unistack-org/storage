@@ -17,7 +17,10 @@
 //	per node/OSD:   unistor_osd_up{osd,addr}, unistor_osd_weight{osd},
 //	                unistor_osd_disk_stored|free|total_bytes{osd},
 //	                unistor_osd_connections{osd},
-//	                unistor_osd_pool_connections{osd,state}
+//	                unistor_osd_pool_connections{osd,state},
+//	                unistor_osd_write_bytes{osd,name} (write-amp
+//	                counters, local OSDs), unistor_osd_meta{osd,name}
+//	                (meta index, local OSDs)
 //	per-OSD speed:  unistor_osd_requests_total{osd,op,status},
 //	                unistor_osd_bytes_total{osd,op,direction},
 //	                unistor_osd_request_duration_seconds{osd,op}
@@ -88,6 +91,9 @@ type clusterMetrics struct {
 	gRaftMember *prometheus.GaugeVec // {id,addr}
 	gOsd        *prometheus.GaugeVec // {osd,addr,name} name=up|weight
 	gDisk       *prometheus.GaugeVec // {osd,name} name=stored|free|total
+	gWrite      *prometheus.GaugeVec // {osd,name} write-amp counters (local OSDs)
+	gJournal    *prometheus.GaugeVec // {osd,name} journal staging footprint (local journal-mode OSDs)
+	gMeta       *prometheus.GaugeVec // {osd,name} meta index (local OSDs)
 	gPool       *prometheus.GaugeVec // {osd,state}
 	gVolume     *prometheus.GaugeVec // {name} name=writable|degraded|...
 	gQoSLimit   *prometheus.GaugeVec // {export,rate} configured limits
@@ -168,6 +174,18 @@ func newClusterMetrics() *clusterMetrics {
 		Name: "unistor_osd_disk_bytes",
 		Help: "Disk accounting per OSD (stored/free/total bytes), probed cluster-wide over StatFS; a remote OSD answering an older protocol is omitted.",
 	}, []string{"osd", "name"})
+	m.gWrite = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "unistor_osd_write_bytes",
+		Help: "Lifetime write traffic of locally hosted OSDs (client/journal/flatten/fill/punch bytes, journal_syncs count): write amplification = (journal+flatten+fill)/client. Counter semantics: monotonically growing since process start.",
+	}, []string{"osd", "name"})
+	m.gJournal = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "unistor_osd_journal",
+		Help: "Journal staging footprint of locally hosted journal-mode OSDs: log_bytes (WAL file size on disk), pending_records (acked, not yet flattened), free_bytes/total_bytes (filesystem the journal grows into). Alert when free_bytes drops toward the journal's growth headroom.",
+	}, []string{"osd", "name"})
+	m.gMeta = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "unistor_osd_meta",
+		Help: "In-memory object meta index of locally hosted OSDs: objects (indexed entries), ram_bytes (estimated RAM the index occupies).",
+	}, []string{"osd", "name"})
 	m.gPool = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "unistor_osd_pool_connections",
 		Help: "Connections in this process's client pool per OSD, by state (idle|in_use).",
@@ -197,7 +215,7 @@ func newClusterMetrics() *clusterMetrics {
 	for _, c := range []prometheus.Collector{
 		m.osdRequests, m.osdBytes, m.osdLatency, m.osdConns,
 		m.exportRequests, m.exportBytes, m.exportLatency, m.exportSustained,
-		m.gCluster, m.gRaftState, m.gRaftMember, m.gOsd, m.gDisk, m.gPool, m.gVolume, m.gQoSLimit, m.gVacuum,
+		m.gCluster, m.gRaftState, m.gRaftMember, m.gOsd, m.gDisk, m.gWrite, m.gJournal, m.gMeta, m.gPool, m.gVolume, m.gQoSLimit, m.gVacuum,
 		m.recoveryCopies, m.recoveryBytes,
 		collectors.NewGoCollector(),
 		collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}),
@@ -381,6 +399,9 @@ func (m *clusterMetrics) collect(ctx context.Context, s metricsSource) {
 	m.gRaftMember.Reset()
 	m.gOsd.Reset()
 	m.gDisk.Reset()
+	m.gWrite.Reset()
+	m.gJournal.Reset()
+	m.gMeta.Reset()
 	m.gPool.Reset()
 	m.gVolume.Reset()
 	m.gQoSLimit.Reset()
@@ -444,6 +465,28 @@ func (m *clusterMetrics) collect(ctx context.Context, s metricsSource) {
 				freeRaw += float64(d.Free)
 				usedRaw += float64(d.Usage)
 				rawReported++
+			}
+			// Write-amp counters and meta index exist only for OSDs
+			// hosted in this process (in-process store counters).
+			if s.disks != nil {
+				if ld := s.disks.disk(info.ID); ld != nil {
+					ws := ld.WriteStats()
+					m.gWrite.WithLabelValues(idL, "client").Set(float64(ws.ClientBytes))
+					m.gWrite.WithLabelValues(idL, "journal").Set(float64(ws.JournalBytes))
+					m.gWrite.WithLabelValues(idL, "flatten").Set(float64(ws.FlattenBytes))
+					m.gWrite.WithLabelValues(idL, "fill").Set(float64(ws.FillBytes))
+					m.gWrite.WithLabelValues(idL, "punch").Set(float64(ws.PunchBytes))
+					m.gWrite.WithLabelValues(idL, "journal_syncs").Set(float64(ws.JournalSyncs))
+					if lb, pend, jfree, jtotal, jok := ld.JournalStats(); jok {
+						m.gJournal.WithLabelValues(idL, "log_bytes").Set(float64(lb))
+						m.gJournal.WithLabelValues(idL, "pending_records").Set(float64(pend))
+						m.gJournal.WithLabelValues(idL, "free_bytes").Set(float64(jfree))
+						m.gJournal.WithLabelValues(idL, "total_bytes").Set(float64(jtotal))
+					}
+					objs, ram := ld.MetaInfo()
+					m.gMeta.WithLabelValues(idL, "objects").Set(float64(objs))
+					m.gMeta.WithLabelValues(idL, "ram_bytes").Set(float64(ram))
+				}
 			}
 		}
 		m.gCluster.WithLabelValues("osds_live").Set(float64(live))

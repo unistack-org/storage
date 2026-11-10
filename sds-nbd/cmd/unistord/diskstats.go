@@ -59,9 +59,26 @@ func (r *diskRegistry) stats() []diskStatView {
 			continue
 		}
 		usage, free, total, ok := d.DiskStats()
+		ws := d.WriteStats()
+		metaObjects, metaRAM := d.MetaInfo()
 		out = append(out, diskStatView{
 			OSD: int32(id), Usage: usage, Free: free, Total: total, OK: ok,
+			Writes: writeStatView{
+				ClientBytes:  ws.ClientBytes,
+				JournalBytes: ws.JournalBytes,
+				JournalSyncs: ws.JournalSyncs,
+				FlattenBytes: ws.FlattenBytes,
+				FillBytes:    ws.FillBytes,
+				PunchBytes:   ws.PunchBytes,
+			},
+			MetaObjects: metaObjects,
+			MetaRAM:     metaRAM,
 		})
+		if lb, pend, jfree, jtotal, jok := d.JournalStats(); jok {
+			out[len(out)-1].Journal = &journalStatView{
+				LogBytes: lb, Pending: pend, Free: jfree, Total: jtotal,
+			}
+		}
 	}
 	return out
 }

@@ -129,6 +129,15 @@ type Options struct {
 	// ring cannot be created the store logs it and keeps the plain
 	// pread/pwrite path, so enabling AsyncRing never breaks a store.
 	AsyncRing int
+	// Intent turns on the Write Intent Journal (see intent.go): every
+	// write is announced by a durable 24-byte intent record (oid/off/
+	// len/crc) before its data, and recovery verifies open intents
+	// against the objects — a power-loss damage map without double
+	// writes. Valid for the non-journal commit modes (journal mode
+	// already has a write-ahead log). Cost: ~1% extra device traffic
+	// and, in flush/sync modes, one extra fsync of the tiny intent log
+	// per write.
+	Intent bool
 	// Logf receives informational messages (nil = silent).
 	Logf func(format string, args ...any)
 }
@@ -142,6 +151,13 @@ type Store struct {
 	files map[object.OID]*entry
 	usage int64 // sum of file sizes of known objects
 
+	// meta is the in-RAM object index (see meta.go): existence,
+	// apparent size and (when known) allocated bytes for every object
+	// the store has seen. It replaces the per-request os.Stat on the
+	// read/Stat path; the disk is consulted only at Load and when an
+	// allocation measurement is genuinely needed.
+	meta map[object.OID]objMeta
+
 	// fsync coalescer (active when opts.FsyncBatch > 0).
 	batchMu     sync.Mutex
 	batch       []batchWaiter
@@ -152,10 +168,21 @@ type Store struct {
 	// CommitJournal; see journal.go).
 	jrn *journalState
 
+	// intent is the Write Intent Journal (nil unless Options.Intent;
+	// see intent.go).
+	intent *intentState
+
 	// ring is the async I/O ring (nil = plain pread/pwrite path).
 	ring iouring.Ring
 
 	syncPasses atomic.Int64 // fsync passes performed (Sync + batches), for stats/tests
+
+	// Write-activity counters (see stats.go): cumulative, lock-free.
+	clientBytes  atomic.Int64 // guest bytes accepted by WriteAt
+	journalBytes atomic.Int64 // bytes appended to the WAL (headers incl.)
+	flattenBytes atomic.Int64 // bytes the applier flattened into objects
+	fillBytes    atomic.Int64 // bytes of zero-fill writes issued
+	punchBytes   atomic.Int64 // bytes punched (TRIM), not device writes
 }
 
 type batchWaiter struct {
@@ -190,6 +217,7 @@ func New(dir string, opts Options) (*Store, error) {
 	}
 	s := &Store{
 		dir: dir, opts: opts, files: map[object.OID]*entry{},
+		meta: map[object.OID]objMeta{},
 	}
 	if opts.CommitMode == CommitJournal {
 		js, err := openJournal(dir, opts.Logf)
@@ -198,6 +226,25 @@ func New(dir string, opts Options) (*Store, error) {
 		}
 		s.jrn = js
 		s.startApplier(js)
+	} else if opts.Intent {
+		// The intent log must recover before the meta index and before
+		// any write: its check reads object files directly.
+		is, err := openIntentLog(dir, opts.Logf)
+		if err != nil {
+			return nil, err
+		}
+		s.intent = is
+	}
+	// Build the meta index from the directory (one readdir, no per-file
+	// stat syscalls). The index is the request-path source of truth for
+	// existence/size, so every store must have it loaded at open — an
+	// OSD that reopened a data directory would otherwise answer
+	// "no such object" for objects it owns.
+	if err := s.Load(); err != nil {
+		if s.jrn != nil {
+			s.journalClose()
+		}
+		return nil, err
 	}
 	if opts.AsyncRing > 0 && s.jrn == nil {
 		ring, err := iouring.New(opts.AsyncRing)
@@ -321,19 +368,20 @@ func (s *Store) path(oid object.OID) string {
 }
 
 // open returns the cached handle for oid, creating the object on first
-// write when create is true.
+// write when create is true. A read of an uncached object consults the
+// meta index instead of the disk: the index (filled by Load and kept
+// current by every mutation) is the request-path source of truth for
+// existence, which is the whole point of keeping meta in RAM.
 func (s *Store) open(oid object.OID, create bool) (*entry, error) {
 	s.mu.RLock()
 	e := s.files[oid]
+	_, indexed := s.meta[oid]
 	s.mu.RUnlock()
 	if e != nil {
 		return e, nil
 	}
-	if !create {
-		// Check existence on disk without caching.
-		if _, err := os.Stat(s.path(oid)); err != nil {
-			return nil, ErrNoSuchObject
-		}
+	if !create && !indexed {
+		return nil, ErrNoSuchObject
 	}
 	return s.openSlow(oid, create)
 }
@@ -392,6 +440,10 @@ func (s *Store) openSlow(oid object.OID, create bool) (*entry, error) {
 		}
 	}
 	e := &entry{f: f, size: st.Size()}
+	// Index the object. Opening is the only moment we see its real
+	// allocation for free (the handle's Stat is off the request path,
+	// once per object lifetime); punches invalidate the hint later.
+	s.meta[oid] = objMeta{size: st.Size(), alloc: fileAllocated(st), allocKnown: true}
 	if s.ring != nil {
 		// os.File.Fd() dups the descriptor (blocking mode) once per
 		// entry: the ring must never call Fd() on the hot path.
@@ -466,7 +518,17 @@ func (s *Store) WriteAt(oid object.OID, p []byte, off int64) (int, error) {
 		if err := s.journalWrite(oid, p, off); err != nil {
 			return 0, err
 		}
+		s.clientBytes.Add(int64(len(p)))
 		return len(p), nil
+	}
+	// Write intent: announce the write (durable in flush/sync modes)
+	// before its data touches the object file (see intent.go).
+	if s.intent != nil {
+		crc := crc32.Checksum(p, crc32cTable)
+		syncIt := s.opts.CommitMode == CommitFlush || s.opts.CommitMode == CommitSync
+		if err := s.intent.appendIntent(oid, off, len(p), crc, syncIt); err != nil {
+			return 0, err
+		}
 	}
 	e, err := s.open(oid, true)
 	if err != nil {
@@ -481,11 +543,27 @@ func (s *Store) WriteAt(oid object.OID, p []byte, off int64) (int, error) {
 			err = ErrNoSpace
 		}
 	}
-	// A write past EOF grew the object.
+	if err == nil && s.intent != nil {
+		s.intent.appendCommit(oid, off)
+	}
+	if err == nil && n > 0 {
+		s.clientBytes.Add(int64(n))
+	}
 	s.mu.Lock()
+	// A data write can allocate (fresh file, refill of a punched
+	// hole): the allocation hint goes stale on every write, not
+	// only on growth.
+	if err == nil && n > 0 {
+		s.metaInvalidate(oid)
+	}
+	// A write past EOF grew the object.
 	if grow := off + int64(n) - e.size; grow > 0 {
 		e.size += grow
 		s.usage += grow
+		if m, ok := s.meta[oid]; ok {
+			m.size = e.size
+			s.meta[oid] = m
+		}
 	}
 	// In CommitNone durability is an explicit Sync, so remember that
 	// this file needs one. CommitFlush fsyncs below and CommitSync uses
@@ -535,11 +613,13 @@ func (s *Store) WriteZeroes(oid object.OID, off, n uint64, sparse bool) error {
 	if sparse && punchSupported {
 		if head, tail, ok := alignRange(off, n, punchAlign); ok {
 			if perr := punchHole(e.f, int64(off+head), int64(tail-head)); perr == nil {
+				s.punchBytes.Add(int64(tail - head))
+				s.metaInvalidateAlloc(oid)
 				// Zero the unaligned head/tail edges around the hole.
-				if err := s.zeroFill(e, off, head); err != nil {
+				if err := s.zeroFill(oid, e, off, head); err != nil {
 					return err
 				}
-				if err := s.zeroFill(e, off+tail, n-tail); err != nil {
+				if err := s.zeroFill(oid, e, off+tail, n-tail); err != nil {
 					return err
 				}
 				return s.commitSync(e)
@@ -548,7 +628,7 @@ func (s *Store) WriteZeroes(oid object.OID, off, n uint64, sparse bool) error {
 			// first, reclaim is a bonus.
 		}
 	}
-	if err := s.zeroFill(e, off, n); err != nil {
+	if err := s.zeroFill(oid, e, off, n); err != nil {
 		return err
 	}
 	return s.commitSync(e)
@@ -572,10 +652,13 @@ func (s *Store) commitSync(e *entry) error {
 // touches usage: a zero-fill over existing blocks changes no allocation
 // (the object is fixed-size), and over a hole it allocates exactly the
 // bytes the kernel zeroes.
-func (s *Store) zeroFill(e *entry, off, n uint64) error {
+func (s *Store) zeroFill(oid object.OID, e *entry, off, n uint64) error {
 	if n == 0 {
 		return nil
 	}
+	s.fillBytes.Add(int64(n))
+	// Writing zeroes into a hole allocates: the hint is stale.
+	s.metaInvalidateAlloc(oid)
 	buf := zeroBuf()
 	for written := uint64(0); written < n; {
 		ch := uint64(len(buf))
@@ -629,7 +712,12 @@ func (s *Store) removeFile(oid object.OID) error {
 	s.mu.Lock()
 	e := s.files[oid]
 	delete(s.files, oid)
-	s.usage -= e.sizeLookup()
+	if m, ok := s.meta[oid]; ok {
+		s.usage -= m.size
+	} else {
+		s.usage -= e.sizeLookup()
+	}
+	delete(s.meta, oid)
 	s.mu.Unlock()
 	if e != nil {
 		e.f.Close()
@@ -648,19 +736,62 @@ func (e *entry) sizeLookup() int64 {
 	return e.size
 }
 
+// metaInvalidate drops the (now stale) allocation hint. Callers hold
+// s.mu (write lock).
+func (s *Store) metaInvalidate(oid object.OID) {
+	if m, ok := s.meta[oid]; ok && m.allocKnown {
+		m.allocKnown = false
+		s.meta[oid] = m
+	}
+}
+
+// metaInvalidateAlloc drops the (now stale) allocation hint after a
+// punch: the next StatInfo re-measures.
+func (s *Store) metaInvalidateAlloc(oid object.OID) {
+	s.mu.Lock()
+	s.metaInvalidate(oid)
+	s.mu.Unlock()
+}
+
+// overlayEnd returns the apparent size implied by un-applied records:
+// the highest offset any record reaches. Records are journal writes
+// (data) and zeroes; sparse zeroes apply as a hole but still extend
+// the file, so they count too.
+func overlayEnd(recs []*journalRec) int64 {
+	var end int64
+	for _, r := range recs {
+		e := int64(r.off) + int64(len(r.data)) + int64(r.n)
+		if e > end {
+			end = e
+		}
+	}
+	return end
+}
+
 // Stat reports the size of an existing object without creating it.
-// It returns fs.ErrNotExist (wrapped by os.Stat) when the object is
-// absent, which is what recovery uses to tell a thin object from a
-// stored one. Unlike Lookup it never creates a file.
+// It is served from the meta index: no disk access on the request
+// path. It returns fs.ErrNotExist when the object is absent. Unlike
+// Lookup it never creates a file. In journal mode the size accounts
+// for un-applied overlay records (read-your-writes for stats).
 func (s *Store) Stat(oid object.OID) (uint64, error) {
-	fi, err := os.Stat(s.path(oid))
-	if err != nil {
-		return 0, err
+	// Overlay first, index second: a record leaves the overlay only
+	// after the applier has updated the index, so an overlay snapshot
+	// taken first can only under-report the pop, never miss it
+	// (missing a pop is safe: the overlay end is a valid size).
+	var oe int64
+	if s.jrn != nil {
+		oe = overlayEnd(s.overlayFor(oid))
 	}
-	if fi.IsDir() {
-		return 0, fs.ErrNotExist
+	s.mu.RLock()
+	m, ok := s.metaLookup(oid)
+	s.mu.RUnlock()
+	if !ok {
+		return 0, ErrNoSuchObject
 	}
-	return uint64(fi.Size()), nil
+	if oe > m.size {
+		return uint64(oe), nil
+	}
+	return uint64(m.size), nil
 }
 
 // ObjectState reports, for NBD base:allocation queries, whether an object
@@ -693,15 +824,60 @@ func (s *Store) ObjectState(oid object.OID) (present, pending bool, statErr erro
 // tell a punched (freed) object from one that still occupies blocks:
 // the apparent size alone cannot, because a punch keeps the size and a
 // preallocated thin object reports the full size.
+//
+// In journal mode un-applied overlay writes are part of the answer:
+// they are acknowledged data the object logically owns, and on a
+// delayed-allocation filesystem the file's st_blocks lags them (it
+// can even read 0 while the applier is between create and write), so
+// the size is the max of the index and the overlay, and the alloc a
+// lower bound of max(file, overlay bytes). Such a reading is never
+// cached: it is not yet the file's stable state.
 func (s *Store) StatInfo(oid object.OID) (size, alloc uint64, err error) {
-	fi, err := os.Stat(s.path(oid))
-	if err != nil {
-		return 0, 0, err
+	// Overlay snapshot first (see Stat): a non-empty overlay always
+	// wins over the index snapshot, which may predate the pop.
+	var oe int64
+	if s.jrn != nil {
+		oe = overlayEnd(s.overlayFor(oid))
 	}
-	if fi.IsDir() {
-		return 0, 0, fs.ErrNotExist
+	s.mu.RLock()
+	m, ok := s.metaLookup(oid)
+	s.mu.RUnlock()
+	if !ok {
+		return 0, 0, ErrNoSuchObject
 	}
-	return uint64(fi.Size()), uint64(fileAllocated(fi)), nil
+	size, alloc = uint64(m.size), uint64(m.alloc)
+	if !m.allocKnown && oe == 0 {
+		// Allocation unknown (indexed at Load, punched since): one
+		// stat, a background/vacuum path cost, and re-measure it now.
+		fi, err := os.Stat(s.path(oid))
+		if err != nil {
+			return 0, 0, err
+		}
+		if fi.IsDir() {
+			return 0, 0, fs.ErrNotExist
+		}
+		size, alloc = uint64(fi.Size()), uint64(fileAllocated(fi))
+		if alloc > 0 {
+			s.mu.Lock()
+			if cur, ok := s.meta[oid]; ok {
+				cur.size, cur.alloc, cur.allocKnown = int64(size), int64(alloc), true
+				s.meta[oid] = cur
+			}
+			s.mu.Unlock()
+		}
+		return size, alloc, nil
+	}
+	if oe > 0 {
+		// Un-applied writes: their bytes are logically allocated even
+		// where the file lags. Never cache a clamped reading.
+		if oe > m.size {
+			size = uint64(oe)
+		}
+		if oe > m.alloc {
+			alloc = uint64(oe)
+		}
+	}
+	return size, alloc, nil
 }
 
 // Lookup returns the cached handle for an existing object (creating it
@@ -787,8 +963,11 @@ func (s *Store) Close() error {
 	return firstErr
 }
 
-// Load rescans the directory so Usage reflects pre-existing objects
-// without opening them all.
+// Load rescans the directory so Usage and the meta index reflect
+// pre-existing objects without opening them all. The directory entry
+// carries the file size (readdir metadata), so this costs no per-file
+// stat syscalls; allocated bytes are left unknown until an object is
+// opened (StatInfo re-measures them on demand).
 func (s *Store) Load() error {
 	des, err := os.ReadDir(s.dir)
 	if err != nil {
@@ -800,6 +979,9 @@ func (s *Store) Load() error {
 		if de.IsDir() {
 			continue
 		}
+		if de.Name() == journalFileName || de.Name() == intentFileName {
+			continue // store log files (hex names would parse as OIDs)
+		}
 		var oid uint64
 		if _, err := fmt.Sscanf(de.Name(), "%016x", &oid); err != nil {
 			continue // not an object file
@@ -807,11 +989,15 @@ func (s *Store) Load() error {
 		if _, ok := s.files[object.OID(oid)]; ok {
 			continue // already accounted
 		}
+		if _, ok := s.meta[object.OID(oid)]; ok {
+			continue // already indexed
+		}
 		st, err := de.Info()
 		if err != nil {
 			return err
 		}
 		s.usage += st.Size()
+		s.meta[object.OID(oid)] = objMeta{size: st.Size()}
 	}
 	return nil
 }
