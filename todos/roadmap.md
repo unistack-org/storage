@@ -154,15 +154,16 @@
         randread 4K ~2.7k IOPS loopback — потолок отладочной сборки, не цель),
         рестарт sdsd данные на месте; тесты: roundtrip, кворум с мёртвым OSD,
         stale-epoch рефреш — `pkg/client/client_test.go`
-- [ ] `pkg/mds` поверх **etcd** (внешний; embedded `cluster/etcdint` для
-      all-in-one): замена DirStore в production; inventory объектов
-  - [ ] **Meta на 2 нодах (блокер полигона из 2 машин)**: NFS с DirStore —
-        только лаборатория (общий ресурс = общая точка отказа, без fencing).
-        MVP: meta-сервис внутри `sdsd` — тонкий KV-RPC (get/put-CAS/delete/
-        list/watch) поверх существующего `sdsnet`, режим `-meta-role
-        active|passive` + плавающий адрес; embedded raft — цельная замена
-        DirStore, но на 2 ноде quorum после потери ноды всё равно нет
-        (детали и сравнение: `test-vm-plan.md` §8.2). Решает владелец (§10)
+- [x] **Meta-консенсус: embedded raft поверх библиотеки etcd** (`go.etcd.io/raft`,
+      та что извлечена из etcd — не внешний сервер): `pkg/meta/raftstore.go` +
+      `rafttransport.go` + `raftproxy.go` (пиши-прокси follower→leader),
+      `-raft/-raft-peers/-raft-dir/-raft-proxy` в `unistord`, witness-voter без
+      дисков; без кворума meta read-only (503). DirStore остаётся для
+      лаборатории. Тесты: `pkg/meta/raftstore_test.go`.
+  - [x] **Meta на 2+1 нодах (полигон из 2 машин)**: третьим голосом —
+        witness-voter (нода без OSD/экспортов), кворум 2/3 переживает потерю
+        одной storage-ноды; плавающего адреса нет — клиенты знают всех
+        участников (raft-peers).
 - [ ] CLI `unistorage`: node add/ls/out, volume create/ls/rm, map dump/check,
       reweight, recovery status
 - [x] **CRUSH — ключевой deliverable: вынесен в отдельный репозиторий
@@ -323,10 +324,15 @@
       реплики с приоритетом «локальная → наименее загруженная». Главный
       кандидат на закрытие разрыва QD128 (41.6K vs 128K, `todos/bench-stand.md`),
       `pkg/client` + `pkg/placement`. Детали: `todos/vitastor-ideas.md` §3.1
-- [ ] **ENOSPC и полный журнал** (урок Vitastor: у нас в коде ENOSPC не
-      обрабатывается нигде): OSD выживает при 100% заполнении и предупреждает
-      в `status`; полный журнал → `EAGAIN`/backpressure, клиент ретраит (у них
-      был зависший клиент); метрика свободного места под журнал.
+- [x] **ENOSPC и полный журнал** — закрыто: `store.ErrNoSpace` → `StatusNoSpace`
+      на wire (`pkg/sdsnet/server.go`), ENOSPC реплики НЕ считается гибелью OSD
+      (не в `noteFailure`), клиент превращает его в `ErrNoSpace` без зависания
+      (`pkg/client/client.go`, writeChunk); journal: полный журнал →
+      `ErrNoSpace` из `pkg/journal` (sticky poison) наружу, не падение OSD;
+      `/v1/status` отдаёт warnings (диск/OSD). Осталось по желанию: отдельная
+      метрика свободного места под журнал.
+      Тесты: `pkg/sdsnet/nospace_test.go`, `pkg/client/quota_test.go`,
+      `pkg/journal/space_linux_test.go`.
       `pkg/store` + `pkg/osd` + `pkg/client`. Детали: `todos/vitastor-ideas.md` §4.2
 - [ ] **Write Intent Journal + атомарные записи NVMe (цель WA → 1)** — смысл их
       доклада Highload'2025: перед записью данных пишем намерение «обновлю
@@ -443,18 +449,21 @@
       `pkg/vduse`): дрейн и закрытие сокетов схемой `SO_LINGER` + `shutdown()`
       + `close()` (у них без этого мусор в io_uring); `/healthcheck` в
       meta/мониторе для оркестрации. Детали: `vitastor-ideas.md` §6.3–6.4
-- [ ] **Безопасность транспорта и meta (по их рецепту 3.1.0, дешёвое первым)**:
-      TLS/mTLS к meta/etcd + DNS-имена; шифрование транспорта AES-GCM
-      **по умолчанию только заголовки** (данные открыты — быстро; см. цену
-      AES 12.6 GB/s), опция — всё; транспортные чексуммы xxh3 (по умолчанию
-      данные) + дисковые `xxh3_32`; ACL пользователей, enforced **и в meta, и
-      в OSD** (их исправление: ACL обходились на OSD). Наш `pkg/sdsnet` сейчас
-      не шифруется. Детали: `vitastor-ideas.md` §5
-- [ ] **Режимы `immediate_commit` (flush/journal/none) + fsync-батчинг** —
-      см. пункт «Ленивый fsync» выше; каждый режим обязан иметь тест
-      «подтверждённая запись не теряется при power-loss». Клиентский
-      writeback-буфер (`client_enable_writeback`) — только как опция для
-      бенчей, см. Риски п.6
+- [x] **Безопасность транспорта (дешёвая часть рецепта 3.1.0)**: mutual TLS
+      (`-tls-cert/-tls-key/-tls-ca`, `pkg/tlsconf`) на OSD data plane
+      (`pkg/sdsnet/server.go` TLS listener), raft-транспорте и admin API;
+      токен admin API (`-admin-token`, `Authorization: Bearer`); тесты
+      `pkg/sdsnet/tls_test.go`, `pkg/tlsconf/tlsconf_test.go`.
+      Осталось (дорогая часть, по запросу): AES-GCM шифрование заголовков в
+      sdsnet, транспортные/дисковые чексуммы xxh3, ACL пользователей,
+      AES-256-XTS E2E (Phase 6). Детали: `vitastor-ideas.md` §5
+- [x] **Режимы `immediate_commit` (flush/journal/none) + fsync-батчинг** —
+      сделано: `-commit none|flush|sync|journal` + `-fsync-batch`
+      (`pkg/store`, `unistord`); journal = WAL с ack по fsync журнала,
+      фоновое разглаживание, replay при старте; тесты power-loss —
+      `pkg/store/journal_test.go` (crash survival, torn tail, remove
+      checkpoint). Клиентский writeback-буфер не делали (только для бенчей,
+      см. Риски п.6). Детали: `vitastor-ideas.md` §4.1
 - [ ] **`recovery_tune_interval`** — авторегулирование скорости
       recovery/rebalance по влиянию на клиентский I/O, приоритет клиента над
       восстановлением; стыкуется с «восстановление пообъектное» выше
@@ -474,13 +483,15 @@
       и `/metrics`) и `unistorage` (единственный контрол, клиент того же
       HTTP API). HTTP живёт внутри демона (каркас — уже используемый `-pprof`),
       отдельного API-демона нет. Детали: `test-vm-plan.md` §3
-- [ ] **HTTP import/export диска** (требование полигона тестовых ВМ):
-      `POST /v1/volumes/{name}/import` — объявленный размер, чанки 4 МиБ через
-      `Volume.WriteAt`, resume по смещению, xxh3-сверка, пропуск нулевых
-      чанков; `GET /v1/volumes/{name}/export` — стрим 4 МиБ-окнами в
-      переиспользуемый буфер, разреженно по `StatusNotFound`, rate limit,
-      подписываемая ссылка. Формат raw; конвертация qemu-img — на стороне
-      потребителя. Детали: `test-vm-plan.md` §4
+- [x] **HTTP import/export диска** (требование полигона тестовых ВМ) —
+      реализовано в `sds-nbd/cmd/unistord/admin.go`: `PUT
+      /v1/volumes/{name}/import?offset=N` (поток octet-stream, чанки 1 МиБ
+      через `Volume.WriteAt`, resume по смещению, xxh3-хэш потока), `POST
+      /v1/volumes/{name}/import` `{"url":...}` — асинхронный импорт-джоб с
+      докачкой; `GET /v1/volumes/{name}/export` — raw-стрим окнами в
+      переиспользуемый буфер, разреженно (дыры → нули). Формат raw;
+      qemu-img — на стороне потребителя. Тесты: `admin_exports_test.go`
+      (ExportEndpoints, ExportReadOnlyPersisted, ImportJobAsync).
 - [ ] **Авто-детект параметров тома клиентом** (block size, immediate_commit,
       гранулярность битмапы) из meta, а не из конфига клиента — у них это
       убрало целый класс рассинхронов; плюс `skip_corrupted_meta_entries` и
