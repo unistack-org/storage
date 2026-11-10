@@ -32,8 +32,10 @@ github.com/prometheus/procfs v0.22.0 h1:6q9+/JL9IKAPbCmBrv9n5O5Ty3NKnciV5X7YGw0o
 github.com/prometheus/procfs v0.22.0/go.mod h1:CvmFr/GVhIjIvWJZW3tgkODBQMRIf0EyWMQLHCHab58=
 github.com/stretchr/testify v1.12.1 h1:EuwCh5fleGS7H32xRwO3wRGT7DxrDhLAT6FF8MpWDWE=
 github.com/stretchr/testify v1.12.1/go.mod h1:MDEgiDPPsNp5cuIrHPPCyornHKgEVbtFUmoNlxoYthg=
-github.com/unistack-org/crushkv v0.0.0-20261107123532-3e0600f56452 h1:+HCUCIvG5hgXay1uEOUnkcgygsOGB1pgzDT/J03j2co=
-github.com/unistack-org/crushkv v0.0.0-20261107123532-3e0600f56452/go.mod h1:RQFrD7PvPgLSUEy9PIbmPjBl5Dzjba9x/SAIuwbKoLQ=
+github.com/unistack-org/crushkv v0.0.0-20261110100949-c2e4bb3b3533 h1:FEkoDpA6deScV6Dd3HIkX7htE530fqZQKSOFLdT3CoE=
+github.com/unistack-org/crushkv v0.0.0-20261110100949-c2e4bb3b3533/go.mod h1:RQFrD7PvPgLSUEy9PIbmPjBl5Dzjba9x/SAIuwbKoLQ=
+github.com/unistack-org/crushkv v0.0.0-20261110102122-43447c11ca8a h1:JXjzYtDJs0QcVTxl3BtcvUZIrFWocrbTArNa67ovPas=
+github.com/unistack-org/crushkv v0.0.0-20261110102122-43447c11ca8a/go.mod h1:RQFrD7PvPgLSUEy9PIbmPjBl5Dzjba9x/SAIuwbKoLQ=
 go.etcd.io/bbolt v1.5.0 h1:S7GAl7Fxv12yohbwFfIbQCGDWbQbtDGPET4P/bD4lxU=
 go.etcd.io/bbolt v1.5.0/go.mod h1:mkltfYE5aUHQxUct9N9V+Kp7aSjFqjgrhcXIS70Lrdk=
 go.etcd.io/raft/v3 v3.7.0 h1:BGzlwx07bLv8PW6OU5HObuz1y4hlPZUXA07pM1mPUh4=
