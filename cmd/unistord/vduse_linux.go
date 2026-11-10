@@ -174,8 +174,15 @@ func (m *vduseManager) list() []vduseDeviceInfo {
 // create registers and serves one device (boot and runtime paths).
 func (m *vduseManager) create(ctx context.Context, devname, volume string, be vduse.Backend, readOnly bool) error {
 	run, stop := context.WithCancel(ctx)
+	nq := m.flags.Queues
+	if nq < 1 {
+		nq = 1
+	}
+	if nq > 254 {
+		nq = 254
+	}
 	dev, err := vduse.NewDevice(devname, vduse.Options{
-		NumQueues:       1,
+		NumQueues:       uint16(nq),
 		Trim:            m.flags.Trim,
 		WriteZeroes:     m.flags.WriteZeroes,
 		ReadOnly:        readOnly,
@@ -234,8 +241,8 @@ func (m *vduseManager) closeAll() {
 
 // startVDUSE is the boot entry point kept for main.go: it wires the
 // manager and starts the -vduse specs.
-func startVDUSE(ctx context.Context, logger *log.Logger, es []*nbd.Export, specs []string, trim, writeZeroes, readAhead bool, readAheadWindow int) (*vduseManager, error) {
-	m := newVDUSEManager(logger, vduseFlags{Trim: trim, WriteZeroes: writeZeroes, ReadAhead: readAhead, ReadAheadWindow: readAheadWindow})
+func startVDUSE(ctx context.Context, logger *log.Logger, es []*nbd.Export, specs []string, trim, writeZeroes, readAhead bool, readAheadWindow, queues int) (*vduseManager, error) {
+	m := newVDUSEManager(logger, vduseFlags{Trim: trim, WriteZeroes: writeZeroes, ReadAhead: readAhead, ReadAheadWindow: readAheadWindow, Queues: queues})
 	if err := m.start(ctx, es, specs); err != nil {
 		return nil, err
 	}

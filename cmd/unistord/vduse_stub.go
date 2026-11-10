@@ -40,8 +40,8 @@ func (m *vduseManager) closeAll() {}
 
 // startVDUSE keeps the boot entry point: on this platform it fails when
 // -vduse specs were requested, otherwise returns an idle manager.
-func startVDUSE(ctx context.Context, logger *log.Logger, es []*nbd.Export, specs []string, trim, writeZeroes, readAhead bool, readAheadWindow int) (*vduseManager, error) {
-	m := newVDUSEManager(logger, vduseFlags{Trim: trim, WriteZeroes: writeZeroes, ReadAhead: readAhead, ReadAheadWindow: readAheadWindow})
+func startVDUSE(ctx context.Context, logger *log.Logger, es []*nbd.Export, specs []string, trim, writeZeroes, readAhead bool, readAheadWindow, queues int) (*vduseManager, error) {
+	m := newVDUSEManager(logger, vduseFlags{Trim: trim, WriteZeroes: writeZeroes, ReadAhead: readAhead, ReadAheadWindow: readAheadWindow, Queues: queues})
 	if err := m.start(ctx, es, specs); err != nil {
 		return nil, err
 	}

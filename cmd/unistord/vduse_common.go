@@ -24,6 +24,9 @@ type vduseFlags struct {
 	// ReadAheadWindow bounds the per-queue prefetch window in bytes;
 	// 0 selects the package default (256 KiB).
 	ReadAheadWindow int
+	// Queues is the number of virtqueues per device (VIRTIO_BLK_F_MQ);
+	// 0/1 means a single queue, the historical behaviour.
+	Queues int
 }
 
 // parseVDUSESpec splits "export" / "export=devname".

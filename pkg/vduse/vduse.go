@@ -41,18 +41,19 @@ const (
 	// avail ring forever). Kicking on every publish is the correct
 	// behaviour for a device that does not maintain event indices.
 	featVersion1      = 1 << 32 // virtio 1.0 device, legacy not offered
-	featBlkSizeMax    = 1 << 1  // config.size_max valid
-	featBlkSegMax     = 1 << 2  // config.seg_max valid
-	featBlkBlkSize    = 1 << 10 // config.blk_size valid
-	featBlkFlush      = 1 << 9  // REQ_FLUSH supported
-	featBlkDiscard    = 1 << 13 // REQ_DISCARD supported
-	featBlkTopology   = 1 << 14 // config topology fields valid
-	featBlkWriteZeroe = 1 << 15 // REQ_WRITE_ZEROES supported
+	featBlkSizeMax    = 1 << 1  // VIRTIO_BLK_F_SIZE_MAX: config.size_max valid
+	featBlkSegMax     = 1 << 2  // VIRTIO_BLK_F_SEG_MAX: config.seg_max valid
+	featBlkBlkSize    = 1 << 6  // VIRTIO_BLK_F_BLK_SIZE: config.blk_size valid
+	featBlkFlush      = 1 << 9  // VIRTIO_BLK_F_FLUSH: REQ_FLUSH supported
+	featBlkDiscard    = 1 << 13 // VIRTIO_BLK_F_DISCARD: REQ_DISCARD supported
+	featBlkTopology   = 1 << 10 // VIRTIO_BLK_F_TOPOLOGY: config topology fields valid
+	featBlkWriteZeroe = 1 << 14 // VIRTIO_BLK_F_WRITE_ZEROES: REQ_WRITE_ZEROES supported
 	// config.wce is writable only with VIRTIO_BLK_F_CONFIG_WCE, which
 	// the VDUSE kernel driver forbids (read-only config space), so we
 	// advertise read-only VIRTIO_BLK_F_FLUSH and keep wce=1 fixed.
 	featAccessPlatform = 1 << 33 // VIRTIO_F_ACCESS_PLATFORM: required by VDUSE
-	featBlkRO          = 1 << 6  // VIRTIO_BLK_F_RO: read-only device
+	featBlkRO          = 1 << 5  // VIRTIO_BLK_F_RO: read-only device
+	featBlkMQ          = 1 << 12 // VIRTIO_BLK_F_MQ: config.num_queues valid
 )
 
 // Features is the feature word offered to the guest (discard and
@@ -66,9 +67,11 @@ const Features = uint64(featVersion1 | featRingIndirect |
 
 // FeatureMask returns the feature word for a device, dropping the
 // discard / write-zeroes advertisement when the backend cannot honour
-// them (same rationale as sdsd's -trim/-write-zeroes flags), and adding
-// VIRTIO_BLK_F_RO for a read-only device.
-func FeatureMask(trim, writeZeroes, readOnly bool) uint64 {
+// them (same rationale as sdsd's -trim/-write-zeroes flags), adding
+// VIRTIO_BLK_F_RO for a read-only device, and VIRTIO_BLK_F_MQ when the
+// device is created with more than one virtqueue (the driver then
+// spreads requests over config.num_queues queues).
+func FeatureMask(trim, writeZeroes, readOnly, mq bool) uint64 {
 	f := Features
 	if !trim {
 		f &^= featBlkDiscard
@@ -78,6 +81,9 @@ func FeatureMask(trim, writeZeroes, readOnly bool) uint64 {
 	}
 	if readOnly {
 		f |= featBlkRO
+	}
+	if mq {
+		f |= featBlkMQ
 	}
 	return f
 }

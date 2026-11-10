@@ -430,7 +430,7 @@ func NewDevice(name string, opts Options, be Backend) (*Device, error) {
 	_, statErr := os.Stat("/dev/vduse/" + name)
 	attached := statErr == nil
 	if !attached {
-		features := FeatureMask(opts.Trim, opts.WriteZeroes, opts.ReadOnly)
+		features := FeatureMask(opts.Trim, opts.WriteZeroes, opts.ReadOnly, nq > 1)
 		if err := CreateDevice(name, nq, features, ConfigSpace(be.Size(), nq)); err != nil {
 			return nil, err
 		}
@@ -547,8 +547,12 @@ func (d *Device) Close() error {
 		// worker pool (in-flight jobs release their pins and touch
 		// guest memory), and only after workers.Stop may we close the
 		// dev fd (completions inject IRQs through it) and unmap.
-		// d.vqs is nil when Close runs after a failed setupVQs.
+		// d.vqs is nil when Close runs after a failed setupVQs, and a
+		// partially built queue has no kickFD yet.
 		for _, q := range d.vqs {
+			if q == nil {
+				continue
+			}
 			var ea [8]byte
 			binary.LittleEndian.PutUint32(ea[0:], q.idx)
 			binary.LittleEndian.PutUint32(ea[4:], 0xFFFFFFFF) // VDUSE_EVENTFD_DEASSIGN
@@ -562,7 +566,7 @@ func (d *Device) Close() error {
 		}
 		d.lockDrains()
 		for _, q := range d.vqs {
-			if q.jobs == nil {
+			if q == nil || q.jobs == nil {
 				continue
 			}
 			d.quiesce(q)
