@@ -10,7 +10,7 @@ info:
     (blob upload) / export (blob download), QoS classes, quota, online
     resize, vacuum, recovery, exports (NBD/VDUSE), cluster status.
     All endpoints answer JSON except the byte-stream import/export bodies.
-    When unistord runs with -admin-token, every endpoint except /healthz
+    When unistord runs with -admin-token, every endpoint except /healthz and /healthcheck
     requires "Authorization: Bearer <token>".
     Prometheus metrics live on a separate -metrics-addr listener and are
     not part of this API.
@@ -41,6 +41,29 @@ paths:
           content:
             text/plain:
               schema: {type: string, example: "ok"}
+  /healthcheck:
+    get:
+      tags: [meta]
+      summary: Cluster health verdict for orchestration
+      description: >
+        Named checks (meta, raft, map, osds, volumes, disks) with per-check
+        state ok/warn/fail and an overall status. HTTP 200 when the cluster
+        serves I/O (ok or warn), 503 when it is degraded (fail). Unauthenticated
+        like /healthz: probes run inside trusted infrastructure and the reply
+        carries no secrets. For time-series monitoring scrape the separate
+        -metrics listener, not this endpoint.
+      security: []
+      responses:
+        "200":
+          description: cluster healthy (status ok or warn)
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Healthcheck"}
+        "503":
+          description: cluster degraded (status fail)
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Healthcheck"}
   /v1/status:
     get:
       tags: [meta]
@@ -581,7 +604,7 @@ components:
     bearerAuth:
       type: http
       scheme: bearer
-      description: "required when unistord runs with -admin-token (all routes except /healthz)"
+      description: "required when unistord runs with -admin-token (all routes except /healthz and /healthcheck)"
   parameters:
     VolumeName:
       name: name
@@ -601,6 +624,19 @@ components:
         application/json:
           schema: {$ref: "#/components/schemas/Error"}
   schemas:
+    Healthcheck:
+      type: object
+      properties:
+        status: {type: string, enum: [ok, warn, fail], description: overall verdict}
+        time: {type: string, format: date-time}
+        checks:
+          type: array
+          items:
+            type: object
+            properties:
+              name: {type: string, description: "check id: meta|raft|map|osds|volumes|disks"}
+              state: {type: string, enum: [ok, warn, fail]}
+              message: {type: string}
     Error:
       type: object
       properties:

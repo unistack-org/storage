@@ -12,6 +12,7 @@
 // Routes (Go 1.22 method+wildcard patterns):
 //
 //	GET    /healthz
+//	GET    /healthcheck                 orchestration verdict (200 ok / 503 fail)
 //	GET    /v1/status
 //	GET    /v1/osds
 //	GET    /v1/volumes
@@ -105,6 +106,7 @@ func newAdminServer(ms meta.Store, addr string, logger *log.Logger, raftSt *meta
 		jobs: newJobRegistry(), importHTTP: &http.Client{Timeout: 0}}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", a.handleHealthz)
+	mux.HandleFunc("GET /healthcheck", a.handleHealthcheck)
 	mux.HandleFunc("GET /v1/exports", a.handleListExports)
 	mux.HandleFunc("POST /v1/exports", a.handleAddExport)
 	mux.HandleFunc("DELETE /v1/exports/{name}", a.handleDeleteExport)
@@ -138,7 +140,15 @@ func newAdminServer(ms meta.Store, addr string, logger *log.Logger, raftSt *meta
 	mux.HandleFunc("POST /v1/recovery/{name}", a.handleRecoveryRepair)
 	var handler http.Handler = mux
 	if token != "" {
-		handler = a.bearerGate(mux)
+		// /healthcheck, like /healthz, is a probe endpoint: probes run
+		// inside trusted infrastructure and carry no secrets, so it
+		// answers outside the token gate. bearerGate (exports.go) only
+		// exempts /healthz, so mount /healthcheck on an outer mux.
+		gated := a.bearerGate(mux)
+		outer := http.NewServeMux()
+		outer.HandleFunc("GET /healthcheck", a.handleHealthcheck)
+		outer.Handle("/", gated)
+		handler = outer
 	}
 	a.srv = &http.Server{Addr: addr, Handler: handler, ReadHeaderTimeout: 10 * time.Second, TLSConfig: tlsCfg}
 	return a, nil

@@ -240,17 +240,33 @@ randread QD128: 41.6K против их 128K (×3). Their bottleneck = CPU + с�
 ## 6. P2 — Ops и наблюдаемость
 
 - [ ] **6.1 Prometheus exporter + Grafana-дашборд** (у них с 1.7.0, дашборд
-      публичный). У нас метрик **нет вообще** — начать с OSD-хистограмм
-      латентности, IOPS/пропускной способности по типам, очереди, WA,
-      состояния PG. `[1.7.0]`
+      публичный). `[1.7.0]`
+      — экспортер **готов и проверен**: unistord `-metrics ADDR` отдаёт
+      `/metrics` (unistor_osd_requests_total/bytes/latency-гистограммы,
+      osd_connections, export_* + QoS sustained, unistor_cluster
+      {healthy,map_epoch,osds,osds_live,volumes,raw_bytes}, raft_state,
+      unistor_osd{up,weight}, osd_disk_bytes, volume, recovery_*_total,
+      vacuum) — скоуп подтверждён скрейпом в смоке. Осталось: Grafana-
+      дашборд (json) и алерты.
 - [ ] **6.2 Усреднённая, а не суммарная статистика** (`usec/count`),
       `etcd_stats_interval`, чистка статистики по удалённым объектам. Лёгкая,
       но важная деталь: у них сумма по OSD давала бессмысленные лаги. `[3.2.x]`
-- [ ] **6.3 `/healthcheck` в meta/мониторе** + явные состояния для оркестрации. `[3.1.0]`
-- [ ] **6.4 Graceful SIGINT/SIGTERM** во всех серверах (`sdsd`, `sds-nbd`,
+- [x] **6.3 `/healthcheck` в meta/мониторе** + явные состояния для оркестрации. `[3.1.0]`
+      — сделано: `GET /healthcheck` в админ-HTTP (health.go) с именованными
+      проверками meta/raft/map/osds/volumes/disks, состояния ok/warn/fail,
+      HTTP 200 (ok|warn) / 503 (fail); вне bearer-gate (пробный эндпоинт,
+      как /healthz). CLI `unistorctl healthcheck [-http URL] [-json]` —
+      exit 0/1 для оркестрации; «демон не ответил» = unhealthy. Специка
+      обновлена (schema Healthcheck).
+- [x] **6.4 Graceful SIGINT/SIGTERM** во всех серверах (`sdsd`, `sds-nbd`,
       `pkg/vduse`): дрейн, закрытие сокетов по их схеме
       `SO_LINGER` + `shutdown()` + `close()` (у них был мусор в io_uring без
       этого). `[3.1.0, 3.2.x]`
+      — сделано: единственный серверный main у нас — `unistord`
+      (`signal.NotifyContext` + SIGTERM-дрейн, закрывает NBD/VDUSE-экспорты,
+      OSD, raft, admin, metrics; тесты дрейна есть). Отдельных демонов нет:
+      `pkg/vduse` и nbd-сервер живут внутри unistord, `sdsbench`/`unistorctl`
+      — CLI-инструменты без долгоживущего состояния.
 - [x] **6.5 HTTP API + OpenAPI-спека** — специка написана: `api/openapi.yaml`
       (3.0.3, 25 путей, Bearer-токен, схемы из `admin.go`/`jobs.go`/
       `exports.go`). HTTP API уже живёт внутри unistord. Осталось: CLI

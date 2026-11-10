@@ -125,6 +125,8 @@ func dispatch(ctx context.Context, cl *client.Cluster, ms meta.Store, args []str
 		return recoveryCmd(ctx, cl, args[1:])
 	case "status":
 		return statusCmd(ctx, args[1:])
+	case "healthcheck":
+		return healthcheckCmd(ctx, args[1:])
 	default:
 		usage()
 		return fmt.Errorf("unknown command %q", args[0])
@@ -1212,6 +1214,67 @@ func statusCmd(ctx context.Context, args []string) error {
 	return nil
 }
 
+// healthcheckCmd asks the running unistord for the orchestration verdict
+// (/healthcheck) and prints one line per check. The exit code is the
+// contract: 0 when the cluster is healthy (warn counts as healthy), 1
+// when it is not — including "the daemon did not answer", which is
+// itself an unhealthy answer. This is what an orchestrator, a cron
+// probe, or a systemd ExecStartPre condition runs.
+func healthcheckCmd(ctx context.Context, args []string) error {
+	fs := flag.NewFlagSet("healthcheck", flag.ExitOnError)
+	httpURL := fs.String("http", "http://127.0.0.1:8443", "unistord admin URL")
+	asJSON := fs.Bool("json", false, "print the raw reply instead of the table")
+	fs.Parse(args)
+	url := strings.TrimRight(*httpURL, "/") + "/healthcheck"
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return err
+	}
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("cluster is unhealthy: unistord did not answer at %s: %v", url, err)
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return fmt.Errorf("cluster is unhealthy: reading %s: %v", url, err)
+	}
+	if *asJSON {
+		os.Stdout.Write(body)
+		if len(body) > 0 && body[len(body)-1] != '\n' {
+			fmt.Println()
+		}
+	}
+	var hc struct {
+		Status string `json:"status"`
+		Time   string `json:"time"`
+		Checks []struct {
+			Name    string `json:"name"`
+			State   string `json:"state"`
+			Message string `json:"message"`
+		} `json:"checks"`
+	}
+	if err := json.Unmarshal(body, &hc); err != nil {
+		return fmt.Errorf("cluster is unhealthy: parse reply from %s: %w", url, err)
+	}
+	if !*asJSON {
+		fmt.Printf("%-10s %s\n", "CHECK", "STATE")
+		for _, c := range hc.Checks {
+			fmt.Printf("%-10s %-5s %s\n", c.Name, c.State, c.Message)
+		}
+	}
+	if resp.StatusCode == http.StatusOK && (hc.Status == "ok" || hc.Status == "warn") {
+		if !*asJSON {
+			fmt.Println("healthy")
+		}
+		return nil
+	}
+	if !*asJSON {
+		fmt.Println("UNHEALTHY")
+	}
+	return fmt.Errorf("cluster is unhealthy: status %q (HTTP %d)", hc.Status, resp.StatusCode)
+}
+
 // ---- helpers ----
 
 func usage() {
@@ -1232,6 +1295,7 @@ map dump [-format raw|text|json|yaml|binary] | map check [file] [-pg-num n] [-re
 vacuum [ls|run [vol]]  (M1.4: free deleted volumes' objects; run <vol> = targeted tombstone, live volume = punch out all-zero objects)
 recovery ls | recovery check <vol> | recovery run <vol> [-iops N] [-bps B]
 status [-http URL]  (reads unistord admin /v1/status; default http://127.0.0.1:8443)
+healthcheck [-http URL] [-json]  (verdict on unistord /healthcheck; exit 1 when the cluster is unhealthy)
 
 Sizes and bandwidth accept K/M/G/T suffixes (10G, 200M). Rates are
 iops[:bytes/s]; all zero (or a missing class) = unlimited, the admin
