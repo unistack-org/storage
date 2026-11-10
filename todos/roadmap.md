@@ -324,12 +324,16 @@
       на ТБ: сырьё+btree+журнал / +11% / +18% худший случай) и инвариантом
       «все записи одного объекта — в одном блоке меты» (иначе потеря блока
       меты = «выбросить весь диск»). Детали: `todos/vitastor-ideas.md` §2.5
-- [ ] **Чтение с любой реплики + выбор primary по номеру PG** (урок Vitastor:
-      primary выбирается по номеру PG, а не хешем — ради read-locality; плюс
-      `local_reads` — не читать через DC): в RF3 W2 разрешить чтение с любой
-      реплики с приоритетом «локальная → наименее загруженная». Главный
-      кандидат на закрытие разрыва QD128 (41.6K vs 128K, `todos/bench-stand.md`),
-      `pkg/client` + `pkg/placement`. Детали: `todos/vitastor-ideas.md` §3.1
+- [x] **Чтение с любой реплики + выбор primary по номеру PG** — закрыто:
+      чтение и так падало на любую живую реплику (fall-through в `readChunk`),
+      добавлен порядок предпочтений `Volume.orderReadRefs` (`pkg/client`):
+      «локальный OSD (`SetLocalOSDs`, пара к `SetLocalDial`) → наименее
+      загруженный (`Pool.Inflight` в `pkg/sdsnet`) → порядок pg-строки
+      (primary-by-PG как стабильный tiebreak)». Хуки в `readChunk` и
+      `readGenChunk` (снапшоты); `unistord` объявляет свои OSD локальными.
+      Тесты: `pkg/client/replica_read_test.go` (выживание при гибели 2/3
+      реплик; локальная реплика забирает всё чтение — по счётчику `Pool.Ops`).
+      Осталось по желанию: флаг локальности для мультi-DC раскладки.
 - [x] **ENOSPC и полный журнал** — закрыто: `store.ErrNoSpace` → `StatusNoSpace`
       на wire (`pkg/sdsnet/server.go`), ENOSPC реплики НЕ считается гибелью OSD
       (не в `noteFailure`), клиент превращает его в `ErrNoSpace` без зависания
@@ -478,6 +482,11 @@
       старую границу; resize без реконнекта, VDUSE уведомляет гостя за ~2 с.
       Осталось: online expand в CSI (внешний проект). Детали:
       `vitastor-ideas.md` §4.5
+- [x] **OpenAPI-спека админ HTTP API** — `api/openapi.yaml` (3.0.3): все 25
+      путей админ-API unistord (`admin.go`/`exports.go`/`jobs.go`) со схемами
+      запросов/ответов, Bearer-авторизация (`-admin-token`), octet-stream для
+      импорта/экспорта блобов; `/metrics` — отдельный слушатель, вне спеки.
+      HTTP API уже живёт в демоне; CLI поверх него — ниже.
 - [ ] **`unistorage serve`: HTTP API + OpenAPI** — наш CLI проектируется как
       оболочка над HTTP API (у них это дало интеграции с CSI/дашбордами);
       вместе с `status` (машиночитаемым, с предупреждениями: 100% OSD,

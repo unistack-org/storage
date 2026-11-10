@@ -1,0 +1,821 @@
+# Unistack admin HTTP API (unistord -admin-addr).
+# Source of truth: sds-nbd/cmd/unistord/admin.go, exports.go, jobs.go.
+# Keep in sync with the handlers; unistorctl talks to exactly this API.
+openapi: 3.0.3
+info:
+  title: Unistack Admin API
+  version: 1.0.0
+  description: >
+    Control plane of a unistord node: volumes, snapshots, clones, import
+    (blob upload) / export (blob download), QoS classes, quota, online
+    resize, vacuum, recovery, exports (NBD/VDUSE), cluster status.
+    All endpoints answer JSON except the byte-stream import/export bodies.
+    When unistord runs with -admin-token, every endpoint except /healthz
+    requires "Authorization: Bearer <token>".
+    Prometheus metrics live on a separate -metrics-addr listener and are
+    not part of this API.
+servers:
+  - url: http://127.0.0.1:8443
+    description: default -admin-addr of a local unistord
+security:
+  - bearerAuth: []
+tags:
+  - name: meta
+  - name: volumes
+  - name: snapshots
+  - name: data
+  - name: exports
+  - name: qos
+  - name: vacuum
+  - name: recovery
+  - name: jobs
+paths:
+  /healthz:
+    get:
+      tags: [meta]
+      summary: Liveness probe (plain text "ok")
+      security: []
+      responses:
+        "200":
+          description: alive
+          content:
+            text/plain:
+              schema: {type: string, example: "ok"}
+  /v1/status:
+    get:
+      tags: [meta]
+      summary: Operational overview (liveness, epoch, health, warnings)
+      responses:
+        "200":
+          description: status
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Status"}
+  /v1/osds:
+    get:
+      tags: [meta]
+      summary: Registered OSDs (crush weights, addrs)
+      responses:
+        "200":
+          description: osd list
+          content:
+            application/json:
+              schema:
+                type: array
+                items: {$ref: "#/components/schemas/OSDInfo"}
+  /v1/volumes:
+    get:
+      tags: [volumes]
+      summary: List volumes with allocation usage
+      responses:
+        "200":
+          description: volume list
+          content:
+            application/json:
+              schema:
+                type: array
+                items: {$ref: "#/components/schemas/VolumeView"}
+    post:
+      tags: [volumes]
+      summary: Create a volume
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/CreateVolumeRequest"}
+      responses:
+        "201":
+          description: created
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/VolumeView"}
+        "400": {$ref: "#/components/responses/BadRequest"}
+        "409":
+          description: volume already exists
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Error"}
+  /v1/volumes/{name}:
+    parameters:
+      - $ref: "#/components/parameters/VolumeName"
+    get:
+      tags: [volumes]
+      summary: One volume
+      responses:
+        "200":
+          description: volume
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/VolumeView"}
+        "404": {$ref: "#/components/responses/NotFound"}
+    delete:
+      tags: [volumes]
+      summary: Delete a volume (ranges go to the vacuum; delayed purge)
+      responses:
+        "204": {description: deleted}
+        "404": {$ref: "#/components/responses/NotFound"}
+  /v1/volumes/{name}/qos:
+    parameters:
+      - $ref: "#/components/parameters/VolumeName"
+    put:
+      tags: [volumes, qos]
+      summary: Attach a QoS class template to a volume (live, via meta watch)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                qos_template: {type: string, description: "QoS class name; empty string removes"}
+      responses:
+        "200":
+          description: updated volume
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/VolumeView"}
+        "404": {$ref: "#/components/responses/NotFound"}
+  /v1/volumes/{name}/quota:
+    parameters:
+      - $ref: "#/components/parameters/VolumeName"
+    put:
+      tags: [volumes]
+      summary: Set the allocation cap live ("0" = cap at volume size)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [quota]
+              properties:
+                quota: {type: string, description: "bytes or K/M/G/T form; \"0\" = size"}
+      responses:
+        "200":
+          description: updated volume
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/VolumeView"}
+        "400": {$ref: "#/components/responses/BadRequest"}
+        "404": {$ref: "#/components/responses/NotFound"}
+  /v1/volumes/{name}/resize:
+    parameters:
+      - $ref: "#/components/parameters/VolumeName"
+    put:
+      tags: [volumes]
+      summary: Grow a volume online (grow-only; open exports pick it up)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [size]
+              properties:
+                size: {type: string, description: "bytes or K/M/G/T form; must exceed current"}
+      responses:
+        "200":
+          description: resized volume
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/VolumeView"}
+        "400":
+          description: bad size / shrink refused
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Error"}
+        "404": {$ref: "#/components/responses/NotFound"}
+  /v1/volumes/{name}/snapshot:
+    parameters:
+      - $ref: "#/components/parameters/VolumeName"
+    post:
+      tags: [snapshots]
+      summary: Freeze current data as a read-only generation (no data moves)
+      responses:
+        "201":
+          description: snapshot created
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/SnapshotInfo"}
+        "404": {$ref: "#/components/responses/NotFound"}
+        "409":
+          description: snapshot chain limit reached
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Error"}
+  /v1/volumes/{name}/snapshots:
+    parameters:
+      - $ref: "#/components/parameters/VolumeName"
+    get:
+      tags: [snapshots]
+      summary: List snapshots
+      responses:
+        "200":
+          description: snapshot list
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  volume: {type: string}
+                  snapshots:
+                    type: array
+                    items: {$ref: "#/components/schemas/SnapshotInfo"}
+        "404": {$ref: "#/components/responses/NotFound"}
+  /v1/volumes/{name}/snapshot/{gen}:
+    parameters:
+      - $ref: "#/components/parameters/VolumeName"
+      - name: gen
+        in: path
+        required: true
+        schema: {type: integer, minimum: 1}
+    delete:
+      tags: [snapshots]
+      summary: Drop a snapshot (its ranges go to the vacuum)
+      responses:
+        "200":
+          description: dropped
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  volume: {type: string}
+                  gen: {type: integer}
+                  dropped: {type: boolean, example: true}
+        "404": {$ref: "#/components/responses/NotFound"}
+  /v1/volumes/{name}/rollback:
+    parameters:
+      - $ref: "#/components/parameters/VolumeName"
+    post:
+      tags: [snapshots]
+      summary: Roll the live volume back to a snapshot generation
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [gen]
+              properties:
+                gen: {type: integer}
+      responses:
+        "200":
+          description: rolled back volume
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/VolumeView"}
+        "404": {$ref: "#/components/responses/NotFound"}
+  /v1/volumes/{name}/clone:
+    parameters:
+      - $ref: "#/components/parameters/VolumeName"
+    post:
+      tags: [snapshots]
+      summary: Clone a volume (shared frozen generations)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              properties:
+                name: {type: string, description: "destination volume name"}
+                quota: {type: string, description: "bytes or K/M/G/T form"}
+      responses:
+        "201":
+          description: cloned volume
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/VolumeView"}
+        "404": {$ref: "#/components/responses/NotFound"}
+        "409":
+          description: destination exists / source chain at snapshot limit
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Error"}
+  /v1/volumes/{name}/import:
+    parameters:
+      - $ref: "#/components/parameters/VolumeName"
+    put:
+      tags: [data]
+      summary: Stream a disk blob into the volume (octet-stream body)
+      description: >
+        Raw bytes are written from ?offset (default 0). The body is
+        application/octet-stream, not JSON; writing past the volume size
+        fails. This is the "upload a disk image" endpoint.
+      parameters:
+        - name: offset
+          in: query
+          schema: {type: integer, minimum: 0, default: 0}
+      requestBody:
+        required: true
+        content:
+          application/octet-stream:
+            schema: {type: string, format: binary}
+      responses:
+        "200":
+          description: "bytes written"
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  volume: {type: string}
+                  written: {type: integer, format: int64}
+                  written_human: {type: string}
+        "400": {$ref: "#/components/responses/BadRequest"}
+        "404": {$ref: "#/components/responses/NotFound"}
+    post:
+      tags: [data, jobs]
+      summary: Import a blob from a URL (background job by default)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [url]
+              properties:
+                url: {type: string, description: "http(s) URL to fetch"}
+                offset: {type: integer, minimum: 0, default: 0}
+                sha256: {type: string, description: "verified over the streamed bytes"}
+                async: {type: boolean, description: "default true; false blocks until done"}
+      responses:
+        "202":
+          description: job accepted (async)
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Job"}
+        "200":
+          description: completed synchronously (async=false) — job record
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Job"}
+        "400": {$ref: "#/components/responses/BadRequest"}
+        "404": {$ref: "#/components/responses/NotFound"}
+  /v1/volumes/{name}/export:
+    parameters:
+      - $ref: "#/components/parameters/VolumeName"
+    get:
+      tags: [data]
+      summary: Download the whole volume as a disk blob
+      description: >
+        Streams the volume as application/octet-stream with an exact
+        Content-Length; holes are filled with zeroes (the stream cannot
+        seek, so the receiver may sparse-restore by detecting zero runs).
+        This is the "download a disk image" endpoint.
+      responses:
+        "200":
+          description: raw volume bytes
+          content:
+            application/octet-stream:
+              schema: {type: string, format: binary}
+        "404": {$ref: "#/components/responses/NotFound"}
+  /v1/exports:
+    get:
+      tags: [exports]
+      summary: Live NBD/VDUSE exports
+      responses:
+        "200":
+          description: export list
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  nbd:
+                    type: array
+                    items: {type: object}
+                  vduse:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        name: {type: string}
+                        volume: {type: string}
+    post:
+      tags: [exports]
+      summary: Attach a runtime export of a volume (cluster mode)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/ExportRequest"}
+      responses:
+        "201":
+          description: export attached
+        "400": {$ref: "#/components/responses/BadRequest"}
+        "503":
+          description: runtime exports not enabled (cluster mode required)
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Error"}
+  /v1/exports/{name}:
+    parameters:
+      - name: name
+        in: path
+        required: true
+        schema: {type: string}
+    delete:
+      tags: [exports]
+      summary: Detach a runtime export
+      responses:
+        "200":
+          description: removed
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  type: {type: string, enum: [nbd, vduse]}
+                  name: {type: string}
+                  removed: {type: boolean, example: true}
+        "404": {$ref: "#/components/responses/NotFound"}
+        "409":
+          description: export is in use
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Error"}
+  /v1/qos/classes:
+    get:
+      tags: [qos]
+      summary: Named QoS classes
+      responses:
+        "200":
+          description: class list
+          content:
+            application/json:
+              schema:
+                type: array
+                items: {$ref: "#/components/schemas/QoSClass"}
+  /v1/qos/classes/{name}:
+    parameters:
+      - name: name
+        in: path
+        required: true
+        schema: {type: string}
+    put:
+      tags: [qos]
+      summary: Create/update a QoS class
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/QoSClass"}
+      responses:
+        "200":
+          description: stored class
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/QoSClass"}
+        "400": {$ref: "#/components/responses/BadRequest"}
+    delete:
+      tags: [qos]
+      summary: Delete a QoS class
+      responses:
+        "204": {description: deleted}
+        "404": {$ref: "#/components/responses/NotFound"}
+  /v1/vacuum:
+    get:
+      tags: [vacuum]
+      summary: Pending vacuum queue (deleted volumes / dropped snapshots)
+      responses:
+        "200":
+          description: queue
+          content:
+            application/json:
+              schema:
+                type: array
+                items: {$ref: "#/components/schemas/VacuumItem"}
+    post:
+      tags: [vacuum]
+      summary: Run a full vacuum pass now (bypasses the auto-vacuum interval)
+      responses:
+        "200":
+          description: pass report
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/VacuumPass"}
+  /v1/vacuum/{name}:
+    parameters:
+      - $ref: "#/components/parameters/VolumeName"
+    post:
+      tags: [vacuum]
+      summary: Vacuum one volume now (live zero-punch, or its tombstone if deleted)
+      responses:
+        "200":
+          description: pass report (mode live or tombstone)
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - {$ref: "#/components/schemas/VacuumLive"}
+                  - {$ref: "#/components/schemas/VacuumPass"}
+        "404": {$ref: "#/components/responses/NotFound"}
+  /v1/recovery:
+    get:
+      tags: [recovery]
+      summary: Cluster recovery scan (all volumes)
+      responses:
+        "200":
+          description: reports per volume
+          content:
+            application/json:
+              schema:
+                type: array
+                items: {$ref: "#/components/schemas/RecoveryReport"}
+  /v1/recovery/{name}:
+    parameters:
+      - $ref: "#/components/parameters/VolumeName"
+    get:
+      tags: [recovery]
+      summary: Check one volume's replica health
+      responses:
+        "200":
+          description: report
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/RecoveryReport"}
+        "404": {$ref: "#/components/responses/NotFound"}
+    post:
+      tags: [recovery]
+      summary: Repair one volume (copy thin/missing replicas from sources)
+      responses:
+        "200":
+          description: repair stats
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/RecoveryStats"}
+        "404": {$ref: "#/components/responses/NotFound"}
+  /v1/jobs:
+    get:
+      tags: [jobs]
+      summary: Background jobs (URL imports)
+      responses:
+        "200":
+          description: job list
+          content:
+            application/json:
+              schema:
+                type: array
+                items: {$ref: "#/components/schemas/Job"}
+  /v1/jobs/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: {type: string}
+    get:
+      tags: [jobs]
+      summary: One job
+      responses:
+        "200":
+          description: job
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Job"}
+        "404": {$ref: "#/components/responses/NotFound"}
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: "required when unistord runs with -admin-token (all routes except /healthz)"
+  parameters:
+    VolumeName:
+      name: name
+      in: path
+      required: true
+      schema: {type: string, maxLength: 128}
+      description: "volume name (no slashes)"
+  responses:
+    BadRequest:
+      description: bad request
+      content:
+        application/json:
+          schema: {$ref: "#/components/schemas/Error"}
+    NotFound:
+      description: not found
+      content:
+        application/json:
+          schema: {$ref: "#/components/schemas/Error"}
+  schemas:
+    Error:
+      type: object
+      properties:
+        error: {type: string}
+    OSDInfo:
+      type: object
+      properties:
+        id: {type: integer, format: int32}
+        addr: {type: string, description: "host:port of the sdsnet server"}
+        uuid: {type: string}
+        data_path: {type: string}
+        weight: {type: number, description: "crush weight, 0 = out"}
+        booted_at: {type: integer, format: int64}
+    VolumeSpec:
+      type: object
+      properties:
+        name: {type: string}
+        size: {type: integer, format: int64, description: "logical bytes"}
+        quota: {type: integer, format: int64, description: "allocation cap, 0 = size"}
+        oid_base: {type: integer, format: int64}
+        num_objects: {type: integer, format: int64}
+        pg_num: {type: integer}
+        replicas: {type: integer}
+        min_size: {type: integer}
+        rule: {type: string}
+        qos_template: {type: string}
+        snapshots:
+          type: array
+          description: frozen generations the live volume reads through
+          items:
+            type: object
+            properties:
+              gen: {type: integer}
+              oid_base: {type: integer, format: int64}
+              num_objects: {type: integer, format: int64}
+        extents:
+          type: array
+          description: OID ranges appended by resizes
+          items:
+            type: object
+            properties:
+              oid_base: {type: integer, format: int64}
+              num_objects: {type: integer, format: int64}
+    VolumeView:
+      allOf:
+        - $ref: "#/components/schemas/VolumeSpec"
+        - type: object
+          properties:
+            size_human: {type: string}
+            quota_human: {type: string}
+            usage: {type: integer, format: int64, description: "allocated bytes"}
+            usage_human: {type: string}
+    CreateVolumeRequest:
+      type: object
+      required: [name, size]
+      properties:
+        name: {type: string, maxLength: 128}
+        size: {type: string, description: "bytes or K/M/G/T form, e.g. 40G"}
+        quota: {type: string}
+        replicas: {type: integer, default: 3}
+        min_size: {type: integer, description: "write quorum (replicas-1 default)"}
+        pg_num: {type: integer, description: "power of two"}
+        rule: {type: string, description: "crush rule name, default data"}
+    SnapshotInfo:
+      type: object
+      properties:
+        gen: {type: integer}
+        created_at: {type: integer, format: int64, description: "unix seconds"}
+        size: {type: integer, format: int64}
+        objects: {type: integer, description: "allocated objects in the generation"}
+    QoSClass:
+      type: object
+      required: [name]
+      properties:
+        name: {type: string}
+        read_iops: {type: integer, format: int64, description: "0 = unlimited"}
+        read_bps: {type: integer, format: int64}
+        write_iops: {type: integer, format: int64}
+        write_bps: {type: integer, format: int64}
+    ExportRequest:
+      type: object
+      required: [volume]
+      properties:
+        volume: {type: string}
+        type: {type: string, enum: [nbd, vduse], default: nbd}
+        devname: {type: string, description: "vduse kernel device name (required for vduse)"}
+        read_only: {type: boolean}
+    Job:
+      type: object
+      properties:
+        id: {type: string}
+        volume: {type: string}
+        type: {type: string, example: import_url}
+        state: {type: string, enum: [running, completed, failed]}
+        written: {type: integer, format: int64}
+        offset: {type: integer, format: int64}
+        error: {type: string}
+        created: {type: string, format: date-time}
+        finished: {type: string, format: date-time}
+    VacuumItem:
+      type: object
+      properties:
+        name: {type: string}
+        oid_base: {type: integer, format: int64}
+        num_objects: {type: integer, format: int64}
+        deleted_at: {type: string}
+        deleted_ago: {type: string}
+    VacuumPass:
+      type: object
+      description: tombstone-purge pass (deleted volumes / dropped snapshots)
+      properties:
+        volume: {type: string, description: "present on per-volume runs"}
+        mode: {type: string, example: tombstone}
+        vacuums: {type: integer, description: "tombstones processed"}
+        deleted: {type: integer, description: "ranges vacuumed"}
+        osds:
+          type: array
+          items:
+            type: object
+            properties:
+              osd: {type: integer, format: int32}
+              removed: {type: integer}
+              err: {type: string}
+        errors:
+          type: array
+          items: {type: string}
+    VacuumLive:
+      type: object
+      description: live pass over a registered volume (zero-object punch + alloc release)
+      properties:
+        volume: {type: string}
+        mode: {type: string, example: live}
+        checked: {type: integer, description: "allocated objects checked"}
+        zeroed: {type: integer, description: "objects punched out"}
+        freed: {type: integer, format: int64, description: "bytes returned to the filesystems"}
+        freed_human: {type: string}
+        error: {type: string, description: "present when the pass was cut short"}
+    RecoveryReport:
+      type: object
+      properties:
+        volume: {type: string}
+        objects: {type: integer}
+        healthy: {type: boolean}
+        ok: {type: integer}
+        thin: {type: integer}
+        to_repair: {type: integer}
+        down:
+          type: array
+          items: {type: integer, format: int32}
+        items:
+          type: array
+          items:
+            type: object
+            properties:
+              index: {type: integer, format: int64}
+              oid: {type: integer, format: int64}
+              osd: {type: integer, format: int32}
+              source: {type: integer, format: int32}
+        checked_at: {type: string, format: date-time}
+    RecoveryStats:
+      type: object
+      properties:
+        volume: {type: string}
+        copied: {type: integer}
+        bytes: {type: integer, format: int64}
+        bytes_human: {type: string}
+        failed: {type: integer}
+        skipped: {type: integer}
+        elapsed: {type: string}
+    Status:
+      type: object
+      properties:
+        volumes: {type: integer}
+        osds: {type: integer}
+        osds_live: {type: integer}
+        map_epoch: {type: integer}
+        meta: {type: string, enum: [dir, raft]}
+        healthy: {type: boolean}
+        time: {type: string, format: date-time}
+        raft_state: {type: string, description: "present when meta runs on raft"}
+        raft_leader: {type: string}
+        writable: {type: boolean}
+        warnings:
+          type: array
+          items: {type: string}
+        osd_detail:
+          type: array
+          items:
+            type: object
+            properties:
+              id: {type: integer, format: int32}
+              addr: {type: string}
+              weight: {type: number}
+              live: {type: boolean}
+              evicted: {type: boolean}
+        volume_health:
+          type: array
+          items:
+            type: object
+            properties:
+              name: {type: string}
+              live_targets: {type: integer}
+              min_size: {type: integer}
+              writable: {type: boolean}
+        disks:
+          type: array
+          description: disk accounting of OSDs hosted in this process
+          items:
+            type: object
+            properties:
+              osd: {type: integer, format: int32}
+              usage: {type: integer, format: int64}
+              free: {type: integer, format: int64}
+              total: {type: integer, format: int64}
+              ok: {type: boolean}
+              usage_human: {type: string}
+              free_human: {type: string}
+              total_human: {type: string}

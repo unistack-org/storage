@@ -218,6 +218,9 @@ func (v *Volume) readGenChunk(ctx context.Context, oid object.OID, index, inObj 
 		if terr != nil {
 			return false, terr
 		}
+		// Frozen generations are immutable: any replica is
+		// authoritative, so read from the cheapest one.
+		v.orderReadRefs(refs)
 		var sawMissing bool
 	refresh:
 		for _, ref := range refs {

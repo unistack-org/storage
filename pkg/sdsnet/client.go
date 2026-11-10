@@ -531,6 +531,17 @@ type Pool struct {
 	closed bool
 	done   chan struct{} // closed by Close
 	wake   chan struct{} // buffered(1): an idle conn became available
+
+	// inflight counts connections currently checked out of the pool
+	// (in-flight ops). The client's read-replica selector uses it to
+	// prefer the least loaded target; lock-free so the hot path stays
+	// cheap.
+	inflight atomic.Int64
+	// ops counts every successful checkout since pool creation
+	// (monotonic). Used to attribute traffic to a target: occupancy
+	// (idle/inUse) snapshots race with straggler replica writes that
+	// return connections after the write call has returned.
+	ops atomic.Int64
 }
 
 // NewPool returns a pool for addr/export.
@@ -573,6 +584,8 @@ func (pp *Pool) Get(ctx context.Context) (*Conn, error) {
 				continue // try the next idle conn
 			}
 			cc.SetEpoch(ep)
+			pp.inflight.Add(1)
+			pp.ops.Add(1)
 			return cc, nil
 		}
 		if pp.Limit > 0 && pp.opened >= pp.Limit {
@@ -597,6 +610,8 @@ func (pp *Pool) Get(ctx context.Context) (*Conn, error) {
 			return nil, err
 		}
 		cc.SetEpoch(pp.epoch.Load())
+		pp.inflight.Add(1)
+		pp.ops.Add(1)
 		pp.mu.Lock()
 		if pp.closed {
 			pp.opened--
@@ -631,6 +646,7 @@ func (pp *Pool) Put(cc *Conn) {
 		cc.Close()
 		return
 	}
+	pp.inflight.Add(-1)
 	pp.idle = append(pp.idle, cc)
 	pp.mu.Unlock()
 	pp.signal()
@@ -639,6 +655,7 @@ func (pp *Pool) Put(cc *Conn) {
 // Discard closes cc and frees its pool slot.
 func (pp *Pool) Discard(cc *Conn) {
 	cc.Close()
+	pp.inflight.Add(-1)
 	pp.mu.Lock()
 	pp.opened--
 	pp.mu.Unlock()
@@ -685,6 +702,16 @@ func (pp *Pool) Stats() (idle, inUse int) {
 	defer pp.mu.Unlock()
 	return len(pp.idle), pp.opened - len(pp.idle)
 }
+
+// Inflight reports the number of connections checked out of the pool
+// right now (in-flight requests). Cheaper than Stats for a load-aware
+// selector on a hot path.
+func (pp *Pool) Inflight() int64 { return pp.inflight.Load() }
+
+// Ops reports the total number of connections checked out of the pool
+// since creation. Monotonic, so a caller can snapshot it before an
+// operation and detect exactly which targets were used by it.
+func (pp *Pool) Ops() int64 { return pp.ops.Load() }
 
 // Do runs fn with a pooled connection, discarding it on protocol errors.
 //

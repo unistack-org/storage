@@ -773,6 +773,14 @@ func clusterExports(ctx context.Context, p clusterParams) ([]*nbd.Export, error)
 			go srv.ServeConn(peer)
 			return mine, nil
 		})
+		// Read-replica selection: prefer the in-process (local) OSDs,
+		// then the least loaded, then map order (roadmap «чтение с
+		// любой реплики», Vitastor local_reads).
+		ids := make([]int32, 0, len(byID))
+		for id := range byID {
+			ids = append(ids, id)
+		}
+		cl.SetLocalOSDs(ids)
 		p.logger.Printf("local-direct transport enabled for %d hosted OSD(s)", len(byID))
 	}
 

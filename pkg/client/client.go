@@ -30,6 +30,7 @@ import (
 	"fmt"
 	"math/bits"
 	"net"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -100,6 +101,11 @@ type Cluster struct {
 	// per-OSD pool as Pool.Local: an in-process transport for OSDs
 	// served by this same process (see SetLocalDial).
 	localDial func(osdID int32) (net.Conn, error)
+
+	// localOSDs (SetLocalOSDs) marks the OSD ids reachable in-process;
+	// read-replica selection prefers them over network targets. Stored
+	// as an atomic snapshot so the read hot path stays lock-free.
+	localOSDs atomic.Pointer[map[int32]bool]
 
 	// poolTLS, when set via SetTLS, makes every per-OSD pool dial over
 	// mutual TLS (tlsconf.Config.ClientConfig).
@@ -473,11 +479,44 @@ func (c *Cluster) SetLocalDial(f func(osdID int32) (net.Conn, error)) {
 	c.poolsMu.Unlock()
 }
 
+// SetLocalOSDs marks the OSD ids that are reachable in-process (the
+// same daemon hosts them; pairs SetLocalDial). Read-replica selection
+// prefers these targets: an in-process read skips the network
+// entirely, so a compute node that also runs OSDs serves reads from
+// its own disk when the object lives there (the Vitastor local_reads
+// idea, "локальная → наименее загруженная"). Safe to call at any time;
+// nil/empty clears the preference.
+func (c *Cluster) SetLocalOSDs(ids []int32) {
+	if len(ids) == 0 {
+		c.localOSDs.Store(nil)
+		return
+	}
+	m := make(map[int32]bool, len(ids))
+	for _, id := range ids {
+		m[id] = true
+	}
+	c.localOSDs.Store(&m)
+}
+
 // PoolStats returns the connection-pool occupancy of every OSD target
 // dialed so far: OSD id -> (idle, in-use) connections. It is a cheap
 // snapshot of the cached pools (no dialing, no network), the export seam
 // for a metrics endpoint that reports client-side connection pressure
 // per target.
+// PoolOps returns the cumulative connection-checkout count of every
+// dialed OSD pool. Monotonic, so tests (and debug tooling) can
+// attribute traffic to targets even when it races with straggler
+// replica writes.
+func (c *Cluster) PoolOps() map[int32]int64 {
+	c.poolsMu.Lock()
+	defer c.poolsMu.Unlock()
+	out := make(map[int32]int64, len(c.pools))
+	for id, pp := range c.pools {
+		out[id] = pp.Ops()
+	}
+	return out
+}
+
 func (c *Cluster) PoolStats() map[int32][2]int {
 	c.poolsMu.Lock()
 	defer c.poolsMu.Unlock()
@@ -579,6 +618,19 @@ func (c *Cluster) epochSnapshot() uint32 {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	return c.epoch
+}
+
+// poolLoad reports the in-flight op count of the cached pool for an
+// OSD (0 when no pool exists yet — an idle target is the cheapest
+// first choice). Lock-free: only reads the pools map pointer-safe.
+func (c *Cluster) poolLoad(id int32) int64 {
+	c.poolsMu.Lock()
+	pp := c.pools[id]
+	c.poolsMu.Unlock()
+	if pp == nil {
+		return 0
+	}
+	return pp.Inflight()
 }
 
 // Registry builds a placement registry from the OSD records in meta:
@@ -1430,6 +1482,45 @@ func (v *Volume) pgFor(snap *placement.Snapshot, index uint64) uint32 {
 // tolerant — any live replica answers identically.
 var ErrDegraded = errors.New("client: volume degraded: live targets below min_size")
 
+// orderReadRefs reorders the live replica targets of a pg into the
+// read preference order (Vitastor lesson: any replica answers a read
+// identically, so pick the cheapest one):
+//
+//  1. in-process (local) OSDs — an in-process read skips the network;
+//  2. least in-flight load (Pool.Inflight of the pool dialed so far;
+//     an undialed pool counts as 0, a brand-new idle target beats a
+//     busy one);
+//  3. target order in the pg row (the placement map's own preference;
+//     the primary-by-PG head of the row acts as a stable tiebreak).
+//
+// The order is a preference only: readChunk falls through to the next
+// replica on any failure, so a misranked (even dead) first target
+// costs one failed round-trip, never correctness.
+func (v *Volume) orderReadRefs(refs []placement.Ref) {
+	if len(refs) < 2 {
+		return
+	}
+	c := v.cluster
+	local := c.localOSDs.Load()
+	// Snapshot ranks once (one pool lookup per target), not per compare.
+	var rank [maxReplicas]struct {
+		local bool
+		load  int64
+	}
+	for i, r := range refs {
+		rank[i].load = c.poolLoad(r.OSD)
+		if local != nil {
+			rank[i].local = (*local)[r.OSD]
+		}
+	}
+	sort.SliceStable(refs, func(i, j int) bool {
+		if rank[i].local != rank[j].local {
+			return rank[i].local
+		}
+		return rank[i].load < rank[j].load
+	})
+}
+
 func (v *Volume) targets(snap *placement.Snapshot, index uint64, scratch []placement.Ref) ([]placement.Ref, error) {
 	pg := v.pgFor(snap, index)
 	row := snap.Row(pg)
@@ -1532,6 +1623,10 @@ func (v *Volume) readChunk(ctx context.Context, p []byte, index, inObj uint64) e
 				}
 			}
 		}
+		// Any replica answers a read identically (quorum writes,
+		// byte-identical copies): reorder by local → least loaded →
+		// map order. The fall-through loop below keeps full tolerance.
+		v.orderReadRefs(refs)
 		lastErr := error(terr)
 		var sawMissing bool
 	refresh:
