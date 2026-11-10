@@ -1,6 +1,7 @@
 package placement
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"math"
@@ -391,4 +392,63 @@ func TestPlacementChiSquare(t *testing.T) {
 		t.Fatalf("chi-square %.1f too high (counts %v)", chi, counts)
 	}
 	t.Logf("chi-square = %.1f, counts = %v", chi, counts)
+}
+
+// TestEncodeMapTextRoundTrip: text -> Map -> text -> Map must place
+// identically (this is `unistorctl map dump -format text` over a json
+// or binary source). It also covers FormatMap for json/binary.
+func TestEncodeMapTextRoundTrip(t *testing.T) {
+	m, err := DecodeMap([]byte(mapRep3))
+	if err != nil {
+		t.Fatal(err)
+	}
+	txt, err := EncodeMapText(m)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m2, err := DecodeMap(txt)
+	if err != nil {
+		t.Fatalf("re-parse encoded text: %v\n%s", err, txt)
+	}
+	base, err := Compile(1, []byte(mapRep3), reg6(), Options{PGNum: 1024, Replicas: 3})
+	if err != nil {
+		t.Fatal(err)
+	}
+	re, err := Compile(1, txt, reg6(), Options{PGNum: 1024, Replicas: 3})
+	if err != nil {
+		t.Fatalf("compile re-encoded: %v\n%s", err, txt)
+	}
+	for pg := uint32(0); pg < base.PGNum; pg++ {
+		a, b := base.Row(pg), re.Row(pg)
+		if fmt.Sprint(a) != fmt.Sprint(b) {
+			t.Fatalf("pg %d: base %v != re %v", pg, a, b)
+		}
+	}
+	_ = m2
+	// FormatMap json + binary round-trips through the same compiler.
+	js, err := FormatMap([]byte(mapRep3), "json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Compile(1, js, reg6(), Options{PGNum: 1024, Replicas: 3}); err != nil {
+		t.Fatalf("compile json: %v", err)
+	}
+	bin, err := FormatMap([]byte(mapRep3), "binary")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Compile(1, bin, reg6(), Options{PGNum: 1024, Replicas: 3}); err != nil {
+		t.Fatalf("compile binary: %v", err)
+	}
+	// json source shown as text must be re-encoded, not passed through.
+	txt2, err := FormatMap(js, "text")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.HasPrefix(bytes.TrimSpace(txt2), []byte("{")) {
+		t.Fatal("text format returned json")
+	}
+	if _, err := FormatMap([]byte(mapRep3), "yaml"); err == nil {
+		t.Fatal("FormatMap should not accept yaml (CLI side)")
+	}
 }

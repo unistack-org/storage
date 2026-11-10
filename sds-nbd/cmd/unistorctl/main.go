@@ -21,7 +21,7 @@
 //	qos rm      <class>
 //	osd ls | out <id> | in <id> [-weight w]      (registry weight; 0 = out of placement)
 //	osd add <id> <addr> [-data P] [-uuid U]      (register an osd record by hand)
-//	map dump                                     (latest crush map epoch, raw)
+//	map dump [-format raw|text|json|yaml|binary]  (latest crush map epoch; raw = as stored)
 //	map check   [file] [-pg-num n] [-replicas n] [-rule r]  (compile + pg census)
 //	map publish <file> [-epoch n]                (store a new epoch; default latest+1)
 //	map reweight <id> <w>                        (vitastor-style alias of osd out/in)
@@ -56,6 +56,7 @@ import (
 	"github.com/unistack-org/storage/pkg/placement"
 	"github.com/unistack-org/storage/pkg/qos"
 	"github.com/unistack-org/storage/pkg/tlsconf"
+	"sigs.k8s.io/yaml"
 )
 
 const chunk = 1 << 20 // import/export streaming granularity
@@ -728,8 +729,9 @@ func osdCmd(ctx context.Context, ms meta.Store, args []string) error {
 // ---- map ----
 
 // mapCmd inspects and edits the crush map stored in meta//maps:
-// "map dump [-f FILE]" prints the latest epoch (raw: text, binary hex,
-// or json, as stored), "map check [-f FILE]" compiles a map file (or
+// "map dump [-format raw|text|json|yaml|binary]" prints the latest
+// epoch (raw = as stored: text, binary hex, or json; the others
+// decode and re-encode), "map check [-f FILE]" compiles a map file (or
 // the stored one) and reports PG-table uniformity, "map publish FILE
 // [-epoch n]" stores a new epoch (n defaults to latest+1; OSDs raise
 // their fence and clients rebuild on watch). Per-OSD weights live in
@@ -742,17 +744,47 @@ func mapCmd(ctx context.Context, cl *client.Cluster, ms meta.Store, args []strin
 	sub, rest := args[0], args[1:]
 	switch sub {
 	case "dump":
+		fs := flag.NewFlagSet("map dump", flag.ExitOnError)
+		format := fs.String("format", "raw", "output format: raw (as stored), text, json, yaml, binary (hex)")
+		fs.Usage = func() {
+			fmt.Fprintln(os.Stderr, "usage: unistorctl map dump [-format raw|text|json|yaml|binary]")
+		}
+		fs.Parse(args[1:])
 		rec, err := meta.LatestMap(ctx, ms)
 		if err != nil {
 			return mapLookupErr(err)
 		}
-		fmt.Fprintf(os.Stderr, "epoch=%d format=%s bytes=%d\n", rec.Epoch, rec.Format, len(rec.Map))
-		if rec.Format == "binary" {
-			fmt.Printf("%x\n", rec.Map)
+		switch *format {
+		case "raw":
+			fmt.Fprintf(os.Stderr, "epoch=%d format=%s bytes=%d\n", rec.Epoch, rec.Format, len(rec.Map))
+			if rec.Format == "binary" {
+				fmt.Printf("%x\n", rec.Map)
+				return nil
+			}
+			os.Stdout.Write(rec.Map)
+			return nil
+		case "yaml":
+			m, err := placement.DecodeMap(rec.Map)
+			if err != nil {
+				return err
+			}
+			b, err := yaml.Marshal(m)
+			if err != nil {
+				return err
+			}
+			os.Stdout.Write(b)
+			return nil
+		default:
+			b, err := placement.FormatMap(rec.Map, *format)
+			if err != nil {
+				return err
+			}
+			os.Stdout.Write(b)
+			if len(b) > 0 && b[len(b)-1] != '\n' {
+				fmt.Println()
+			}
 			return nil
 		}
-		os.Stdout.Write(rec.Map)
-		return nil
 	case "check":
 		fs := flag.NewFlagSet("map check", flag.ExitOnError)
 		pgNum := fs.Uint("pg-num", 1024, "pg table width for the compile")
@@ -1196,7 +1228,7 @@ vol export <name> <file|->
 vol snap create <name> | vol snap ls <name> | vol snap rm <name> <gen> | vol snap rollback <name> <gen>
 qos ls | qos put <class> <riops:rbps:wiops:wbps> | qos rm <class>
 osd ls | osd add <id> <addr> [-data P] [-uuid U] | osd out <id> | osd in <id> [-weight w]   (weight 0 = out of placement)
-map dump | map check [file] [-pg-num n] [-replicas n] [-rule r] | map publish <file> [-epoch n] | map reweight <id> <w>
+map dump [-format raw|text|json|yaml|binary] | map check [file] [-pg-num n] [-replicas n] [-rule r] | map publish <file> [-epoch n] | map reweight <id> <w>
 vacuum [ls|run [vol]]  (M1.4: free deleted volumes' objects; run <vol> = targeted tombstone, live volume = punch out all-zero objects)
 recovery ls | recovery check <vol> | recovery run <vol> [-iops N] [-bps B]
 status [-http URL]  (reads unistord admin /v1/status; default http://127.0.0.1:8443)

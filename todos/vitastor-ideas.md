@@ -264,7 +264,10 @@ randread QD128: 41.6K против их 128K (×3). Their bottleneck = CPU + с�
       дамп блоков Б-дерева в обход структуры для восстановления БД.
       Последнее — их опыт «мету испортили, данные спасли».
       Уже сделано: `map dump/check/publish/reweight` (check = компиляция
-      + ценз PG-таблицы: full/degraded/down), `osd add/out/in/ls`
+      + ценз PG-таблицы: full/degraded/down; dump `-format
+      raw|text|json|yaml|binary` — реинкодинг между форматами, текстовый
+      энкодер написан у нас в pkg/placement, т.к. crushkv его не даёт),
+      `osd add/out/in/ls`
       (out = weight 0, без перевыпуска мапы). `[3.x]`
 - [ ] **6.8 `prepare --dry-run`** и вообще dry-run для всех опасных операций. `[3.2.x]`
 - [ ] **6.9 Авто-детект параметров тома клиентом** (block size, режим
