@@ -19,7 +19,12 @@
 //	qos ls
 //	qos put     <class> <riops:rbps:wiops:wbps>
 //	qos rm      <class>
-//	osd ls
+//	osd ls | out <id> | in <id> [-weight w]      (registry weight; 0 = out of placement)
+//	osd add <id> <addr> [-data P] [-uuid U]      (register an osd record by hand)
+//	map dump                                     (latest crush map epoch, raw)
+//	map check   [file] [-pg-num n] [-replicas n] [-rule r]  (compile + pg census)
+//	map publish <file> [-epoch n]                (store a new epoch; default latest+1)
+//	map reweight <id> <w>                        (vitastor-style alias of osd out/in)
 //	vacuum      [ls|run [vol]]                 (M1.4: deleted-volume garbage; run <vol> targets one tombstone or punches a live volume's all-zero objects)
 //	recovery    ls | check <vol> | run <vol>   (M6.3: heal diverged/missing replicas)
 //	status      -http URL                       (operational overview, see unistord)
@@ -48,6 +53,7 @@ import (
 	"github.com/unistack-org/storage/pkg/client"
 	"github.com/unistack-org/storage/pkg/meta"
 	"github.com/unistack-org/storage/pkg/object"
+	"github.com/unistack-org/storage/pkg/placement"
 	"github.com/unistack-org/storage/pkg/qos"
 	"github.com/unistack-org/storage/pkg/tlsconf"
 )
@@ -110,6 +116,8 @@ func dispatch(ctx context.Context, cl *client.Cluster, ms meta.Store, args []str
 		return qosCmd(ctx, cl, args[1:])
 	case "osd":
 		return osdCmd(ctx, ms, args[1:])
+	case "map":
+		return mapCmd(ctx, cl, ms, args[1:])
 	case "vacuum":
 		return vacuumCmd(ctx, cl, args[1:])
 	case "recovery":
@@ -624,10 +632,77 @@ func qosCmd(ctx context.Context, cl *client.Cluster, args []string) error {
 
 // ---- osd ----
 
+// osdCmd manages the OSD registry: "osd ls" lists it, "osd add <id>
+// <addr> [-data P] [-uuid U]" registers an OSD record by hand (the
+// normal path is the OSD self-registering at startup — this is the
+// operator's rescue tool), "osd out <id>" sets weight 0 (the OSD leaves
+// placement: rows are rebuilt without it, its data needs recovery
+// elsewhere), "osd in <id> [-weight w]" brings it back. The registry is
+// what placement compiles pg rows from, so the change takes effect on
+// every client's next map refresh; publishing a fresh map epoch is not
+// required (it only moves the fence).
 func osdCmd(ctx context.Context, ms meta.Store, args []string) error {
-	if len(args) == 0 || args[0] != "ls" {
+	if len(args) == 0 {
 		usage()
-		return errors.New("osd: subcommand required (ls)")
+		return errors.New("osd: subcommand required (ls | add <id> <addr> | out <id> | in <id> [-weight w])")
+	}
+	switch args[0] {
+	case "add":
+		fs := flag.NewFlagSet("osd add", flag.ExitOnError)
+		data := fs.String("data", "", "data path the osd serves")
+		uuid := fs.String("uuid", "", "osd uuid (must match what the daemon reports)")
+		wFlag := fs.Float64("weight", 1, "crush weight (> 0)")
+		parseMix(fs, args[1:])
+		if fs.NArg() != 2 {
+			fs.Usage()
+			return errors.New("osd add: <id> <addr> [-data P] [-uuid U] [-weight w]")
+		}
+		id, err := strconv.ParseInt(fs.Arg(0), 10, 32)
+		if err != nil {
+			return fmt.Errorf("osd add: bad id %q", fs.Arg(0))
+		}
+		if _, err := meta.PutOSD(ctx, ms, meta.OSDInfo{
+			ID: int32(id), Addr: fs.Arg(1), DataPath: *data, UUID: *uuid, Weight: *wFlag,
+		}); err != nil {
+			return err
+		}
+		fmt.Printf("osd %d: registered at %s (weight %g)\n", id, fs.Arg(1), *wFlag)
+		return nil
+	case "out", "in":
+		if len(args) < 2 {
+			return errors.New("osd " + args[0] + ": <id>")
+		}
+		id, err := strconv.ParseInt(args[1], 10, 32)
+		if err != nil {
+			return fmt.Errorf("osd %s: bad id %q", args[0], args[1])
+		}
+		w := 0.0
+		if args[0] == "in" {
+			fs := flag.NewFlagSet("osd in", flag.ExitOnError)
+			wFlag := fs.Float64("weight", 1, "crush weight (> 0)")
+			parseMix(fs, args[2:])
+			if fs.NArg() != 0 {
+				fs.Usage()
+				return errors.New("osd in: <id> [-weight w]")
+			}
+			w = *wFlag
+			if w <= 0 {
+				return errors.New("osd in: weight must be > 0 (use `osd out` to evict)")
+			}
+		}
+		if err := meta.SetOSDWeight(ctx, ms, int32(id), w); err != nil {
+			return err
+		}
+		if w == 0 {
+			fmt.Printf("osd %d: weight 0 — out of placement; its replicas now need recovery (`recovery check`)\n", id)
+		} else {
+			fmt.Printf("osd %d: weight %g — back in placement; rebuild data (`recovery run`) before trusting it alone\n", id, w)
+		}
+		return nil
+	case "ls":
+	default:
+		usage()
+		return fmt.Errorf("osd: unknown subcommand %q (ls | out <id> | in <id>)", args[0])
 	}
 	infos, err := meta.ListOSDs(ctx, ms)
 	if err != nil {
@@ -648,6 +723,157 @@ func osdCmd(ctx context.Context, ms meta.Store, args []string) error {
 		fmt.Printf("map: %v\n", mapErr)
 	}
 	return nil
+}
+
+// ---- map ----
+
+// mapCmd inspects and edits the crush map stored in meta//maps:
+// "map dump [-f FILE]" prints the latest epoch (raw: text, binary hex,
+// or json, as stored), "map check [-f FILE]" compiles a map file (or
+// the stored one) and reports PG-table uniformity, "map publish FILE
+// [-epoch n]" stores a new epoch (n defaults to latest+1; OSDs raise
+// their fence and clients rebuild on watch). Per-OSD weights live in
+// the OSD registry ("osd out/in"), not in the map.
+func mapCmd(ctx context.Context, cl *client.Cluster, ms meta.Store, args []string) error {
+	if len(args) == 0 {
+		usage()
+		return errors.New("map: subcommand required (dump | check [file] | publish file [-epoch n])")
+	}
+	sub, rest := args[0], args[1:]
+	switch sub {
+	case "dump":
+		rec, err := meta.LatestMap(ctx, ms)
+		if err != nil {
+			return mapLookupErr(err)
+		}
+		fmt.Fprintf(os.Stderr, "epoch=%d format=%s bytes=%d\n", rec.Epoch, rec.Format, len(rec.Map))
+		if rec.Format == "binary" {
+			fmt.Printf("%x\n", rec.Map)
+			return nil
+		}
+		os.Stdout.Write(rec.Map)
+		return nil
+	case "check":
+		fs := flag.NewFlagSet("map check", flag.ExitOnError)
+		pgNum := fs.Uint("pg-num", 1024, "pg table width for the compile")
+		replicas := fs.Int("replicas", 3, "replicas per pg row")
+		rule := fs.String("rule", "", "crush rule name (default: lowest-id rule)")
+		parseMix(fs, rest)
+		var src []byte
+		label := "stored map"
+		if fs.NArg() > 0 {
+			b, err := os.ReadFile(fs.Arg(0))
+			if err != nil {
+				return err
+			}
+			src, label = b, fs.Arg(0)
+		} else {
+			rec, err := meta.LatestMap(ctx, ms)
+			if err != nil {
+				return mapLookupErr(err)
+			}
+			src = rec.Map
+			label = fmt.Sprintf("stored map (epoch %d, %s)", rec.Epoch, rec.Format)
+		}
+		reg, err := cl.Registry(ctx)
+		if err != nil {
+			return err
+		}
+		if len(reg) == 0 {
+			fmt.Fprintln(os.Stderr, "warning: OSD registry is empty — checking map structure only (pg census needs registered osds)")
+		}
+		snap, err := placement.Compile(0, src, reg, placement.Options{
+			PGNum: uint32(*pgNum), Replicas: *replicas, Rule: *rule,
+		})
+		if err != nil {
+			return fmt.Errorf("map check %s: %w", label, err)
+		}
+		if len(reg) == 0 {
+			fmt.Printf("map check %s: ok (rule %q, pg_num %d, replicas %d)\n", label, snap.Rule, snap.PGNum, snap.Replicas)
+			return nil
+		}
+		// Count how many live targets each pg row resolves to.
+		ok, degraded, down := 0, 0, 0
+		for pg := uint32(0); pg < snap.PGNum; pg++ {
+			n := 0
+			for _, id := range snap.Row(pg) {
+				if id >= 0 {
+					n++
+				}
+			}
+			switch {
+			case n == snap.Replicas:
+				ok++
+			case n >= snap.Replicas/2+1:
+				degraded++
+			default:
+				down++
+			}
+		}
+		fmt.Printf("map check %s: ok (rule %q, pg_num %d, replicas %d)\n", label, snap.Rule, snap.PGNum, snap.Replicas)
+		fmt.Printf("pg rows: %d full, %d degraded, %d down — osds in table: %v\n", ok, degraded, down, snap.LiveOSDs())
+		if down > 0 {
+			return fmt.Errorf("map check: %d pg row(s) below quorum — not enough live osds for this layout", down)
+		}
+		return nil
+	case "publish":
+		fs := flag.NewFlagSet("map publish", flag.ExitOnError)
+		epoch := fs.Int("epoch", -1, "new epoch (default: latest+1)")
+		parseMix(fs, rest)
+		if fs.NArg() != 1 {
+			fs.Usage()
+			return errors.New("map publish: <file> [-epoch n]")
+		}
+		src, err := os.ReadFile(fs.Arg(0))
+		if err != nil {
+			return err
+		}
+		newEpoch := uint32(*epoch)
+		if *epoch < 0 {
+			rec, err := meta.LatestMap(ctx, ms)
+			if err != nil && !errors.Is(err, meta.ErrNotFound) {
+				return mapLookupErr(err)
+			}
+			newEpoch = rec.Epoch + 1
+		}
+		if err := cl.MapEpoch(ctx, newEpoch, src); err != nil {
+			return err
+		}
+		fmt.Printf("map epoch %d published (OSDs fence at it, clients rebuild on watch)\n", newEpoch)
+		return nil
+	case "reweight":
+		// vitastor-style one-liner over the OSD registry: same effect
+		// as `osd out` / `osd in -weight`.
+		if len(rest) != 2 {
+			return errors.New("map reweight: <id> <weight> (0 = out)")
+		}
+		id, err := strconv.ParseInt(rest[0], 10, 32)
+		if err != nil {
+			return fmt.Errorf("map reweight: bad id %q", rest[0])
+		}
+		w, err := strconv.ParseFloat(rest[1], 64)
+		if err != nil {
+			return fmt.Errorf("map reweight: bad weight %q", rest[1])
+		}
+		if w < 0 {
+			return errors.New("map reweight: weight must be >= 0")
+		}
+		if err := meta.SetOSDWeight(ctx, ms, int32(id), w); err != nil {
+			return err
+		}
+		fmt.Printf("osd %d: weight %g\n", id, w)
+		return nil
+	default:
+		usage()
+		return fmt.Errorf("map: unknown subcommand %q (dump | check | publish | reweight)", args[0])
+	}
+}
+
+func mapLookupErr(err error) error {
+	if errors.Is(err, meta.ErrNotFound) {
+		return errors.New("no crush map in meta (publish one: `map publish <file>`)")
+	}
+	return err
 }
 
 // ---- vacuum ----
@@ -799,7 +1025,7 @@ func recoveryCmd(ctx context.Context, cl *client.Cluster, args []string) error {
 		fs := flag.NewFlagSet("recovery run", flag.ExitOnError)
 		iops := fs.Uint64("iops", 200, "repair write IOPS (0 = unthrottled)")
 		bpsStr := fs.String("bps", "200M", "repair write bandwidth (K/M/G/T; 0 = unthrottled)")
-		mustParse(fs, rest)
+		parseMix(fs, rest)
 		if fs.NArg() != 1 {
 			fs.Usage()
 			return errors.New("recovery run: <vol>")
@@ -969,7 +1195,8 @@ vol import <name> <file|http(s)://url> [-offset N]
 vol export <name> <file|->
 vol snap create <name> | vol snap ls <name> | vol snap rm <name> <gen> | vol snap rollback <name> <gen>
 qos ls | qos put <class> <riops:rbps:wiops:wbps> | qos rm <class>
-osd ls
+osd ls | osd add <id> <addr> [-data P] [-uuid U] | osd out <id> | osd in <id> [-weight w]   (weight 0 = out of placement)
+map dump | map check [file] [-pg-num n] [-replicas n] [-rule r] | map publish <file> [-epoch n] | map reweight <id> <w>
 vacuum [ls|run [vol]]  (M1.4: free deleted volumes' objects; run <vol> = targeted tombstone, live volume = punch out all-zero objects)
 recovery ls | recovery check <vol> | recovery run <vol> [-iops N] [-bps B]
 status [-http URL]  (reads unistord admin /v1/status; default http://127.0.0.1:8443)
@@ -991,6 +1218,41 @@ func mustParse(fs *flag.FlagSet, args []string) {
 	if err := fs.Parse(args); err != nil {
 		fatal("%v", err)
 	}
+}
+
+// parseMix parses args with flags interleaved with positionals (Go's
+// flag package stops at the first positional; commands like
+// "osd add <id> <addr> -data P" want both orders to work).
+func parseMix(fs *flag.FlagSet, args []string) {
+	var flags, pos []string
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		name := ""
+		if len(a) > 1 && a[0] == '-' {
+			name = strings.TrimLeft(a, "-")
+			if j := strings.Index(name, "="); j >= 0 {
+				name = name[:j]
+			}
+		}
+		def := fs.Lookup(name)
+		if def == nil {
+			pos = append(pos, a)
+			continue
+		}
+		flags = append(flags, a)
+		isBool := false
+		if bv, ok := def.Value.(interface{ IsBoolFlag() bool }); ok {
+			isBool = bv.IsBoolFlag()
+		}
+		if isBool || strings.Contains(a, "=") {
+			continue
+		}
+		if i+1 < len(args) {
+			flags = append(flags, args[i+1])
+			i++
+		}
+	}
+	mustParse(fs, append(flags, pos...))
 }
 
 // parseRates parses "riops:rbps:wiops:wbps" (bandwidth: K/M/G/T).
