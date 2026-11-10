@@ -38,6 +38,12 @@ else
   RPM_REL="1.${VER#*-}"
 fi
 APK_VER="${VER//-/_}"
+# Alpine versions accept only _alpha/_beta/_rc/_pre suffixes: map any
+# pre-release suffix (dev, testing, rc.N) to the rc slot.
+case "$VER" in
+  *-rc*) APK_VER="${VER%%-*}_rc${VER#*-rc}" ;;
+  *-*)   APK_VER="${VER%%-*}_rc1" ;;
+esac
 
 have() { command -v "$1" >/dev/null 2>&1; }
 
@@ -121,39 +127,63 @@ fi
 
 # ---------- .apk ----------
 if have abuild && [ -n "$APK_DIR" ]; then
+  # Under `su -`/`sudo` the login PATH may lack /sbin, where apk lives;
+  # abuild needs `apk --print-arch` to deduce the build architecture.
+  case ":$PATH:" in
+    *:/sbin:*) ;;
+    *) PATH="$PATH:/sbin"; export PATH ;;
+  esac
   mkdir -p "$APK_DIR" "$HOME/.abuild"
   if [ ! -f "$HOME/.abuild/abuild.conf" ]; then
     abuild-keygen -a -i -n >/dev/null
   fi
-  work="$(mktemp -d)"
-  {
-    echo '# Maintainer: Unistack <maintainers@unistack.org>'
-    echo "pkgname=unistord"
-    echo "pkgver=$APK_VER"
-    echo 'pkgrel=0'
-    echo 'pkgdesc="Unistack SDS storage daemon (NBD/VDUSE)"'
-    echo 'url="https://github.com/unistack-org/storage"'
-    echo 'license="Apache-2.0"'
-    echo 'arch="all"'
-    echo 'source=""'
-    echo 'options="!check"'
-    echo 'builddir="$srcdir"'
-    echo
-    echo 'package() {'
-    echo '  case "$CARCH" in x86_64) goarch=amd64 ;; aarch64) goarch=arm64 ;; *) echo "unsupported CARCH=$CARCH" >&2; exit 1 ;; esac'
-    for c in "${CMDS[@]}"; do
-      echo "  install -D -m 0755 \"$DIST_DIR/$c-linux-\$goarch\" \"\$pkgdir/usr/bin/$c\""
-    done
-    echo "  install -D -m 0755 \"$TPL/unistord-openrc\" \"\$pkgdir/etc/init.d/unistord\""
-    echo '  install -d -m 0755 "$pkgdir/etc/unistord" "$pkgdir/var/lib/unistord"'
-    echo '  : > "$pkgdir/etc/unistord/unistord.env"'
-    echo '  chmod 0640 "$pkgdir/etc/unistord/unistord.env"'
-    echo '}'
-  } > "$work/APKBUILD"
-  ( cd "$work" && abuild -r >/dev/null )
-  # abuild installs built packages into $PKGDEST (default $HOME/packages).
-  find "${PKGDEST:-$HOME/packages}" -name 'unistord-*.apk' -exec cp -t "$APK_DIR/" {} +
-  rm -rf "$work"
+  # abuild stamps the apk with CARCH; the Go binaries are cross-compiled,
+  # so every target can be built from one native container (no emulation).
+  for arch in $ARCHES; do
+    case "$arch" in
+      amd64) apk_carch=x86_64 ;;
+      arm64) apk_carch=aarch64 ;;
+      *) echo "package.sh: no apk CARCH for goarch $arch" >&2; continue ;;
+    esac
+    work="$(mktemp -d)"
+    {
+      echo '# Maintainer: Unistack <maintainers@unistack.org>'
+      echo "pkgname=unistord"
+      echo "pkgver=$APK_VER"
+      echo 'pkgrel=0'
+      echo 'pkgdesc="Unistack SDS storage daemon (NBD/VDUSE)"'
+      echo 'url="https://github.com/unistack-org/storage"'
+      echo 'license="Apache-2.0"'
+      echo "arch=\"$apk_carch\""
+      echo 'source=""'
+      echo 'options="!check !strip !tracedeps"'
+      echo 'builddir="$srcdir"'
+      echo
+      echo 'package() {'
+      echo '  case "$CARCH" in x86_64) goarch=amd64 ;; aarch64) goarch=arm64 ;; *) echo "unsupported CARCH=$CARCH" >&2; exit 1 ;; esac'
+      for c in "${CMDS[@]}"; do
+        echo "  install -D -m 0755 \"$DIST_DIR/$c-linux-\$goarch\" \"\$pkgdir/usr/bin/$c\""
+      done
+      echo "  install -D -m 0755 \"$TPL/unistord-openrc\" \"\$pkgdir/etc/init.d/unistord\""
+      echo '  install -d -m 0755 "$pkgdir/etc/unistord" "$pkgdir/var/lib/unistord"'
+      echo '  : > "$pkgdir/etc/unistord/unistord.env"'
+      echo '  chmod 0640 "$pkgdir/etc/unistord/unistord.env"'
+      echo '}'
+    } > "$work/APKBUILD"
+    ( cd "$work" && CARCH="$apk_carch" abuild -r ${ABUILD_FLAGS:-} >"${ABUILD_LOG:-/dev/null}" 2>&1 )
+    # abuild writes the apk as $PKGDEST/<repo>/<carch>/<name>.apk (no arch
+    # suffix in the file name), so stamp the target arch into the name to
+    # keep both arches apart. Busybox cp has no -t: copy one by one.
+    dest_root="${PKGDEST:-$HOME/packages}"
+    found=0
+    while IFS= read -r f; do
+      base="$(basename "$f" .apk)"
+      cp "$f" "$APK_DIR/$base.$apk_carch.apk"
+      found=1
+    done < <(find "$dest_root" -type d -name "$apk_carch" -exec find {} -name 'unistord-*.apk' \;)
+    [ "$found" = 1 ] || { echo "package.sh: no apk produced for $apk_carch" >&2; exit 1; }
+    rm -rf "$work"
+  done
   echo "built apks into $APK_DIR"
 else
   echo "package.sh: abuild not found (the apk job runs in an alpine container), skipping" >&2

@@ -195,13 +195,7 @@ jobs:
 
   apk:
     needs: [meta, build]
-    runs-on: ${{ matrix.runner }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - runner: ubuntu-latest
-          - runner: ubuntu-24.04-arm
+    runs-on: ubuntu-latest
     container:
       image: alpine:3.21
     # В alpine:3.21 нет bash "из коробки" (он ставится первым шагом),
@@ -213,7 +207,7 @@ jobs:
         run: |
           set -eu
           apk update
-          apk add --no-cache abuild sudo bash
+          apk add --no-cache abuild apk-tools sudo bash
           adduser -D builder
           addgroup builder abuild
           echo "builder ALL=(ALL) NOPASSWD: ALL" >/etc/sudoers.d/builder
@@ -250,10 +244,10 @@ jobs:
             '
           chown -R "$(id -u):$(id -g)" "$APK_DIR" || true
 
-      - name: Upload apk
+      - name: Upload apks
         uses: actions/upload-artifact@v4
         with:
-          name: apk-${{ matrix.runner }}
+          name: apk
           path: apkout/*.apk
           retention-days: 7
 
@@ -280,9 +274,8 @@ jobs:
       - name: Download apks
         uses: actions/download-artifact@v4
         with:
-          pattern: apk-*
+          name: apk
           path: sds-nbd/dist
-          merge-multiple: true
 
       - name: Ensure tag exists
         env:
@@ -304,8 +297,9 @@ jobs:
         run: |
           set -euo pipefail
           rm -f SHA256SUMS
-          find . -maxdepth 1 -type f ! -name SHA256SUMS ! -name release-notes.md -printf '%P\0' \
-            | sort -z | xargs -0 sha256sum >SHA256SUMS
+          for f in $(find . -maxdepth 1 -type f ! -name 'SHA256SUMS*' ! -name release-notes.md -printf '%P\n' | LC_ALL=C sort); do
+            sha256sum "$f"
+          done >SHA256SUMS
           cat SHA256SUMS
 
       - name: Publish GitHub Release
