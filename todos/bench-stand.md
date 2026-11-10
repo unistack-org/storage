@@ -326,3 +326,42 @@ memmove 6%, шторм планировщика (schedule 17% cum); CPU 486%/800
 данные тоже встали; в dmesg аппаратный MCE (L3/SRC) на фоне sglang —
 reboot по SysRq b, хост поднимается >3 мин как обычно. Восстановление:
 modprobe virtio_vdpa; запуск демона; vdpa dev add.
+
+## 10 ноя, день 2: аппаратная деградация NVMe и восстановление
+
+**Симптом:** randread через стек упал до 16.2K; сырой fio на /dev/nvme0n1
+давал 371 IOPS, на nvme1n1 522 (норма 300K+). SMART/температура/PCIe в
+норме; в dmesg серии `nvme nvmeX: I/O tag N QID N timeout, completion
+polled` на обоих P4510 — классический APST-стоп (уход контроллера в
+deep-sleep и зависание на пробуждении). Один MCE (L3/GEN SRC) в dmesg
+совпал по времени с vdpa-клинчем 10.11 — клинч объясняется блокировкой
+демона на мёртвом диске, не нашей логикой.
+
+**Лечение:** `nvme_core.default_ps_max_latency_us=0` +
+`/etc/modprobe.d/nvme-apst.conf`. Грабли Fedora 44: grubby пишет BLS,
+но загрузчик берёт строку из GRUB_CMDLINE_LINUX (/etc/default/grub) —
+нужен sed по нему + `grub2-mkconfig` + reboot. После ребута
+`/sys/module/nvme_core/parameters/default_ps_max_latency_us == 0` —
+подтверждено.
+
+**После фиксации:** nvme0 307K, nvme1 310K, LV sustained 404K randread.
+
+**Матрица new-sdsd9 (batch ON, APST off):**
+| Паттерн | Результат |
+|---|---|
+| randread qd128×4 | **94.9K**, 5.4ms |
+| randwrite qd128×4 | **46.2K**, 11ms |
+| randread qd1 | **152µs** (фикс держится) |
+
+**Ложная тревога:** сразу после старта демон давал 2.9–4K IOPS.
+Причина — осиротевшее ядровое VDUSE-устройство sds-vol0 (демон убит,
+устройство в sysfs живо, все I/O в нём навечно в D). Новые запуски с
+именем vol0 цепляли мёртвое имя. Лечение: запуск под новым именем
+(sds-vol1) + `vdpa dev add`. Разрушить осиротевшее устройство из
+пользовательского пространства нельзя (unbind виснет, destroy ioctl
+EINVAL) — только reboot. Правило стенда: **убивать демон можно только
+после `vdpa dev del`**, иначе стенд требует перезагрузки.
+
+**Итог по цели 175K:** текущий потолок на стенде ~95K randread при
+CPU 520%/800% (не CPU-упор). Следующие шаги: zero-copy IOTLB,
+multi-queue VDUSE, сокращение goroutine-хопов на путь ответа.
