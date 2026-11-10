@@ -118,7 +118,7 @@ type Cluster struct {
 	// nothing else (no map recompile, no pg table rebuild).
 	mapSrc   []byte
 	regCache placement.Registry
-	closed   bool
+	closed   atomic.Bool // read under mu, failMu (prober) and hot paths
 
 	// out_time dwell (osd_out_time analogue): an OSD that fails to
 	// answer keeps its weight for outTime; only if it stays down that
@@ -277,7 +277,7 @@ func (c *Cluster) noteSuccess(id int32) {
 // ensureProber starts the background prober if any OSD is in the dwell
 // queue. Call with failMu held.
 func (c *Cluster) ensureProber() {
-	if c.proberOn || c.closed {
+	if c.proberOn || c.closed.Load() {
 		return
 	}
 	c.proberOn = true
@@ -412,11 +412,11 @@ func (c *Cluster) failing(id int32) bool {
 // Close shuts every pool down.
 func (c *Cluster) Close() error {
 	c.mu.Lock()
-	if c.closed {
+	if c.closed.Load() {
 		c.mu.Unlock()
 		return nil
 	}
-	c.closed = true
+	c.closed.Store(true)
 	c.mu.Unlock()
 	c.failMu.Lock()
 	if c.proberOn {
@@ -603,7 +603,7 @@ func (c *Cluster) Registry(ctx context.Context) (placement.Registry, error) {
 // StatusStale replies costs one rebuild.
 func (c *Cluster) Refresh(ctx context.Context) (*placement.Snapshot, error) {
 	c.mu.RLock()
-	snap, closed := c.snap, c.closed
+	snap, closed := c.snap, c.closed.Load()
 	c.mu.RUnlock()
 	if closed {
 		return nil, ErrClosed

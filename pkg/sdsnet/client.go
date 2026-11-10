@@ -26,6 +26,8 @@ type Conn struct {
 	seq  uint32
 	dead bool // transport error: the stream state is unknown
 	ep   atomic.Uint32
+	// zcState caches the MSG_ZEROCOPY support probe (zerocopy_linux.go).
+	zcState atomic.Int32
 	// batchOK is set from the handshake reply's Value field: a
 	// batch-capable server answers the handshake with Value=1. Old
 	// servers (Value=0) must never receive a batch frame — a pre-batch

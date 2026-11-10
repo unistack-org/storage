@@ -103,13 +103,24 @@ type Server struct {
 	Logf func(format string, args ...any)
 
 	minEpoch atomic.Uint32
+	// draining is set by Shutdown: connection loops finish the request
+	// in flight, answer further requests with StatusIO (clients retry
+	// elsewhere), and exit.
+	draining atomic.Bool
 
 	mu       sync.Mutex
 	listener net.Listener
 	closed   chan struct{}
 	closedF  bool
-	conns    map[net.Conn]struct{}
+	conns    map[net.Conn]*connLife
 	wg       sync.WaitGroup
+}
+
+// connLife tracks whether a served connection is executing a request
+// (busy) or parked in a read waiting for one. Shutdown closes parked
+// connections immediately and lets busy ones finish.
+type connLife struct {
+	busy atomic.Bool
 }
 
 // ServerMetrics is the optional observation seam of a Server: one
@@ -201,16 +212,17 @@ func (s *Server) ServeListener(ln net.Listener) error {
 		}
 		wg.Add(1)
 		s.wg.Add(1)
+		life := &connLife{}
 		s.mu.Lock()
 		if s.conns == nil {
-			s.conns = make(map[net.Conn]struct{})
+			s.conns = make(map[net.Conn]*connLife)
 		}
-		s.conns[c] = struct{}{}
+		s.conns[c] = life
 		s.mu.Unlock()
 		go func() {
 			defer wg.Done()
 			defer s.wg.Done()
-			s.handle(c)
+			s.handle(c, life)
 			s.mu.Lock()
 			delete(s.conns, c)
 			s.mu.Unlock()
@@ -224,15 +236,16 @@ func (s *Server) ServeListener(ln net.Listener) error {
 // live in one process (see Pool.Local). The connection is tracked like
 // a listener-accepted one: Close closes it.
 func (s *Server) ServeConn(c net.Conn) {
+	life := &connLife{}
 	s.mu.Lock()
 	if s.conns == nil {
-		s.conns = make(map[net.Conn]struct{})
+		s.conns = make(map[net.Conn]*connLife)
 	}
-	s.conns[c] = struct{}{}
+	s.conns[c] = life
 	s.mu.Unlock()
 	s.wg.Add(1)
 	defer s.wg.Done()
-	s.handle(c)
+	s.handle(c, life)
 	s.mu.Lock()
 	delete(s.conns, c)
 	s.mu.Unlock()
@@ -273,6 +286,76 @@ func (s *Server) Close() error {
 	return err
 }
 
+// Shutdown drains the server gracefully: it stops accepting (the
+// listener closes, Serve returns nil), closes connections that are
+// parked between requests, and lets connections with a request in
+// flight finish it and then exit the loop. New requests that arrive
+// during the drain are answered with StatusIO, so clients fail over and
+// retry against another replica instead of hanging. When ctx expires,
+// remaining connections are force-closed (Close semantics), so Shutdown
+// always returns within the deadline. Call it concurrently with Serve,
+// then Close the backend: queued durable writes have been served by the
+// time Shutdown returns.
+func (s *Server) Shutdown(ctx context.Context) error {
+	s.mu.Lock()
+	if s.closed == nil {
+		s.closed = make(chan struct{})
+	}
+	if !s.closedF {
+		s.closedF = true
+		close(s.closed)
+	}
+	var err error
+	if s.listener != nil {
+		err = s.listener.Close()
+	}
+	s.mu.Unlock()
+	s.draining.Store(true)
+
+	done := make(chan struct{})
+	go func() {
+		s.wg.Wait()
+		close(done)
+	}()
+	tick := time.NewTicker(20 * time.Millisecond)
+	defer tick.Stop()
+	for {
+		select {
+		case <-done:
+			return err
+		case <-ctx.Done():
+			// Deadline: force-close whatever is left, exactly like Close.
+			s.mu.Lock()
+			for c := range s.conns {
+				c.Close()
+			}
+			s.mu.Unlock()
+			// Give the killed handlers a moment to unwind; a backend
+			// operation that ignores its context must not turn a
+			// bounded shutdown into an unbounded one.
+			grace := time.NewTimer(100 * time.Millisecond)
+			defer grace.Stop()
+			select {
+			case <-done:
+			case <-grace.C:
+			}
+			if err == nil {
+				err = ctx.Err()
+			}
+			return err
+		case <-tick.C:
+			// Close connections parked in a read; busy ones finish.
+			s.mu.Lock()
+			for c, life := range s.conns {
+				if !life.busy.Load() {
+					c.Close()
+				}
+			}
+			s.mu.Unlock()
+		}
+	}
+}
+
 func (s *Server) logf(format string, args ...any) {
 	if s.Logf != nil {
 		s.Logf(format, args...)
@@ -280,7 +363,7 @@ func (s *Server) logf(format string, args ...any) {
 }
 
 // handle runs one connection: handshake, then the request loop.
-func (s *Server) handle(c net.Conn) {
+func (s *Server) handle(c net.Conn, life *connLife) {
 	defer c.Close()
 	setNoDelay(c)
 
@@ -349,12 +432,24 @@ func (s *Server) handle(c net.Conn) {
 	// these makes the warm request loop allocation-free.
 	rw := &connRW{rh: make([]byte, ReqHeaderSize), hdr: make([]byte, RespHeaderSize)}
 	for {
+		if s.draining.Load() {
+			// Graceful drain: finish the connection after the last
+			// completed request; pooled clients reconnect to a peer.
+			_ = wr.Flush()
+			return
+		}
+		// Parked: Shutdown may close this connection now.
+		life.busy.Store(false)
 		if _, err := io.ReadFull(rd, rw.rh); err != nil {
 			if !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) {
 				s.logf("sdsnet: read request header: %v", err)
 			}
 			return
 		}
+		// Request in flight: from here the loop owes the client a
+		// reply, so Shutdown must not yank the socket mid-request
+		// (the flag stays set until the next iteration's park).
+		life.busy.Store(true)
 		h, err := DecodeReqHeader(rw.rh)
 		if err != nil {
 			// Echo the raw seq (decoded headers zero it on error) so

@@ -25,6 +25,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/unistack-org/storage/pkg/iouring"
 	"github.com/unistack-org/storage/pkg/object"
 )
 
@@ -121,6 +122,13 @@ type Options struct {
 	// the reservation is object.Size, so sizing this >= a few objects is
 	// enough on a quiet store.
 	MinFreeBytes int64
+	// AsyncRing > 0 routes ReadAt/WriteAt through the async I/O ring:
+	// io_uring on Linux (kernel >= 5.6), a worker-pool pread/pwrite
+	// fallback elsewhere. The value is the ring depth (a good starting
+	// point is 128-512). Journal mode always uses the plain path; if the
+	// ring cannot be created the store logs it and keeps the plain
+	// pread/pwrite path, so enabling AsyncRing never breaks a store.
+	AsyncRing int
 	// Logf receives informational messages (nil = silent).
 	Logf func(format string, args ...any)
 }
@@ -144,6 +152,9 @@ type Store struct {
 	// CommitJournal; see journal.go).
 	jrn *journalState
 
+	// ring is the async I/O ring (nil = plain pread/pwrite path).
+	ring iouring.Ring
+
 	syncPasses atomic.Int64 // fsync passes performed (Sync + batches), for stats/tests
 }
 
@@ -153,6 +164,7 @@ type batchWaiter struct {
 
 type entry struct {
 	f    *os.File
+	fd   int32 // cached f.Fd() for ring submissions (0 when ring off)
 	size int64
 	// dirty counts writes issued since the last successful fsync of
 	// this file (0 = clean). Sync skips clean files, which keeps a
@@ -186,6 +198,16 @@ func New(dir string, opts Options) (*Store, error) {
 		}
 		s.jrn = js
 		s.startApplier(js)
+	}
+	if opts.AsyncRing > 0 && s.jrn == nil {
+		ring, err := iouring.New(opts.AsyncRing)
+		if err != nil {
+			// A missing ring is a performance loss, not a failure:
+			// plain pread/pwrite stays in charge.
+			opts.Logf("store: async ring unavailable (%v): using plain pread/pwrite", err)
+		} else {
+			s.ring = ring
+		}
 	}
 	return s, nil
 }
@@ -370,6 +392,12 @@ func (s *Store) openSlow(oid object.OID, create bool) (*entry, error) {
 		}
 	}
 	e := &entry{f: f, size: st.Size()}
+	if s.ring != nil {
+		// os.File.Fd() dups the descriptor (blocking mode) once per
+		// entry: the ring must never call Fd() on the hot path.
+		e.fd = int32(f.Fd())
+		s.ring.RegisterFile(e.fd, f)
+	}
 	s.files[oid] = e
 	s.usage += e.size
 	return e, nil
@@ -389,6 +417,9 @@ func (s *Store) ReadAt(oid object.OID, p []byte, off int64) (int, error) {
 	e, err := s.open(oid, false)
 	if err != nil {
 		return 0, err
+	}
+	if s.ring != nil {
+		return s.ringIO(e, p, off, false)
 	}
 	return e.f.ReadAt(p, off)
 }
@@ -441,9 +472,14 @@ func (s *Store) WriteAt(oid object.OID, p []byte, off int64) (int, error) {
 	if err != nil {
 		return 0, err
 	}
-	n, err := e.f.WriteAt(p, off)
-	if isNoSpace(err) {
-		err = ErrNoSpace
+	var n int
+	if s.ring != nil {
+		n, err = s.ringIO(e, p, off, true)
+	} else {
+		n, err = e.f.WriteAt(p, off)
+		if isNoSpace(err) {
+			err = ErrNoSpace
+		}
 	}
 	// A write past EOF grew the object.
 	s.mu.Lock()
@@ -700,9 +736,17 @@ func (s *Store) Close() error {
 		}
 	}
 
+	// Stop the ring before the files: queued completions must not race
+	// with closed descriptors. Close fires queued ops with ErrClosed.
+	var firstErr error
+	if s.ring != nil {
+		if err := s.ring.Close(); err != nil {
+			firstErr = err
+		}
+	}
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	var firstErr error
 	for oid, e := range s.files {
 		if err := e.f.Sync(); err != nil && firstErr == nil {
 			firstErr = err

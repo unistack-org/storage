@@ -194,6 +194,13 @@ func (d *Daemon) Run(ctx context.Context) error {
 	for {
 		select {
 		case <-ctx.Done():
+			// Graceful drain first: parked clients are closed, a
+			// request in flight finishes; the deadline bounds it.
+			sctx, scancel := context.WithTimeout(context.Background(), 10*time.Second)
+			if err := srv.Shutdown(sctx); err != nil {
+				d.opts.Logf("osd: shutdown: %v", err)
+			}
+			scancel()
 			d.Close()
 			return ctx.Err()
 		case <-d.quit:

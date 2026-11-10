@@ -161,6 +161,7 @@ func main() {
 	storeMode := flag.Bool("store", false, "treat export paths as object-store directories (phase-1 data path) instead of sparse files")
 	direct := flag.Bool("direct", false, "with -store: request O_DIRECT on object files")
 	prealloc := flag.Bool("preallocate", false, "with -store: fallocate each new object to full size")
+	asyncRing := flag.Int("async-ring", 0, "with -store: route object reads/writes through the async I/O ring (io_uring on Linux, worker-pool fallback elsewhere); value = ring depth, e.g. 128; 0 = plain pread/pwrite")
 	maxConns := flag.Int("max-conns", 0, "max concurrent client connections (0 = unlimited)")
 	clusterDir := flag.String("cluster", "", "meta directory of a cluster (enables clustered exports backed by OSDs)")
 	var osds osdFlag
@@ -276,11 +277,17 @@ func main() {
 	}
 
 	if *pprofAddr != "" {
+		pprofSrv := &http.Server{Addr: *pprofAddr, Handler: nil}
 		go func() {
 			logger.Printf("pprof on %s", *pprofAddr)
-			if err := http.ListenAndServe(*pprofAddr, nil); err != nil {
+			if err := pprofSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 				logger.Printf("pprof: %v", err)
 			}
+		}()
+		defer func() {
+			sctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+			_ = pprofSrv.Shutdown(sctx)
 		}()
 	}
 
@@ -496,7 +503,7 @@ func main() {
 				logger.Fatalf("bad size in -export %q: %v", spec, err)
 			}
 		}
-		b, err := newBackend(*storeMode, path, size, *direct, *prealloc, commitMode, *fsyncBatch)
+		b, err := newBackend(*storeMode, path, size, *direct, *prealloc, commitMode, *fsyncBatch, *asyncRing)
 		if err != nil {
 			logger.Fatalf("export %s: %v", name, err)
 		}
@@ -868,7 +875,7 @@ func parseOSDSpec(spec string) (id int32, dataDir, addr string, err error) {
 
 // newBackend builds the export backend: a plain sparse file (MVP
 // default) or, with -store, the phase-1 object-store data path.
-func newBackend(storeMode bool, path string, size uint64, direct, prealloc bool, commitMode store.CommitMode, fsyncBatch time.Duration) (nbd.Backend, error) {
+func newBackend(storeMode bool, path string, size uint64, direct, prealloc bool, commitMode store.CommitMode, fsyncBatch time.Duration, asyncRing int) (nbd.Backend, error) {
 	if !storeMode {
 		return nbd.NewFileBackend(path, size)
 	}
@@ -880,6 +887,7 @@ func newBackend(storeMode bool, path string, size uint64, direct, prealloc bool,
 		Preallocate: prealloc,
 		CommitMode:  commitMode,
 		FsyncBatch:  fsyncBatch,
+		AsyncRing:   asyncRing,
 	})
 }
 
