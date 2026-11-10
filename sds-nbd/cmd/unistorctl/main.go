@@ -22,7 +22,7 @@
 //	osd ls | out <id> | in <id> [-weight w]      (registry weight; 0 = out of placement)
 //	osd add <id> <addr> [-data P] [-uuid U]      (register an osd record by hand)
 //	map dump [-format raw|text|json|yaml|binary]  (latest crush map epoch; raw = as stored)
-//	map check   [file] [-pg-num n] [-replicas n] [-rule r]  (compile + pg census)
+//	map check   [file] [-pg-num n] [-replicas n] [-rule r] [-class ssd|hdd]  (compile + pg census + class validators)
 //	map publish <file> [-epoch n]                (store a new epoch; default latest+1)
 //	map reweight <id> <w>                        (vitastor-style alias of osd out/in)
 //	vacuum      [ls|run [vol]]                 (M1.4: deleted-volume garbage; run <vol> targets one tombstone or punches a live volume's all-zero objects)
@@ -50,6 +50,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/unistack-org/crushkv/crushmap"
+	"github.com/unistack-org/sds-nbd/internal/buildinfo"
 	"github.com/unistack-org/storage/pkg/client"
 	"github.com/unistack-org/storage/pkg/meta"
 	"github.com/unistack-org/storage/pkg/object"
@@ -66,8 +68,13 @@ func main() {
 	tlsCert := flag.String("tls-cert", "", "with a TLS-enabled cluster: PEM client certificate for the OSD data plane (with -tls-key, -tls-ca)")
 	tlsKey := flag.String("tls-key", "", "PEM private key for -tls-cert")
 	tlsCA := flag.String("tls-ca", "", "PEM CA certificate(s): verify server certificates (OSD data plane, admin -http https URLs)")
+	showVersion := flag.Bool("version", false, "print version and exit")
 	flag.Usage = usage
 	flag.Parse()
+	if *showVersion {
+		fmt.Println(buildinfo.Line("unistorctl"))
+		return
+	}
 	args := flag.Args()
 	if len(args) == 0 {
 		usage()
@@ -792,6 +799,7 @@ func mapCmd(ctx context.Context, cl *client.Cluster, ms meta.Store, args []strin
 		pgNum := fs.Uint("pg-num", 1024, "pg table width for the compile")
 		replicas := fs.Int("replicas", 3, "replicas per pg row")
 		rule := fs.String("rule", "", "crush rule name (default: lowest-id rule)")
+		class := fs.String("class", "", "validate rules for a volume class (e.g. ssd, hdd): class filters, fault-domain capacity, reweight preview against the live registry")
 		parseMix(fs, rest)
 		var src []byte
 		label := "stored map"
@@ -808,6 +816,38 @@ func mapCmd(ctx context.Context, cl *client.Cluster, ms meta.Store, args []strin
 			}
 			src = rec.Map
 			label = fmt.Sprintf("stored map (epoch %d, %s)", rec.Epoch, rec.Format)
+		}
+		// AST-валидатор: структура карты ловится до компиляции (битые
+		// pos/ссылки/классы из etcd приходят именно так).
+		ast, astErr := placement.DecodeMap(src)
+		if astErr == nil {
+			verdict := ast.Check()
+			fmt.Print(formatMapVerdict(verdict))
+			if !verdict.OK() {
+				return fmt.Errorf("map check %s: %d structural error(s)", label, len(verdict.Errors))
+			}
+			if *class != "" {
+				cverdict := ast.CheckClass(*class)
+				if live, lerr := cl.Registry(ctx); lerr == nil && len(live) > 0 {
+					// reweight-preview: osd out (вес 0 в реестре) учитывается
+					weights := make(map[int32]float64, len(ast.Devices))
+					for _, d := range ast.Devices {
+						if _, ok := live[d.ID]; ok {
+							weights[d.ID] = 1
+						} else {
+							weights[d.ID] = 0
+						}
+					}
+					cverdict = ast.CheckWeights(*class, weights)
+				}
+				fmt.Printf("map check %s class %s: classes in map: %v\n", label, *class, ast.Classes())
+				fmt.Print(formatMapVerdict(cverdict))
+				if !cverdict.OK() {
+					return fmt.Errorf("map check %s class %s: %d error(s)", label, *class, len(cverdict.Errors))
+				}
+			}
+		} else if *class != "" {
+			return fmt.Errorf("map check %s: -class needs a decodable map: %w", label, astErr)
 		}
 		reg, err := cl.Registry(ctx)
 		if err != nil {
@@ -901,6 +941,11 @@ func mapCmd(ctx context.Context, cl *client.Cluster, ms meta.Store, args []strin
 		usage()
 		return fmt.Errorf("map: unknown subcommand %q (dump | check | publish | reweight)", args[0])
 	}
+}
+
+// formatMapVerdict печатает вердикт crushmap-валидатора.
+func formatMapVerdict(r *crushmap.CheckResult) string {
+	return crushmap.FormatCheckResult(r)
 }
 
 func mapLookupErr(err error) error {

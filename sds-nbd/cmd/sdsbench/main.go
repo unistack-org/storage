@@ -25,6 +25,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/unistack-org/sds-nbd/internal/buildinfo"
 )
 
 // NBD protocol constants (mirrors of the unexported ones in package nbd).
@@ -66,7 +68,12 @@ func main() {
 	qd := flag.Int("qd", 32, "queue depth (in-flight requests) per connection")
 	conns := flag.Int("conns", 1, "number of parallel connections (total QD = qd*conns)")
 	runDur := flag.Duration("runtime", 10*time.Second, "duration (0 = one pass over size)")
+	showVersion := flag.Bool("version", false, "print version and exit")
 	flag.Parse()
+	if *showVersion {
+		fmt.Println(buildinfo.Line("sdsbench"))
+		return
+	}
 
 	bsBytes, err := parseSize(*bs)
 	if err != nil {

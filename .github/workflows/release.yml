@@ -1,0 +1,319 @@
+name: release
+
+# Порт release-процедуры unistack-org/unistack: сборки по тегу в GitHub
+# Releases (ассеты — бинарники linux/amd64 + linux/arm64, SHA256SUMS,
+# release-notes), плюс устанавливаемые пакеты .deb / .rpm / .apk.
+# CDN/TUF-часть из оригинального workflow намеренно опущена.
+#
+# Каналы (по суффиксу тега, как в unistack):
+#   v2026.02.12.01-stable  -> stable   (голый тег = stable)
+#   v2026.02.12.01-testing -> testing
+#   v2026.02.12.01-rc.1    -> testing, prerelease
+#   v2026.02.12.01-dev     -> develop, prerelease
+#   push в master          -> develop (автотег vYYYY.MM.DD.NN-dev), prerelease
+#
+# Формат версии в бинарях/пакетах: YYYYmmddNN (NN из тега, для develop —
+# счётчик тегов этого дня + 1).
+
+on:
+  push:
+    branches: [master]
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Версия (YYYYmmddNN); пусто = сегодня.01"
+        required: false
+        type: string
+      channel:
+        description: "Канал"
+        required: false
+        type: choice
+        default: stable
+        options: [stable, testing, develop]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  GO_VERSION_FILE: sds-nbd/go.mod
+
+jobs:
+  meta:
+    runs-on: ubuntu-latest
+    outputs:
+      channel: ${{ steps.meta.outputs.channel }}
+      version: ${{ steps.meta.outputs.version }}
+      tag: ${{ steps.meta.outputs.tag }}
+      prerelease: ${{ steps.meta.outputs.prerelease }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Determine channel/version/tag
+        id: meta
+        env:
+          INPUT_VERSION: ${{ github.event.inputs.version }}
+          INPUT_CHANNEL: ${{ github.event.inputs.channel }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+          CHANNEL=develop
+          PRERELEASE=true
+          case "$EVENT_NAME:$GITHUB_REF" in
+            workflow_dispatch:*)
+              CHANNEL="${INPUT_CHANNEL:-stable}"
+              V="${INPUT_VERSION:-}"
+              if [ -z "$V" ]; then
+                V="$(date -u +%Y%m%d)01"
+              fi
+              VERSION="$V"
+              TAG="v$(cut -c1-4 <<<"$V").$(cut -c5-6 <<<"$V").$(cut -c7-8 <<<"$V").$(cut -c9-10 <<<"$V")"
+              case "$CHANNEL" in
+                develop) TAG="$TAG-dev" ; PRERELEASE=true ;;
+                testing) TAG="$TAG-testing"; PRERELEASE=false ;;
+                *) PRERELEASE=false ;;
+              esac
+              ;;
+            push:refs/tags/v*)
+              TAG="$GITHUB_REF_NAME"
+              T="${TAG#v}"
+              BASE="${T%%-*}"
+              SUFFIX="${T#*-}"; [ "$SUFFIX" = "$T" ] && SUFFIX=""
+              case "$SUFFIX" in
+                testing)      CHANNEL=testing ;;
+                stable)       CHANNEL=stable ;;
+                dev|develop)  CHANNEL=develop ;;
+                rc.*)         CHANNEL=testing ;;
+                "")           CHANNEL=stable ;;
+                *) echo "unknown tag suffix: $SUFFIX"; exit 1 ;;
+              esac
+              Y="$(cut -d. -f1 <<<"$BASE")"
+              M="$(printf %02d "$(cut -d. -f2 <<<"$BASE")")"
+              D="$(printf %02d "$(cut -d. -f3 <<<"$BASE")")"
+              NN="$(cut -d. -f4 <<<"$BASE")"; [ "$NN" = "$BASE" ] && NN=00
+              NN="$(printf %02d "$NN")"
+              VERSION="${Y}${M}${D}${NN}"
+              case "$SUFFIX" in
+                dev|develop|rc.*) PRERELEASE=true ;;
+                *) PRERELEASE=false ;;
+              esac
+              ;;
+            push:refs/heads/master)
+              CHANNEL=develop
+              PRERELEASE=true
+              Y="$(date -u +%Y)"; M="$(date -u +%m)"; D="$(date -u +%d)"
+              NN="$(( $(git tag -l "v${Y}.${M}.${D}.*" | wc -l) + 1 ))"
+              NN="$(printf %02d "$NN")"
+              VERSION="${Y}${M}${D}${NN}"
+              TAG="v${Y}.${M}.${D}.${NN}-dev"
+              ;;
+            *)
+              echo "unhandled event/ref: $EVENT_NAME $GITHUB_REF"; exit 1 ;;
+          esac
+          echo "channel=$CHANNEL" >>"$GITHUB_OUTPUT"
+          echo "version=$VERSION" >>"$GITHUB_OUTPUT"
+          echo "tag=$TAG" >>"$GITHUB_OUTPUT"
+          echo "prerelease=$PRERELEASE" >>"$GITHUB_OUTPUT"
+          echo "channel=$CHANNEL version=$VERSION tag=$TAG prerelease=$PRERELEASE"
+
+  build:
+    needs: meta
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: ${{ env.GO_VERSION_FILE }}
+
+      - name: Build binaries
+        working-directory: sds-nbd
+        env:
+          VERSION: ${{ needs.meta.outputs.version }}
+          CHANNEL: ${{ needs.meta.outputs.channel }}
+        run: make release VERSION="$VERSION" CHANNEL="$CHANNEL"
+
+      - name: Verify stamped version
+        working-directory: sds-nbd
+        env:
+          VERSION: ${{ needs.meta.outputs.version }}
+        run: |
+          set -euo pipefail
+          for c in unistord unistorctl sdsbench; do
+            out="$(./dist/$c-linux-amd64 -version)"
+            echo "$out"
+            grep -Fq "$VERSION" <<<"$out" || { echo "$c: version $VERSION not stamped"; exit 1; }
+          done
+
+      - name: Release notes
+        env:
+          CHANNEL: ${{ needs.meta.outputs.channel }}
+        run: ./scripts/gen-release-notes.sh
+
+      - name: Upload dist
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: sds-nbd/dist
+          retention-days: 7
+
+  packages:
+    needs: [meta, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download dist
+        uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: sds-nbd/dist
+
+      - name: Build deb + rpm
+        env:
+          VERSION: ${{ needs.meta.outputs.version }}
+        run: bash sds-nbd/scripts/package.sh
+
+      - name: Upload packages
+        uses: actions/upload-artifact@v4
+        with:
+          name: packages
+          path: |
+            sds-nbd/dist/*.deb
+            sds-nbd/dist/*.rpm
+          retention-days: 7
+
+  apk:
+    needs: [meta, build]
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+          - runner: ubuntu-24.04-arm
+    container:
+      image: alpine:3.21
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Prepare toolchain
+        run: |
+          set -euo pipefail
+          apk add --no-cache abuild sudo bash
+          adduser -D builder
+          addgroup builder abuild
+          echo "builder ALL=(ALL) NOPASSWD: ALL" >/etc/sudoers.d/builder
+          mkdir -p sds-nbd/dist
+          chown -R builder:builder "$GITHUB_WORKSPACE"
+
+      - name: Download dist
+        uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: sds-nbd/dist
+
+      - name: Chown dist (artifact extraction runs as root)
+        run: chown -R builder:builder sds-nbd/dist
+
+      - name: Build apk
+        user: builder
+        env:
+          VERSION: ${{ needs.meta.outputs.version }}
+          APK_DIR: ${{ github.workspace }}/apkout
+          HOME: /home/builder
+        run: |
+          set -euo pipefail
+          abuild-keygen -a -i -n
+          bash sds-nbd/scripts/package.sh
+
+      - name: Upload apk
+        uses: actions/upload-artifact@v4
+        with:
+          name: apk-${{ matrix.runner }}
+          path: apkout/*.apk
+          retention-days: 7
+
+  publish:
+    needs: [meta, build, packages, apk]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download dist
+        uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: sds-nbd/dist
+
+      - name: Download packages
+        uses: actions/download-artifact@v4
+        with:
+          name: packages
+          path: sds-nbd/dist
+
+      - name: Download apks
+        uses: actions/download-artifact@v4
+        with:
+          pattern: apk-*
+          path: sds-nbd/dist
+          merge-multiple: true
+
+      - name: Ensure tag exists
+        env:
+          TAG: ${{ needs.meta.outputs.tag }}
+        run: |
+          set -euo pipefail
+          if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "$TAG" -m "release $TAG [skip ci]"
+          # Push через GITHUB_TOKEN: не триггерит повторный прогон workflow.
+          git push "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "refs/tags/$TAG"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Finalize SHA256SUMS over all assets
+        working-directory: sds-nbd/dist
+        run: |
+          set -euo pipefail
+          rm -f SHA256SUMS
+          sha256sum $(ls | grep -v '^SHA256SUMS$' | grep -v '^release-notes.md$') >SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Publish GitHub Release
+        env:
+          TAG: ${{ needs.meta.outputs.tag }}
+          VERSION: ${{ needs.meta.outputs.version }}
+          CHANNEL: ${{ needs.meta.outputs.channel }}
+          PRERELEASE: ${{ needs.meta.outputs.prerelease }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          cd sds-nbd
+          ARGS=(--title "$TAG" --notes-file dist/release-notes.md)
+          [ "$PRERELEASE" = "true" ] && ARGS+=(--prerelease)
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release edit "$TAG" --notes-file dist/release-notes.md \
+              $( [ "$PRERELEASE" = "true" ] && echo --prerelease )
+            gh release upload "$TAG" dist/* --clobber
+          else
+            gh release create "$TAG" dist/* "${ARGS[@]}"
+          fi
+          gh release view "$TAG" --json tagName,prerelease,assets \
+            --jq '{tag:.tagName, prerelease:.prerelease, assets:[.assets[].name]}'

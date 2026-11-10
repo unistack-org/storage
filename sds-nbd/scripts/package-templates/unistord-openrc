@@ -1,0 +1,22 @@
+#!/sbin/openrc-run
+# OpenRC init script for unistord (the apk package; the deb/rpm packages
+# ship the systemd unit from deploy/unistord.service).
+#
+# Daemon arguments live in /etc/unistord/unistord.env as UNISTORD_ARGS,
+# the same file the systemd unit reads.
+
+description="Unistack SDS storage daemon (NBD/VDUSE exports)"
+command="/usr/bin/unistord"
+command_args="$(sed -n 's/^UNISTORD_ARGS=//p' /etc/unistord/unistord.env | head -1)"
+pidfile="/run/unistord.pid"
+command_background=true
+command_user="root"
+
+depend() {
+    need net
+    after firewall
+}
+
+start_pre() {
+    checkpath --directory --owner root:root --mode 0700 /var/lib/unistord
+}

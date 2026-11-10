@@ -29,6 +29,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/unistack-org/sds-nbd/internal/buildinfo"
 	"github.com/unistack-org/sds-nbd/nbd"
 	"github.com/unistack-org/storage/pkg/client"
 	"github.com/unistack-org/storage/pkg/meta"
@@ -202,7 +203,12 @@ func main() {
 	tlsCA := flag.String("tls-ca", "", "PEM CA certificate(s) that signed the peers'/clients' certificates; required for the OSD/raft planes; it is also used to verify admin API clients unless -tls-client-ca-file is set")
 	tlsClientCA := flag.String("tls-client-ca-file", "", "with -tls-ca: require admin API client certificates signed by this CA (by default the admin API presents a certificate but does not demand client certificates, so plain 'curl --cacert' works)")
 	tlsMinVer := flag.String("tls-min-version", "1.2", "minimum TLS version: 1.2 or 1.3")
+	showVersion := flag.Bool("version", false, "print version and exit")
 	flag.Parse()
+	if *showVersion {
+		fmt.Println(buildinfo.Line("unistord"))
+		return
+	}
 
 	if *gogc > 0 {
 		debug.SetGCPercent(*gogc)
