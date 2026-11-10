@@ -52,6 +52,8 @@
 
 ## Фаза 1 — Локальное ядро: быстрый single-node data path (2–4 недели)
 
+> Статус (2026-11-09): код и тесты — готово; открыта только приёмка fio на Linux+NVMe.
+
 Цель: один узел держит диск; fio бьёт наш NBD/сокет — база для всех замеров.
 
 - [x] `pkg/object`: объект = 64-бит ObjectID (OID), размер блока 2–4 MiB (shift, как Sheepdog object / Vitastor 4M)
@@ -86,7 +88,9 @@
       sdsbench (host→sdsd, loopback, QD32): seqwrite 1M 733 MB/s,
       randwrite 4K 49k IOPS; приёмка p99<1мс — на Linux+NVMe
 
-## Фаза 2 — Сеть и репликация (3–5 недель)
+## Фаза 2 — Сеть и репликация (3–5 недель) — ✅ сделано
+
+> Статус (2026-11-09): все пункты закрыты (протокол, репликация кворумом, heartbeat/out_time, pipeline/zerocopy/io_uring); e2e-приёмка на Linux — вне репозитория.
 
 - [x] `pkg/sdsnet`: бинарный протокол (запрос 32 B: op/flags/seq/OID/offset/len/epoch;
       ответ 16 B: seq/status/value; handshake на 16 B + имя экспорта; без grpc/protobuf)
@@ -108,12 +112,22 @@
 - [x] pipeline/batch запросов (`sdsnet.Stream`: окно+батч-флаш+backpressure),
       `MSG_ZEROCOPY` (Linux, `ZerocopyThreshold`, errqueue-синхронизация),
       приём через io_uring (`store.Options.AsyncRing`, fallback pread/pwrite)
-- [ ] heartbeat, деградация при потере реплики, recovery-трафик приоритетом
+- [x] heartbeat, деградация при потере реплики, recovery-трафик приоритетом —
+      heartbeat = `out_time`-выдержка + prober (пинг упавших OSD по свежим
+      соединениям; evict => weight 0, возврат => weight 1; см. Фазу 5
+      «Отказоустойчивость»); деградация: чтения терпимы (любая живая реплика,
+      порядок предпочтений local-first), запись ниже min_size fast-fail
+      `ErrDegraded` + awaitQuorum (hard-семантика, тесты TestCluster*);
+      recovery/vacuum-трафик paced QoS-лимитером и всегда ниже клиентского
+      I/O; авторегулирование скорости вынесено отдельной позицией
+      (`recovery_tune_interval`, Фаза 5b)
 - [x] Тесты: chaos (смерть сервера, frozen replica, пул-давление, обрывы), `-race`
 - Примечание: исправлен дедлок `iouring.fallbackRing.Submit` (mutex держался при
   отправке в unbuffered канал; файлы вынесены под отдельный filesMu)
 
-## Фаза 3 — Кластер, метаданные, CRUSH (4–6 недель) — «как Ceph»
+## Фаза 3 — Кластер, метаданные, CRUSH (4–6 недель) — «как Ceph» — ✅ сделано
+
+> Статус (2026-11-09): все пункты закрыты (etcd/raft-мета, CRUSH-импорт, PG-таблицы, map check/publish/reweight, CLI `unistorctl`).
 
 - [x] `pkg/meta`: метаданные кластера — интерфейс `Store` (Get/Put CAS/List/Watch)
       + `DirStore` (файловый бэкенд: каталог на все роли, watch поллингом 250 мс;
@@ -144,8 +158,10 @@
         масштабирования straw2). Попутно найден и исправлен баг:
         `buildTable` игнорировал реестр — устройства вне Registry теперь
         получают вес 0 (is_out), как и документировано.
-  - [ ] Reweight-валидатор, `rule`-валидатор под наши volume-class (SSD/HDD) —
-        поверх crushkv (CLI-команда `map check`).
+  - [x] Валидатор карты CLI-командой `map check` — сделано: компиляция карты
+        против реестра + ценз PG-таблицы (full/degraded/down), reweight in/out
+        покрыт тестами (см. выше). Отдельный rule-валидатор под volume-class
+        (SSD/HDD) не делался — классов в крашмапе пока нет.
 - [x] sds-nbd: бэкенд `VolumeBackend` (том → NBD-экспорт) и режим `sdsd
       -cluster <meta-каталог>`: OSD в процессе (`-osd id@dir[@addr]`),
       публикация карты (`-crushmap -epoch`), `-create имя:размер`,
@@ -164,8 +180,11 @@
         witness-voter (нода без OSD/экспортов), кворум 2/3 переживает потерю
         одной storage-ноды; плавающего адреса нет — клиенты знают всех
         участников (raft-peers).
-- [ ] CLI `unistorage`: node add/ls/out, volume create/ls/rm, map dump/check,
-      reweight, recovery status
+- [x] CLI `unistorctl`: osd add/ls/out/in, vol create/ls/rm/info/quota/resize/
+      qos/import/export/snap/clone, map dump/check/publish/reweight (dump
+      -format raw|text|json/yaml/binary), vacuum ls/run (включая пер-томный),
+      recovery ls/check/run, status (машиночитаемый, -json), healthcheck
+      (exit-code для оркестрации). Все команды — оболочка над HTTP API unistord.
 - [x] **CRUSH — ключевой deliverable: вынесен в отдельный репозиторий
       [`crushkv`](https://github.com/unistack-org/crushkv) (`../crushkv`), ГОТОВО:**
   - [x] Движок `crushkv/crush` на Go — **byte-exact порт C-ядра Ceph**
@@ -185,13 +204,21 @@
         690–940 нс у `make()`. GC на пути размещения отсутствует полностью.
   - [x] Тесты: воспроизводимость (golden Ceph), reweight in/out (вес 0),
         movement-свойства CRUSH — в `crush/*_test.go`.
-  - [ ] Reweight-валидатор, `rule`-валидатор под наши volume-class (SSD/HDD) —
-        CLI-команда поверх crushkv (эмуляция отказов и chi-square равномерность
-        уже покрыты тестами: `storage/pkg/placement/uniformity_test.go`).
-- [ ] CLI `unistorage`: node add/ls/out, volume create/ls/rm, map dump/check,
-      reweight, recovery status
+  - [x] Валидатор карты CLI-командой `map check` — сделано (компияция карты
+        против реестра + ценз PG-таблицы full/degraded/down, non-zero exit при
+        down-строках); reweight покрыт `map reweight` + тестами. Эмуляция
+        отказов и chi-square равномерность покрыты тестами:
+        `storage/pkg/placement/uniformity_test.go`. Отдельный rule-валидатор
+        под volume-class (SSD/HDD) не делался — классов в крашмапе пока нет.
+- [x] CLI `unistorctl`: osd add/ls/out/in, vol create/ls/rm/info/quota/resize/
+      qos/import/export/snap/clone, map dump/check/publish/reweight (dump
+      -format raw|text|json/yaml/binary), vacuum ls/run (включая пер-томный),
+      recovery ls/check/run, status (машиночитаемый, -json), healthcheck
+      (exit-code для оркестрации). Все команды — оболочка над HTTP API unistord.
 
 ## Фаза 4 — Экспорт в ВМ: «NVMe внутри виртуалки» (2–4 недели)
+
+> Статус (2026-11-09): NBD + VDUSE (мультиочерёдный, online-resize, reconnect) готовы; открыто: Go vhost-user-blk (`pkg/vub`) и e2e Linux+KVM.
 
 Порядок от простого к целевому (детали и команды —
 `unistack/todos/storage-nvme-vfio-user.md`):
@@ -253,6 +280,8 @@
 
 ## Фаза 5 — Производительность до уровня Vitastor (постоянно, с замерами на каждую фазу)
 
+> Статус (2026-11-09): 171–177K 4K randread (цель 100K — перекрыта), отказоустойчивость (min_size/out_time/пресеты) закрыта; открыто: бенч-стенд 3–5 нод, in-memory мета-индекс, write-intent/WA, cpubench, per-CPU оптимизации.
+
 - [ ] **Чем обгоняем Vitastor (принято: они реально быстрее Ceph, мы целимся выше).**
       Их сильные стороны перенимаем 1:1: мета в RAM, journal-ring + кворум
       журналов, один RPC до primary, per-CPU single-thread, io_uring, zero-copy.
@@ -287,9 +316,9 @@
       — RDMA+оптимум; наши ворота ниже — это потолок-мишень, а не обещание.
 - [ ] Бенч-стенд: 3–5 нод, NVMe, 25/40GbE; профили из `tests/fio.txt` +
       randread/randwrite 4K/64K/1M, depth 4/16/128
-- [ ] **Отказоустойчивость по домену отказа (по мотивам Vitastor pool config)**:
+- [x] **Отказоустойчивость по домену отказа (по мотивам Vitastor pool config)**:
       механизм уже есть (CRUSH `failure_domain` = chooseleaf distinct rack, golden-тесты),
-      взять из Vitastor три вещи: (1) DONE `min_size` тома = их pg_minsize — поле
+      взято из Vitastor всё: (1) DONE `min_size` тома = их pg_minsize — поле
       VolumeSpec.MinSize, кворум записи W=min_size, ниже — write fast-fail ErrDegraded,
       чтения толерантны (любая живая реплика); флаг sdsd `-min-size`; тесты
       TestClusterMinSize*; (2) DONE `out_time`-выдержка (default 600 с) перед вытеснением
@@ -369,9 +398,15 @@
       коалесинг гостевых FLUSH в один проход fsync; NBD flush/SYNC → в
       Volume.Flush. Тесты «подтверждённая запись переживает перезапуск» —
       в `journal_test.go`/`commit_test.go`
-- [ ] **Восстановление пообъектное, не PG-ами** (урок Vitastor; Ceph из-за
-      PG-гранулярности получает взрывной recovery): recovery-воркер чинит
-      отдельные объекты строки pg
+- [x] **Восстановление пообъектное, не PG-ами** (урок Vitastor; Ceph из-за
+      PG-гранулярности получает взрывной recovery) — сделано (Recovery v1):
+      recovery-воркер чинит отдельные объекты строки pg: `recovery check`
+      сравнивает индексные списки OSD-источника и собирает план дыр
+      (`recovery:<том>`: pending|running|done|failed, прогресс, копия в
+      etcd), `recovery run` копирует 4M-объекты источник→приёмник
+      (дистанционный pull, приёмник пишет себе локально), темп paced-QoS
+      ниже клиентского I/O; `recovery ls`, метрики recovery-объектов;
+      тесты mock-кластером (`pkg/client/recovery*`, `sds-nbd` e2e recovery)
 - [x] **Клиент «вечно ждёт», а не ошибается** (урок Vitastor: EPIPE →
       бесконечный retry): DONE._hardMode_ по умолчанию = hard: write при
       недоборе кворума (ErrDegraded из targets) засыпает в awaitQuorum —
@@ -405,6 +440,8 @@
       результаты на стенде в `~/bench/results/`
 
 ## Фаза 5b — Надёжность, безопасность, наблюдаемость (по урокам Vitastor)
+
+> Статус (2026-11-09): закрыто ядро Ops: HTTP API+OpenAPI, CLI-оболочка, status/healthcheck, метрики, TLS, commit-режимы, SIGTERM-дрейн, онлайн-resize, import/export по HTTP, пообъектный recovery. Открыто: хаос-CI с сидами, каталог багов-инвариантов, Grafana-дашборд, авторегулирование recovery, авто-детект параметров тома.
 
 Источник: полный разбор их ченджлогов 0.5.x → 3.2.3 и доклада Highload'2025 —
 `todos/vitastor-ideas.md` (там же нумерация §, релиз-источник каждой позиции и
@@ -476,7 +513,10 @@
       см. Риски п.6). Детали: `vitastor-ideas.md` §4.1
 - [ ] **`recovery_tune_interval`** — авторегулирование скорости
       recovery/rebalance по влиянию на клиентский I/O, приоритет клиента над
-      восстановлением; стыкуется с «восстановление пообъектное» выше
+      восстановлением; стыкуется с «восстановление пообъектное» выше.
+      Частично: приоритет клиента уже обеспечен (recovery/vacuum идут через
+      paced QoS-лимитер ниже клиентского трафика, лимит задаётся вручную);
+      автоматической подстройки темпа по метрикам задержки клиента нет
 - [x] **Онлайн-resize экспорта** (`sds-nbd`, `pkg/vduse`) — рост на лету
       реализован: `cs.size` атомарный, обновляется из бэкенда при запросе за
       старую границу; resize без реконнекта, VDUSE уведомляет гостя за ~2 с.
@@ -487,17 +527,21 @@
       запросов/ответов, Bearer-авторизация (`-admin-token`), octet-stream для
       импорта/экспорта блобов; `/metrics` — отдельный слушатель, вне спеки.
       HTTP API уже живёт в демоне; CLI поверх него — ниже.
-- [ ] **`unistorage serve`: HTTP API + OpenAPI** — наш CLI проектируется как
-      оболочка над HTTP API (у них это дало интеграции с CSI/дашбордами);
-      вместе с `status` (машиночитаемым, с предупреждениями: 100% OSD,
-      degraded PG, флэппинг, отставание recovery) и отладочными
+- [x] **HTTP API контролла (идея `unistorage serve`): HTTP API + OpenAPI** —
+      CLI (`unistorctl`) — оболочка над HTTP API unistord (это дало
+      интеграции с CSI/дашбордами); `status` машинночитаемый
+      (`-json`/`-json-summary`) с предупреждениями: диск 95%, нет
+      кворум-строки, флэппинг OSD, отставание recovery; OpenAPI
+      `api/openapi.yaml` (см. выше). Не сделано: отладочные
       `pg-list`/`osd-tree`/`raw-ls`/**kv-rescue** (дамп блоков меты в обход
-      структуры — их способ спасать данные при порче меты). Детали: §6.5–6.9
+      структуры — их способ спасать данные при порче меты; частично
+      закрыто `recovery check` + map dump). Детали: §6.5–6.9
       **Форма поставки зафиксирована (2026-11-08): ровно два бинарника** —
       `sdsd` (данные: OSD + экспорт в ВМ + служебный HTTP этой ноды, `/v1/*`
       и `/metrics`) и `unistorage` (единственный контрол, клиент того же
       HTTP API). HTTP живёт внутри демона (каркас — уже используемый `-pprof`),
-      отдельного API-демона нет. Детали: `test-vm-plan.md` §3
+      отдельного API-демона нет. Реализовано как `unistord` + `unistorctl`
+      (переименовано при доставке). Детали: `test-vm-plan.md` §3
 - [x] **HTTP import/export диска** (требование полигона тестовых ВМ) —
       реализовано в `sds-nbd/cmd/unistord/admin.go`: `PUT
       /v1/volumes/{name}/import?offset=N` (поток octet-stream, чанки 1 МиБ
@@ -550,6 +594,8 @@
       конкурентности на цель). Частично пересекается с «квоты, QoS» Фазы 6
 
 ## Фаза 6 — Функциональность уровня Ceph-фич (после 1–5)
+
+> Статус (2026-11-09): сделано: снапшоты/клоны, thin+UNMAP, QoS/квоты, вакуум. Открыто: EC (RS), бекапы (расписание/ротация поверх export/import), AES-256-XTS, balancer.
 
 - [x] снапшоты (copy-on-write по OID-поколениям) + откат — реализованы
       по ADR `todos/adr-snapshots.md`: схема **«forward/redo»**

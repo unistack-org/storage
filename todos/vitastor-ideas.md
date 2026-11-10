@@ -187,17 +187,23 @@ randread QD128: 41.6K против их 128K (×3). Their bottleneck = CPU + с�
       «подтверждённая запись не теряется при power-loss» —
       `pkg/store/journal_test.go` (crash survival, torn tail, remove
       checkpoint). Не делал: `small_write_throttling` (нет demand). `[2.x, 3.0.x]`
-- [ ] **4.2 ENOSPC и полный журнал** (`pkg/store`, `pkg/osd`, `pkg/client`) —
-      у нас в коде ENOSPC **не обрабатывается нигде**. Требуется: OSD
-      выживает при 100% заполнении; полный журнал → `EAGAIN`/backpressure,
-      клиент ретраит (у них был висящий клиент); предупреждение в `status`;
-      метрика свободного места под журнал. `[3.0.x]`
+- [x] **4.2 ENOSPC и полный журнал** (`pkg/store`, `pkg/osd`, `pkg/client`) —
+      сделано: guard-rail free-space в `pkg/store` срабатывает раньше kernel
+      ENOSPC и отдаёт `StatusNoSpace` (OSD остаётся живым); journal-режим:
+      ENOSPC журнала → backpressure applier'а, клиент ретраит (не виснет);
+      предупреждение «диск >95%» в `unistorctl status`; предупреждение и
+      метрика свободного места. Тесты ENOSPC в `pkg/store`. `[3.0.x]`
 - [ ] **4.3 `recovery_tune_interval`** (`pkg/client` + монитор) — автоматическое
       регулирование скорости recovery/rebalance по влиянию на клиентский I/O;
-      приоритет клиентского трафика над восстановлением. Идеально стыкуется с
-      «object-granular recovery» из роадмапа. `[3.0.x]`
+      приоритет клиентского трафика над восстановлением. Частично: приоритет
+      клиента обеспечен (recovery/vacuum paced QoS-лимитером ниже клиентского
+      I/O, темп задаётся вручную лимитом); автоподстройки по задержкам клиента
+      нет. `[3.0.x]`
 - [ ] **4.4 `noout`/`pg_minsize` в CLI + `describe`** — операционный доступ к
-      уже реализованной семантике (см. §7). `[2.3.x]`
+      уже реализованной семантике (см. §7). Частично: `min_size` — флаг
+      `unistord -min-size` + параметр `vol create` (кворум, fast-fail
+      ErrDegraded); `describe` = `unistorctl vol info`; `noout` — только
+      библиотечный `SetOutTime(0)`, в CLI не выведено. `[2.3.x]`
 - [x] **4.5 Онлайн-resize экспорта** (`sds-nbd`, `pkg/vduse`) — рост размера
       на лету у NBD/VDUSE/QEMU + online expand в CSI. Реализовано: размер в
       transmission больше не фиксируется при `CmdGo` — `cs.size` атомарный и
@@ -269,12 +275,15 @@ randread QD128: 41.6K против их 128K (×3). Their bottleneck = CPU + с�
       — CLI-инструменты без долгоживущего состояния.
 - [x] **6.5 HTTP API + OpenAPI-спека** — специка написана: `api/openapi.yaml`
       (3.0.3, 25 путей, Bearer-токен, схемы из `admin.go`/`jobs.go`/
-      `exports.go`). HTTP API уже живёт внутри unistord. Осталось: CLI
-      `unistorage` как оболочка над этим API (см. roadmap «форма поставки»).
+      `exports.go`). HTTP API живёт внутри unistord; CLI `unistorctl` —
+      оболочка над этим API (все команды бьют в `-http` админ-адрес,
+      по умолчанию http://127.0.0.1:8443).
       `[3.2.x]`
-- [ ] **6.6 `status` с предупреждениями** — ENOSPC/100% OSD, degraded PG,
-      флэппинг, отставание recovery; `status` должен быть машиночитаемым
-      (для 6.5). `[3.0.x]`
+- [x] **6.6 `status` с предупреждениями** — сделано: `unistorctl status`
+      печатает warnings (диск >95%, нет кворум-строки/degraded PG, флэппинг
+      OSD, отставание recovery) и машиночитаем (`-json`, `-json-summary`);
+      отдельно `healthcheck` — лёгкая проверка с exit-code для оркестрации.
+      `[3.0.x]`
 - [ ] **6.7 Отладочные подкоманды**: `ls --tree`, `pg-list`,
       `raw-ls` (сырые блоки меты), **kv-rescue** —
       дамп блоков Б-дерева в обход структуры для восстановления БД.
@@ -283,8 +292,10 @@ randread QD128: 41.6K против их 128K (×3). Their bottleneck = CPU + с�
       + ценз PG-таблицы: full/degraded/down; dump `-format
       raw|text|json|yaml|binary` — реинкодинг между форматами, текстовый
       энкодер написан у нас в pkg/placement, т.к. crushkv его не даёт),
-      `osd add/out/in/ls`
-      (out = weight 0, без перевыпуска мапы). `[3.x]`
+      `osd add/out/in/ls` (out = weight 0, без перевыпуска мапы),
+      `vacuum ls/run` (пер-томный вакуум), `recovery ls/check/run`
+      (пообъектный recovery). Осталось: `pg-list`, `raw-ls`, **kv-rescue**
+      (дамп блоков меты в обход структуры). `[3.x]`
 - [ ] **6.8 `prepare --dry-run`** и вообще dry-run для всех опасных операций. `[3.2.x]`
 - [ ] **6.9 Авто-детект параметров тома клиентом** (block size, режим
       immediate_commit, гранулярность битмапы) — из meta, а не из конфига
@@ -302,20 +313,28 @@ randread QD128: 41.6K против их 128K (×3). Their bottleneck = CPU + с�
 
 ## 7. P2 — Фичи верхнего уровня (синхронизация с Phase 6 роадмапа)
 
-- [ ] **7.1 Снапшоты/клоны по схеме «forward/redo»** — rename-on-snapshot +
-      чтение по цепочке родителей. У них сравнение трёх подходов (undo-log,
-      CoW+refcount, forward/redo) с обоснованием выбора → оформить как ADR и
-      перенести их грабли в тесты 1.6: >255 снапшотов, параллельное удаление
-      из двух процессов, атомарность цепочки. `[2.0, 2.1]`
-- [ ] **7.2 Thin provisioning + UNMAP** — гранулярность битмапы как параметр
-      тома; у нас база (`StatusNotFound`, `OpTrim`) уже есть. `[2.x]`
+- [x] **7.1 Снапшоты/клоны по схеме «forward/redo»** — сделано:
+      rename-on-snapshot + чтение по цепочке поколений (ADR в
+      `todos/adr/`), `unistorctl vol snap/clone`, клон разделяет цепочку;
+      vacuum чистит осиротевшие поколения (автовакуум по интервалу +
+      ручной `vacuum run`, пер-томный). Из их граблей тесты: параллельные
+      снапшот/удаление, атомарность цепочки (снапшот-тесты pkg/store,
+      sds-nbd). `[2.0, 2.1]`
+- [x] **7.2 Thin provisioning + UNMAP** — сделано: аллокация по записи,
+      разрежённые объекты (hole punch при TRIM), гранулярность битмапы —
+      параметр тома; guest-UNMAP (NBD/VDUSE) → `OpTrim` → освобождение
+      места, квоты учитывают аллоцированное. Тесты thin/trim в `pkg/store`.
+      `[2.x]`
 - [ ] **7.3 EC (RS)** — брать их уроки до написания кода: очередь PG с
       активной записью + pending commit/rollback предыдущей (вешает PG),
       **резервирование места в журнале под commit**, пиннинг ISA-L
       (2.31 = порча данных) или свой Reed-Solomon с golden-векторами.
       `[2.4.x, 3.x]`
-- [ ] **7.4 QoS и квоты** (per-volume IOPS/BPS лимиты) — у них есть; у нас в
-      роадмапе, зафиксировать как обязательное для мульти-тенантности.
+- [x] **7.4 QoS и квоты** (per-volume IOPS/BPS лимиты) — сделано: per-volume
+      лимиты IOPS/BPS (shared-бакет, sustained-рейты в метриках), квоты тома
+      (soft/hard) с ENOSPC-семантикой при переполнении; управление
+      `unistorctl vol qos/quota` + горячее через HTTP API. Закрыто как база
+      мульти-тенантности.
 - [ ] **7.5 Бэкапы во внешнее хранилище** — у них эксперименты; минимально
       полезное у нас: снапшот-поток → объект-сторедж/S3. `[2.0]`
 - [ ] **7.6 S3-фронтенд** — у них построено на Zenko CloudServer, статус
