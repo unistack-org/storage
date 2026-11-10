@@ -292,3 +292,37 @@ rmapbt=0), к local-direct отношения не имеет. Профиль 1M
 Lookup (pull-on-miss на unix-сокетах), memmove (2 копиру 4K-плейлоада),
 netpoll/wake-цепочки. Следующие шаги: батчинг RPC (N опов на раунд-трип),
 zero-copy IOTLB-кэш, XROW-репликация, multi-queue VDUSE.
+
+**Batched RPC (OpBatch + микро-батчер на клиенте), new-sdsd8/9:**
+Протокол: OpBatch (N опов на раунд-трип,协商 Value=1, legacy-пиры
+автооткат), Conn.Batch/Pool.Batch, server lazy flush; на клиенте
+микро-батчер per-(volume,OSD): окно 64 слота / 15µs, intake 512,
+pipeline глубины 2. SDS_CLIENT_BATCH=0 отключает.
+
+Матрица (GOMAXPROCS=8, fio /dev/vda, 20s; фон sglang ~170% CPU —
+латентности смотреть осторожно):
+
+| Паттерн            | batch OFF | batch ON           | Vitastor |
+|--------------------|-----------|--------------------|----------|
+| 4K randread qd128×4| 84.7K     | **94.9–103K** (+18%) | 175K   |
+| 4K randwrite qd128×4 | 39.1K (sdsd7) | **45.1K** (+15%) | —    |
+| 4K randread qd1    | 116–119µs | 600µs → фикс ниже  | —        |
+
+Страничный кэш (без -direct): 101K — упор НЕ в диск.
+
+**Фикс qd1-регрессии (opportunistic dispatch, 537347393452):**
+изолированный запрос (интервал > окна, intake пуст) диспатчится сразу,
+без ожидания 15µs; плотные пачки батчатся как раньше. Замер на
+new-sdsd9: qd1 = **166.7µs** (было 600µs с окном; базa 117µs — остаток
+это pipeline-overhead + шум sglang). randread-гарантия +18% сохранена
+(тесты коалесинга зелёные, -race зелёный).
+
+Профиль 100K: Syscall6 29% (сокет read/write ~8.5s/10s, pread 3.9s),
+memmove 6%, шторм планировщика (schedule 17% cum); CPU 486%/800% — не
+упор. Следующие шаги: zero-copy IOTLB, XROW, multi-queue VDUSE,
+уменьшение числа goroutine-перекладываний на путь ответа.
+
+**Падение стенда 10 ноя:** vdpa dev del завис в D (три D-задачи vdpa),
+данные тоже встали; в dmesg аппаратный MCE (L3/SRC) на фоне sglang —
+reboot по SysRq b, хост поднимается >3 мин как обычно. Восстановление:
+modprobe virtio_vdpa; запуск демона; vdpa dev add.
