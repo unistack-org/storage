@@ -7,9 +7,9 @@ import (
 	"runtime/debug"
 	"sync"
 	"sync/atomic"
-	"time"
 
 	"github.com/unistack-org/storage/pkg/vduse"
+	"golang.org/x/sys/unix"
 )
 
 // vqMaxSize is the queue depth we advertise (virtqueue size). vduse
@@ -34,12 +34,23 @@ type job struct {
 // eventfd and publishes jobs; Workers goroutines execute them against
 // the backend and publish used entries, signalling the call eventfd.
 type queue struct {
-	idx  int
-	d    *device
-	num  uint16
+	idx int
+	d   *device
+	num uint16
+	// ring and gm are snapshotted together under d.mu at
+	// SET_VRING_ADDR (which refuses to touch a running queue), so the
+	// dispatcher goroutine — started strictly after that write — can
+	// read them without locking; reset() stops all queues before
+	// dropping the mappings.
 	ring *vduse.SplitRing
-	kick *os.File // readable: guest published buffers
-	call *os.File // writable: notify guest of used buffers
+	gm   vduse.SliceGuestMem
+	// kick is owned for closing only; the dispatcher reads via the
+	// raw kickFD (poll+nonblocking read) because SCM_RIGHTS fds are
+	// not registered with Go's netpoll on macOS. call is written via
+	// os.File (write end, never polled).
+	kick   *os.File // readable: guest published buffers
+	kickFD int32
+	call   *os.File // writable: notify guest of used buffers
 
 	running bool
 
@@ -67,11 +78,6 @@ func (q *queue) start() {
 		return
 	}
 	q.running = true
-	if q.kick != nil {
-		// A prior stop() armed a past read deadline to unblock the
-		// dispatcher; clear it before parking a new one.
-		_ = q.kick.SetReadDeadline(time.Time{})
-	}
 	q.stopCh = make(chan struct{})
 	q.jobs = make(chan *job, 2*q.d.opts.Workers)
 	q.wg.Add(1)
@@ -94,14 +100,13 @@ func (q *queue) stop() {
 	}
 	q.running = false
 	close(q.stopCh)
-	if q.kick != nil {
-		// Unblock a dispatcher parked in kick.Read without destroying
-		// the fd: the kick dup is registered with Go's poller, so a
-		// past deadline makes the blocked Read fail and the dispatcher
-		// exits through its stopCh check.
-		_ = q.kick.SetReadDeadline(time.Now())
-	}
-	close(q.jobs)
+	// The dispatcher parks in poll(2) with a short timeout, so it
+	// notices stopCh within that window on any platform (a read
+	// deadline cannot wake a raw fd read, and we must not close the
+	// kick fd: QEMU resumes the queue on it without resending).
+	// The dispatcher owns closing q.jobs (its defer): that is what
+	// ends the workers' range loops. Closing it here too would be a
+	// double close.
 	q.wg.Wait()
 }
 
@@ -110,6 +115,7 @@ func (q *queue) closeFDs() {
 	if q.kick != nil {
 		_ = q.kick.Close()
 		q.kick = nil
+		q.kickFD = -1
 	}
 	if q.call != nil {
 		_ = q.call.Close()
@@ -119,6 +125,10 @@ func (q *queue) closeFDs() {
 
 // dispatch is the dispatcher goroutine: park on the kick eventfd, then
 // drain the available ring.
+// kickPollMs bounds how long the dispatcher parks in one poll(2) call.
+// stop() only closes stopCh, so this is the worst-case stop latency.
+const kickPollMs = 50
+
 func (q *queue) dispatch() {
 	defer q.wg.Done()
 	defer close(q.jobs)
@@ -130,15 +140,33 @@ func (q *queue) dispatch() {
 			<-q.stopCh
 			return
 		}
-		_, err := q.kick.Read(buf)
+		pfd := unix.PollFd{Fd: q.kickFD, Events: unix.POLLIN}
+		n, err := unix.Poll([]unix.PollFd{pfd}, kickPollMs)
 		select {
 		case <-q.stopCh:
 			return
 		default:
 		}
 		if err != nil {
-			// Kick fd closed (stop) — exit.
+			if err == unix.EINTR {
+				continue
+			}
+			q.logf("vub: q%d: kick poll: %v", q.idx, err)
 			return
+		}
+		if n == 0 {
+			continue // poll timeout: loop and re-check stopCh
+		}
+		if pfd.Revents&(unix.POLLERR|unix.POLLHUP|unix.POLLNVAL) != 0 {
+			// Front-end closed the kick fd: the queue is dead.
+			return
+		}
+		// Drain the eventfd counter / pipe bytes (fd is nonblocking).
+		for {
+			rn, rerr := unix.Read(int(q.kickFD), buf)
+			if rerr != nil || rn == 0 {
+				break // EAGAIN: drained; EOF/error: handled next poll
+			}
 		}
 		if !q.dispatchOnce() {
 			return
@@ -157,8 +185,7 @@ func (q *queue) dispatchOnce() bool {
 		}
 		debug.SetPanicOnFault(prev)
 	}()
-	ring := q.ring
-	gm := q.d.gm
+	ring, gm := q.ring, q.gm
 	for {
 		select {
 		case <-q.stopCh:
@@ -200,6 +227,12 @@ func (q *queue) dispatchOnce() bool {
 		}
 		ok := true
 		for _, sg := range br.DataSegs {
+			// Zero-length segments carry no bytes: the IOTLB refuses
+			// them, and pinning one would spuriously fail the whole
+			// request (FLUSH chains reach this shape). Skip them.
+			if sg.Len == 0 {
+				continue
+			}
 			if !pin(sg.Addr, int(sg.Len)) {
 				ok = false
 				break

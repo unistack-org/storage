@@ -224,7 +224,7 @@
 
 ## Фаза 4 — Экспорт в ВМ: «NVMe внутри виртуалки» (2–4 недели)
 
-> Статус (2026-11-10): NBD + VDUSE (мультиочерёдный, online-resize, reconnect, base:allocation, lock-free IOTLB) готовы; `pkg/vub` (vhost-user-blk) — код пишется, валидация только на Linux+KVM; открыто: 4b/e2e Linux+KVM.
+> Статус (2026-11-11): NBD + VDUSE (мультиочерёдный, online-resize, reconnect, base:allocation, lock-free IOTLB) готовы; `pkg/vub` (vhost-user-blk) реализован и покрыт fake-QEMU e2e-тестами (handshake, rings, multi-queue, GET_VRING_BASE/resume, RESET_DEVICE, reconnect) — все зелёные под `-race`; CLI `-vub export=sock[:ro]` в unistord; остаётся: 4b e2e на Linux+KVM.
 
 Порядок от простого к целевому (детали и команды —
 `unistack/todos/storage-nvme-vfio-user.md`):
@@ -241,14 +241,23 @@
       shutdown/autofsck. fio в госте не поставился (aarch64-пакет вне зеркала
       ISO) — IOPS-числа сняты sdsbench на хосте: seqwrite 64K qd16 ~46 МБ/с,
       randread 4K qd32 ~2.3k IOPS (loopback, отладочная сборка)
-- [ ] **4b Целевой: Go vhost-user-blk server (`pkg/vub`)** — unix-сокет,
-      handshake (GET/SET_FEATURES, SET_MEM_TABLE, SET_VRING_*), mmap гостевой
-      памяти (hugepages), разбор desc/avail/used rings, multi-queue; QSD как
-      мост `--export type=vfio-user` → QEMU `-device vfio-user-pci`
-      (в госте virtio-blk) + вариант NVMe через QSD NBD-экспорт + QEMU NVMe
+- [x] **4b Целевой: Go vhost-user-blk server (`pkg/vub`) — код готов, e2e на Linux+KVM** — unix-сокет,
+      handshake (GET/SET_FEATURES, GET/SET_PROTOCOL_FEATURES + REPLY_ACK,
+      SET_OWNER, SET_MEM_TABLE с SCM_RIGHTS-fd, SET_VRING_NUM/ADDR/BASE/KICK/
+      CALL/ENABLE, GET_VRING_BASE(+SKIP_DRAIN), RESET_DEVICE, GET/SET_CONFIG),
+      mmap гостевой памяти, разбор desc/avail/used rings (split, indirect),
+      multi-queue, диспетчер kick=unix.Poll+неблокирующий read (переносимо:
+      SCM_RIGHTS-fd не регистрируется в netpoll на macOS), батч IRQ на call-fd,
+      F_RO/F_FLUSH/F_DISCARD/F_ZEROES, GET_VRING_BASE drenит inflight
+      (save/restore на тех же fd), reconnect-сессия (reset при дисконнекте).
+      `unistord -vub vol0=/run/vol0.sock[:ro]` (-vub-queues/-vub-workers),
+      admin API exports type=vub. Тесты: protocol-фрейминг + fake-QEMU e2e
+      (11 тестов, -race, -count=2) — все зелёные на macOS; кросс-сборка linux
+      чистая. QSD как мост `--export type=vfio-user` → QEMU
+      `-device vfio-user-pci` не требуется (прямой vhost-user-blk).
       ⚠ Проверено: домашний хост (macOS, homebrew QEMU 11.1.3) НЕ имеет
-      `vhost-user-blk-pci`/`vfio-pci`/vhost-объектов — 4b валидируется только
-      на Linux+KVM (x86_64 или aarch64 Linux-хост с QEMU ≥ 8)
+      `vhost-user-blk-pci`/`vfio-pci`/vhost-объектов — живой QEMU-e2e 4b
+      валидируется только на Linux+KVM (x86_64 или aarch64 Linux-хост с QEMU ≥ 8)
 - [x] **Интеграция с `unistack/pkg/storage` (ушла в VDUSE-транспорт).**
       Клетка подключается драйвером `unistack-sds`
       (`unistack/pkg/storage/unistack_sds.go`) к admin API unistord
@@ -286,7 +295,7 @@
 
 ## Фаза 5 — Производительность до уровня Vitastor (постоянно, с замерами на каждую фазу)
 
-> Статус (2026-11-10): 171–177K 4K randread (цель 100K — перекрыта), отказоустойчивость (min_size/out_time/пресеты) закрыта; закрыты in-memory мета-индекс (ADR), замер WA в sdsbench (WA=2.01), метрика свободного места журнала, write-intent journal (`-intent`, damage report при восстановлении) и упаковка journal-записей (packed-пачки в `pkg/journal`, intent-лог 40→24 Б/запись); открыто: AWUPF/`RWF_ATOMIC` (цель WA→1), VDUSE read-ahead, бенч-стенд 3–5 нод, cpubench, per-CPU оптимизации, цель >200K.
+> Статус (2026-11-10): 171–177K 4K randread (цель 100K — перекрыта), отказоустойчивость (min_size/out_time/пресеты) закрыта; закрыты in-memory мета-индекс (ADR), замер WA в sdsbench (WA=2.01), метрика свободного места журнала, write-intent journal (`-intent`, damage report при восстановлении), упаковка journal-записей (packed-пачки в `pkg/journal`, intent-лог 40→24 Б/запись) и VDUSE read-ahead (§3.8: `-vduse-readahead`, окно 256 КиБ/очередь, portable-тесты; 2–3× подтвердить на Linux-стенде); закрыты ручки GC-давления (`-gogc`, `-ballast-mb`); открыто: AWUPF/`RWF_ATOMIC` (цель WA→1), бенч-стенд 3–5 нод, cpubench, per-CPU оптимизации (по perf-профилю), цель >200K.
 
 - [ ] **Чем обгоняем Vitastor (принято: они реально быстрее Ceph, мы целимся выше).**
       Их сильные стороны перенимаем 1:1: мета в RAM, journal-ring + кворум
@@ -350,7 +359,16 @@
       EPOLL_TAG), registered io_uring fds+bufers, отключение GC-давления
       (GOGC off на data-потоках / ballast), hugepages для буферов,
       NUMA-affinity, опционально kernel-bypass (netmap/eBPF) — только если
-      perf покажет сеть узким местом
+      perf покажет сеть узким местом.
+      => Частично (2026-11-10): ручки GC-давления готовы — `-gogc N`
+      (debug.SetGCPercent) и `-ballast-mb N` (удерживаемый балласт поднимает
+      floor живучей кучи; проверено: RSS растёт на размер балласта).
+      Остальное упирается в профиль: на стенде нужен `perf record` под
+      sdsbench-нагрузкой, по нему выбираем следующую точку (per-CPU workers
+      vs registered buffers vs hugepages). План замера: 1) perf под 4K
+      randread 100K+, 2) grep по GC-фреймам (gcBgMarkWorker, runtime.mallocgc
+      share), 3) только при >10% GC-доле — включать gogc/ballast в тестовый
+      профиль; при сетевой доле >40% — zero-copy/registered buffers.
 - [x] **In-memory мета-индекс объектов** — закрыто 2026-11-10 (ADR:
       `todos/adr-meta-index.md`). `objMeta{size,alloc,allocKnown}` — 24 Б на
       объект, `map` под `Store.mu`; инвариант «один объект — одна запись меты»

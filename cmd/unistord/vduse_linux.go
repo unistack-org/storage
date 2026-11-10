@@ -175,10 +175,12 @@ func (m *vduseManager) list() []vduseDeviceInfo {
 func (m *vduseManager) create(ctx context.Context, devname, volume string, be vduse.Backend, readOnly bool) error {
 	run, stop := context.WithCancel(ctx)
 	dev, err := vduse.NewDevice(devname, vduse.Options{
-		NumQueues:   1,
-		Trim:        m.flags.Trim,
-		WriteZeroes: m.flags.WriteZeroes,
-		ReadOnly:    readOnly,
+		NumQueues:       1,
+		Trim:            m.flags.Trim,
+		WriteZeroes:     m.flags.WriteZeroes,
+		ReadOnly:        readOnly,
+		ReadAhead:       m.flags.ReadAhead,
+		ReadAheadWindow: m.flags.ReadAheadWindow,
 	}, be)
 	if err != nil {
 		stop()
@@ -232,8 +234,8 @@ func (m *vduseManager) closeAll() {
 
 // startVDUSE is the boot entry point kept for main.go: it wires the
 // manager and starts the -vduse specs.
-func startVDUSE(ctx context.Context, logger *log.Logger, es []*nbd.Export, specs []string, trim, writeZeroes bool) (*vduseManager, error) {
-	m := newVDUSEManager(logger, vduseFlags{Trim: trim, WriteZeroes: writeZeroes})
+func startVDUSE(ctx context.Context, logger *log.Logger, es []*nbd.Export, specs []string, trim, writeZeroes, readAhead bool, readAheadWindow int) (*vduseManager, error) {
+	m := newVDUSEManager(logger, vduseFlags{Trim: trim, WriteZeroes: writeZeroes, ReadAhead: readAhead, ReadAheadWindow: readAheadWindow})
 	if err := m.start(ctx, es, specs); err != nil {
 		return nil, err
 	}

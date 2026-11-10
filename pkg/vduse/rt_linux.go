@@ -150,6 +150,9 @@ type queueState struct {
 	// then complete (status + used + IRQ) and release their pins.
 	jobs     chan *job
 	inflight atomic.Int32 // claimed jobs not fully finished
+	// ra is the per-queue read-ahead tracker (nil when disabled).
+	// Workers of this queue share it; readAhead is internally locked.
+	ra *readAhead
 	// cond signals inflight == 0. The counter is atomic: completions
 	// only touch ctrlMu/cond when the decrement REACHES zero (the
 	// quiesce wake-up), not on every completion — under load 256
@@ -294,7 +297,7 @@ func (d *Device) execJob(q *queueState, j *job) {
 		}
 		d.releaseJob(q, j)
 	}()
-	status, written := d.exec(j.br, j.hdr)
+	status, written := d.exec(q, j.br, j.hdr)
 	if d.dbg && time.Since(j.t0) > 2*time.Millisecond {
 		d.logf("q%d: head=%d exec-slow total-since-dispatch=%s\n", q.idx, j.br.Head, time.Since(j.t0))
 	}
@@ -373,6 +376,8 @@ type Device struct {
 	wz       bool
 	ro       bool
 	dbg      bool
+	raOn     bool
+	raOpt    ReadAheadOptions
 	stop     chan struct{}
 	done     chan struct{}
 }
@@ -395,6 +400,15 @@ type Options struct {
 	// read-only and every write request is refused with VIRTIO_BLK_S_IOERR
 	// (the device is the read-only enforcement point, not the guest).
 	ReadOnly bool
+	// ReadAhead enables sequential read prefetch on the data path
+	// (ideas §3.8): a proven sequential run of small reads widens the
+	// first request of the run to a window fetch and serves the rest
+	// of the run from cache. One window per queue, bounded by
+	// ReadAheadWindow (default 256 KiB).
+	ReadAhead bool
+	// ReadAheadWindow bounds the prefetched window per queue in
+	// bytes; 0 selects the default.
+	ReadAheadWindow int
 }
 
 // NewDevice creates (or reattaches to) the kernel device and opens it,
@@ -438,6 +452,8 @@ func NewDevice(name string, opts Options, be Backend) (*Device, error) {
 		trim:     opts.Trim,
 		wz:       opts.WriteZeroes,
 		ro:       opts.ReadOnly,
+		raOn:     opts.ReadAhead,
+		raOpt:    ReadAheadOptions{WindowBytes: opts.ReadAheadWindow},
 		dbg:      os.Getenv("SDS_VDUSE_DEBUG") != "",
 		stop:     make(chan struct{}),
 		done:     make(chan struct{}),
@@ -496,7 +512,7 @@ func (d *Device) setupVQs() error {
 			kf.Close()
 			return fmt.Errorf("vduse: kickfd %d: %w", i, err)
 		}
-		d.vqs[i] = &queueState{idx: uint32(i), kickFD: kf}
+		d.vqs[i] = &queueState{idx: uint32(i), kickFD: kf, ra: newReadAhead(d.raOn, d.raOpt)}
 	}
 	return nil
 }
@@ -1388,6 +1404,71 @@ func (d *Device) execIO(gm SliceGuestMem, segs []Seg, wantWrite bool, off int64)
 	return n, StatusOK
 }
 
+// execRead is the IN path with read-ahead (ideas §3.8). The tracker
+// (q.ra, nil when disabled) either serves the request from a cached
+// window, or asks us to fetch a wider window: the guest receives the
+// first n bytes of the fetch, the tail is cached for the run.
+func (d *Device) execRead(q *queueState, gm SliceGuestMem, segs []Seg, off int64) (int, uint8) {
+	total := 0
+	for _, sg := range segs {
+		total += int(sg.Len)
+	}
+	if total == 0 {
+		return 0, StatusOK
+	}
+	if off+int64(total) > int64(d.be.Size()) {
+		return 0, StatusIOErr
+	}
+	ra := q.ra
+	if ra == nil {
+		return d.execIO(gm, segs, false, off)
+	}
+	prefetch, tok, hitSlice, hit := ra.planRead(off, total, int64(d.be.Size()))
+	if hit {
+		// Serve from the cached window: scatter into the guest chain.
+		pos := 0
+		for _, sg := range segs {
+			if pos >= len(hitSlice) {
+				break
+			}
+			b, err := gm.Slice(sg.Addr, int(sg.Len))
+			if err != nil {
+				return 0, StatusIOErr
+			}
+			pos += copy(b, hitSlice[pos:])
+		}
+		return pos, StatusOK
+	}
+	if prefetch <= total {
+		return d.execIO(gm, segs, false, off)
+	}
+	// Widened fetch: read the window into scratch, serve the first
+	// total bytes, cache the tail. The allocation is bounded by the
+	// per-queue window (256 KiB default) and only happens at run
+	// starts, not per request.
+	win := make([]byte, prefetch)
+	n, err := d.be.ReadAt(win, off)
+	if err != nil {
+		return n, StatusIOErr
+	}
+	if n > total {
+		ra.keep(off+int64(total), win[total:n], tok)
+		n = total
+	}
+	pos := 0
+	for _, sg := range segs {
+		if pos >= n {
+			break
+		}
+		b, serr := gm.Slice(sg.Addr, int(sg.Len))
+		if serr != nil {
+			return n, StatusIOErr
+		}
+		pos += copy(b, win[pos:])
+	}
+	return pos, StatusOK
+}
+
 // coalesce returns one byte slice spanning the whole segment chain.
 // ok=false means the chain crosses IOTLB mapping boundaries and the
 // caller must gather/scatter through a copy.
@@ -1422,7 +1503,7 @@ func (d *Device) coalesce(gm SliceGuestMem, segs []Seg, total int) (buf []byte, 
 // into-the-guest). Guest buffers are used zero-copy straight from the
 // IOTLB mappings: the backend preads/pwrites the guest pages directly,
 // exactly like vhost-user does.
-func (d *Device) exec(br *BlkReq, hdr BlkReqHeader) (uint8, uint32) {
+func (d *Device) exec(q *queueState, br *BlkReq, hdr BlkReqHeader) (uint8, uint32) {
 	gm := d.gm
 	off := int64(hdr.Sector) * 512
 	// A read-only device refuses every request that mutates the image:
@@ -1447,7 +1528,7 @@ func (d *Device) exec(br *BlkReq, hdr BlkReqHeader) (uint8, uint32) {
 				return StatusIOErr, 0
 			}
 		}
-		n, st := d.execIO(gm, br.DataSegs, false, off)
+		n, st := d.execRead(q, gm, br.DataSegs, off)
 		if d.dbg && st != StatusOK {
 			d.logf("exec IN: sector %d segs %d: status %d\n", hdr.Sector, len(br.DataSegs), st)
 		}
@@ -1459,6 +1540,7 @@ func (d *Device) exec(br *BlkReq, hdr BlkReqHeader) (uint8, uint32) {
 			}
 		}
 		_, st := d.execIO(gm, br.DataSegs, true, off)
+		q.ra.invalidate() // nil-safe; mutation breaks any prefetched window
 		if d.dbg && st != StatusOK {
 			d.logf("exec OUT: sector %d segs %d: status %d\n", hdr.Sector, len(br.DataSegs), st)
 		}
@@ -1524,6 +1606,7 @@ func (d *Device) exec(br *BlkReq, hdr BlkReqHeader) (uint8, uint32) {
 				}
 			}
 		}
+		q.ra.invalidate() // nil-safe; discard/zero drops prefetched windows
 		return StatusOK, 0
 	default:
 		if d.dbg {

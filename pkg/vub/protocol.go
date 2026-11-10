@@ -170,13 +170,17 @@ func (c *Conn) ReadMessage() (Header, []byte, []int, error) {
 		return h, nil, fds, fmt.Errorf("vub: payload too big: %d", h.Size)
 	}
 	body := make([]byte, h.Size)
-	m, bfds, err := c.recvMsg(body)
-	fds = append(fds, bfds...)
-	if err != nil {
-		return h, body, fds, err
-	}
-	if m < len(body) {
-		return h, body, fds, fmt.Errorf("vub: truncated payload: %d of %d", m, len(body))
+	if h.Size > 0 {
+		// A zero-size read on macOS blocks (recvmsg with iovlen 0
+		// waits for readability); skip it entirely.
+		m, bfds, err := c.recvMsg(body)
+		fds = append(fds, bfds...)
+		if err != nil {
+			return h, body, fds, err
+		}
+		if m < len(body) {
+			return h, body, fds, fmt.Errorf("vub: truncated payload: %d of %d", m, len(body))
+		}
 	}
 	return h, body, fds, nil
 }

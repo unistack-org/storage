@@ -1,5 +1,7 @@
 package vduse
 
+import "sync"
+
 // Read-ahead (ideas §3.8). The guest reads sequentially in large
 // strides (page cache readahead, dd, mkfs, sequential scans); a
 // sequential run of N requests of size S each costs N backend round
@@ -55,6 +57,7 @@ func (o *ReadAheadOptions) minGoodSize() int {
 // worker pool for a queue shares it under its own serialisation — see
 // planRead callers).
 type readAhead struct {
+	mu         sync.Mutex // guards every field below (workers of one queue share the tracker)
 	opt        ReadAheadOptions
 	seqOff     int64 // expected offset of the next request in the run
 	seqSize    int   // size of requests in the current run
@@ -62,6 +65,7 @@ type readAhead struct {
 	prefetched int64 // end offset of the prefetched window (cache covers up to here)
 	cacheOff   int64
 	cache      []byte // cached bytes [cacheOff, cacheOff+len(cache))
+	token      uint64 // bumped on every cache drop; keep() discards prefetches planned before it, so a window fetched across an invalidate (racing write) never lands
 	enabled    bool
 }
 
@@ -69,29 +73,34 @@ func newReadAhead(enabled bool, opt ReadAheadOptions) *readAhead {
 	if !enabled {
 		return nil
 	}
-	return &readAhead{opt: opt, enabled: true, seqOff: -1}
+	return &readAhead{opt: opt, enabled: true, seqOff: -1, token: 1}
 }
 
 // planRead inspects a read of n bytes at off (before it goes to the
 // backend). Returns:
 //
 //   - hitSlice/hit: the request lies wholly inside the cached window;
-//     serve it from hitSlice (valid until the next invalidate/keep).
-//   - prefetch: fetch [off, off+prefetch) from the backend (bounded
-//     to the device size). The caller serves the first n bytes to the
-//     guest and keeps prefetch-n bytes (starting at off+n) via keep.
+//     serve it from hitSlice (the backing array is immutable, so the
+//     slice stays valid after the lock is released).
+//   - prefetch/token: fetch [off, off+prefetch) from the backend
+//     (bounded to the device size). The caller serves the first n
+//     bytes to the guest and keeps the tail via keep, passing the
+//     token; a token invalidated before keep() discards the bytes.
 //   - otherwise: plain passthrough (the caller reads n bytes).
 //
 // A read outside a sequential run resets the tracker; a window is
-// prefetched once per run start, not per request.
-func (ra *readAhead) planRead(off int64, n int, size int64) (prefetch int, hitSlice []byte, hit bool) {
+// prefetched once per run start, not per request. planRead, keep and
+// invalidate share the tracker lock.
+func (ra *readAhead) planRead(off int64, n int, size int64) (prefetch int, token uint64, hitSlice []byte, hit bool) {
 	if ra == nil || !ra.enabled || n <= 0 {
-		return 0, nil, false
+		return 0, 0, nil, false
 	}
+	ra.mu.Lock()
+	defer ra.mu.Unlock()
 	// Cache hit: the request lies wholly inside the cached window.
 	if len(ra.cache) > 0 && off >= ra.cacheOff && off+int64(n) <= ra.cacheOff+int64(len(ra.cache)) {
 		ra.consume(off, n)
-		return 0, ra.cache[off-ra.cacheOff : off-ra.cacheOff+int64(n)], true
+		return 0, 0, ra.cache[off-ra.cacheOff : off-ra.cacheOff+int64(n)], true
 	}
 	// Sequential run tracking: a request that begins exactly where
 	// the previous one ended, at the same size.
@@ -102,8 +111,14 @@ func (ra *readAhead) planRead(off int64, n int, size int64) (prefetch int, hitSl
 		ra.seqSize = n
 	}
 	ra.seqOff = off + int64(n)
-	if off >= ra.prefetched {
-		ra.dropCache() // window expired behind us
+	if ra.prefetched > 0 && off >= ra.prefetched {
+		// The stream consumed the whole window. Drop it; on a
+		// continuous run this request becomes the new run start
+		// (hits=1) and prefetches the next window below.
+		ra.dropCache()
+		if ra.hits > 0 {
+			ra.hits = 1
+		}
 	}
 	// Prefetch only for small sequential reads, at the START of a
 	// run, and only when no cache window is live (a live window
@@ -116,10 +131,10 @@ func (ra *readAhead) planRead(off int64, n int, size int64) (prefetch int, hitSl
 		}
 		if p := int(want - off); p > n {
 			ra.prefetched = want
-			return p, nil, false
+			return p, ra.token, nil, false
 		}
 	}
-	return 0, nil, false
+	return 0, 0, nil, false
 }
 
 // consume advances the run pointer after a cache hit; the cached
@@ -132,20 +147,28 @@ func (ra *readAhead) consume(off int64, n int) {
 }
 
 // keep stores the prefetched tail the caller fetched (bytes starting
-// at keepOff).
-func (ra *readAhead) keep(keepOff int64, b []byte) {
+// at keepOff). A token that no longer matches (the window state was
+// dropped — by invalidate, a dropCache, or a re-plan — between
+// planRead and keep) discards the bytes: they may predate a write.
+func (ra *readAhead) keep(keepOff int64, b []byte, token uint64) {
 	if ra == nil || !ra.enabled {
+		return
+	}
+	ra.mu.Lock()
+	defer ra.mu.Unlock()
+	if token == 0 || token != ra.token {
 		return
 	}
 	ra.cacheOff = keepOff
 	ra.cache = b
 }
 
-// dropCache invalidates the cached window.
+// dropCache invalidates the cached window. Callers hold the lock.
 func (ra *readAhead) dropCache() {
 	ra.cache = nil
 	ra.cacheOff = 0
 	ra.prefetched = 0
+	ra.token++
 }
 
 // invalidate drops cache AND sequence state: any mutation (write,
@@ -155,6 +178,8 @@ func (ra *readAhead) invalidate() {
 	if ra == nil {
 		return
 	}
+	ra.mu.Lock()
+	defer ra.mu.Unlock()
 	ra.dropCache()
 	ra.seqOff = -1
 	ra.seqSize = 0

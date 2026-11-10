@@ -19,11 +19,11 @@ import (
 // ---------------------------------------------------------------------------
 
 type memBackend struct {
-	mu        sync.Mutex
-	data      []byte
-	flushes   int
-	trims     [][3]int64 // {off, length, punchHole?1:0}
-	zeros     [][3]int64
+	mu      sync.Mutex
+	data    []byte
+	flushes int
+	trims   [][3]int64 // {off, length, punchHole?1:0}
+	zeros   [][3]int64
 }
 
 func newMemBackend(size uint64) *memBackend {
@@ -134,16 +134,18 @@ func (g *guestMem) close() {
 
 func (g *guestMem) fd() int { return int(g.file.Fd()) }
 
-func (g *guestMem) put(off uint64, b []byte)          { copy(g.mem[off:], b) }
-func (g *guestMem) get(off uint64, n int) []byte      { return append([]byte(nil), g.mem[off:off+uint64(n)]...) }
-func (g *guestMem) u16(off uint64) uint16             { return binary.LittleEndian.Uint16(g.mem[off:]) }
-func (g *guestMem) putU16(off uint64, v uint16)       { binary.LittleEndian.PutUint16(g.mem[off:], v) }
-func (g *guestMem) u32(off uint64) uint32             { return binary.LittleEndian.Uint32(g.mem[off:]) }
-func (g *guestMem) putU32(off uint64, v uint32)       { binary.LittleEndian.PutUint32(g.mem[off:], v) }
-func (g *guestMem) u64(off uint64) uint64             { return binary.LittleEndian.Uint64(g.mem[off:]) }
-func (g *guestMem) putU64(off uint64, v uint64)       { binary.LittleEndian.PutUint64(g.mem[off:], v) }
-func (g *guestMem) u8(off uint64) uint8           { return g.mem[off] }
-func (g *guestMem) putU8(off uint64, v uint8)     { g.mem[off] = v }
+func (g *guestMem) put(off uint64, b []byte) { copy(g.mem[off:], b) }
+func (g *guestMem) get(off uint64, n int) []byte {
+	return append([]byte(nil), g.mem[off:off+uint64(n)]...)
+}
+func (g *guestMem) u16(off uint64) uint16       { return binary.LittleEndian.Uint16(g.mem[off:]) }
+func (g *guestMem) putU16(off uint64, v uint16) { binary.LittleEndian.PutUint16(g.mem[off:], v) }
+func (g *guestMem) u32(off uint64) uint32       { return binary.LittleEndian.Uint32(g.mem[off:]) }
+func (g *guestMem) putU32(off uint64, v uint32) { binary.LittleEndian.PutUint32(g.mem[off:], v) }
+func (g *guestMem) u64(off uint64) uint64       { return binary.LittleEndian.Uint64(g.mem[off:]) }
+func (g *guestMem) putU64(off uint64, v uint64) { binary.LittleEndian.PutUint64(g.mem[off:], v) }
+func (g *guestMem) u8(off uint64) uint8         { return g.mem[off] }
+func (g *guestMem) putU8(off uint64, v uint8)   { g.mem[off] = v }
 
 // ---------------------------------------------------------------------------
 // Fake QEMU: the vhost-user control channel plus split-ring plumbing.
@@ -153,6 +155,16 @@ const (
 	// descriptor flags (VRING_DESC_F_*)
 	descNext  = 1 << 0
 	descWrite = 1 << 1
+)
+
+// virtio-blk request types (virtio_blk_req.type)
+const (
+	blkIn      = vduse.ReqIn
+	blkOut     = vduse.ReqOut
+	blkFlush   = vduse.ReqFlush
+	blkGetID   = vduse.ReqGetID
+	blkDiscard = vduse.ReqDiscard
+	blkZeroOut = vduse.ReqZeroOut
 )
 
 type vq struct {
@@ -272,19 +284,20 @@ func (q *fakeQEMU) handshake() uint64 {
 		q.t.Fatalf("device features %#x: F_PROTOCOL_FEATURES (bit 30) missing", devFeat)
 	}
 	protoFeat := q.qget(ReqGetProtocolFeatures, nil)
-	want := uint64(protoFMQ|protoFReplyAck|protoFConfig|protoFResetDevice)
+	want := uint64(1<<protoFMQ | 1<<protoFReplyAck | 1<<protoFConfig | 1<<protoFResetDevice)
 	if protoFeat&want != want {
 		q.t.Fatalf("protocol features %#x, want at least %#x", protoFeat, want)
 	}
 	q.qfire(ReqSetProtocolFeatures, u64bytes(protoFeat&want), nil)
 	q.qcall(ReqSetFeatures, u64bytes(devFeat))
 	q.qfire(ReqSetOwner, nil, nil) // SET_OWNER: no reply in QEMU
-	// One region: all guest RAM mapped at GPA 0.
+	// One region: all guest RAM mapped at GPA 0. QEMU's struct is
+	// {u32 nregions; u32 padding; regions[32]} — 40 bytes for one.
 	reg := make([]byte, 32)
 	binary.LittleEndian.PutUint64(reg[0:], 0)
 	binary.LittleEndian.PutUint64(reg[8:], guestSize)
 	binary.LittleEndian.PutUint64(reg[16:], 0x7f0000000000)
-	body := append(u32bytes(1), reg...)
+	body := append(append(u32bytes(1), 0, 0, 0, 0), reg...)
 	q.qfire(ReqSetMemTable, body, []int{q.gm.fd()})
 	return devFeat
 }
@@ -315,11 +328,14 @@ func (q *fakeQEMU) setupQueue(idx int, size uint16) *vq {
 	base := uint64(idx) * (1 << 19)
 	v := &vq{
 		q: q, idx: idx, size: size,
-		desc:  base,
-		avail: base + uint64(size)*16 + 64,
-		used:  base + uint64(size)*16 + 64 + 6 + 2*uint64(size) + 64,
+		desc:       base,
+		avail:      base + uint64(size)*16 + 64,
+		used:       base + uint64(size)*16 + 64 + 6 + 2*uint64(size) + 64,
 		statusAddr: map[uint16]uint64{},
 	}
+	// A fresh guest boots with zeroed ring memory; a reconnecting fake
+	// QEMU reuses the mapping, so clear desc..used tail explicitly.
+	q.gm.put(base, make([]byte, v.used+8+2*uint64(size)-base))
 	q.qcall(ReqSetVringNum, stateBytes(idx, uint32(size)))
 	addr := make([]byte, 40) // vhost_vring_addr {idx, flags, desc, used, avail, log}
 	binary.LittleEndian.PutUint32(addr[0:], uint32(idx))
@@ -334,7 +350,7 @@ func (q *fakeQEMU) setupQueue(idx int, size uint16) *vq {
 	if err != nil {
 		q.t.Fatal(err)
 	}
-	q.qfire(ReqSetVringKick, stateBytes(idx, uint32(idx)<<8), []int{int(kickR.Fd())})
+	q.qfire(ReqSetVringKick, stateBytes(idx, 0), []int{int(kickR.Fd())})
 	_ = kickR.Close() // SendMsgUnix dups the fd; our copy is no longer needed
 	// CALL: backend writes the eventfd, QEMU (us) reads it. Send the
 	// write end; keep the read end.
@@ -342,7 +358,7 @@ func (q *fakeQEMU) setupQueue(idx int, size uint16) *vq {
 	if err != nil {
 		q.t.Fatal(err)
 	}
-	q.qfire(ReqSetVringCall, stateBytes(idx, uint32(idx)<<8), []int{int(callW.Fd())})
+	q.qfire(ReqSetVringCall, stateBytes(idx, 0), []int{int(callW.Fd())})
 	_ = callW.Close()
 	v.kickW, v.callR = kickW, callR
 	q.t.Cleanup(func() { _ = kickW.Close(); _ = callR.Close() })
@@ -379,8 +395,11 @@ func (v *vq) publish(heads ...uint16) {
 	}
 }
 
+// usedEnt is one completed used-ring entry.
+type usedEnt struct{ ID, Len uint32 }
+
 // awaitUsed waits for used.idx to reach want completions past usedSeen.
-func (v *vq) awaitUsed(want int) []vduse.UsedElem {
+func (v *vq) awaitUsed(want int) []usedEnt {
 	v.q.t.Helper()
 	deadline := time.Now().Add(5 * time.Second)
 	for {
@@ -393,11 +412,11 @@ func (v *vq) awaitUsed(want int) []vduse.UsedElem {
 		}
 		time.Sleep(time.Millisecond)
 	}
-	out := make([]vduse.UsedElem, 0, want)
+	out := make([]usedEnt, 0, want)
 	for i := 0; i < want; i++ {
 		slot := (v.usedSeen + uint16(i)) % v.size
 		p := v.used + 4 + 8*uint64(slot)
-		out = append(out, vduse.UsedElem{ID: v.q.gm.u32(p), Len: v.q.gm.u32(p + 4)})
+		out = append(out, usedEnt{ID: v.q.gm.u32(p), Len: v.q.gm.u32(p + 4)})
 	}
 	v.usedSeen += uint16(want)
 	v.q.gm.putU16(v.used+2, v.usedSeen) // driver consumes (device re-reads it for the wrap test)
@@ -437,7 +456,7 @@ func (v *vq) chain(head uint16, reqType uint32, sector uint64, hdrAddr, dataAddr
 	v.q.gm.putU8(statusAddr, 0xff)
 	v.statusAddr[head] = statusAddr
 	v.putDesc(head+0, hdrAddr, 16, descNext, head+1)
-	v.putDesc(head+1, dataAddr, dataLen, descFlagOf(dataWrite), head+2)
+	v.putDesc(head+1, dataAddr, dataLen, descFlagOf(dataWrite)|descNext, head+2)
 	v.putDesc(head+2, statusAddr, 1, descWrite, 0)
 }
 
@@ -479,9 +498,6 @@ func TestHandshake(t *testing.T) {
 	if cap := binary.LittleEndian.Uint64(body[12:]); cap != (1<<20)/512 {
 		t.Fatalf("config capacity = %d, want %d", cap, (1<<20)/512)
 	}
-	// SET_CONFIG with nonzero size must be refused (read-only config).
-	q.request(ReqGetConfig, flagNeedReply, req, nil) // placeholder to keep framing: replaced below
-	t.Cleanup(func() {})
 }
 
 func TestSetConfigRefused(t *testing.T) {
@@ -556,7 +572,11 @@ func TestWriteReadRoundtrip(t *testing.T) {
 	}
 
 	// FLUSH and GET_ID.
+	// A real QEMU FLUSH chain is header+status with NO data segment:
+	// the chain helper wires three descriptors, so skip the middle one
+	// by ending the header descriptor's chain at the status slot.
 	v.chain(2, blkFlush, 0, hdrA, dataA, 0, false)
+	v.putDesc(2, hdrA, 16, descNext, 4) // head 2 -> skip slot 3, status at 4
 	v.publish(2)
 	used = v.awaitUsed(1)
 	v.awaitIRQ()
@@ -657,6 +677,7 @@ func TestReadOnlyRefusesWrites(t *testing.T) {
 func TestUnsupportedWhenDisabled(t *testing.T) {
 	b := newMemBackend(1 << 20)
 	q := startQEMU(t, b, 1<<20, Options{}) // Trim/WriteZeroes off
+	q.handshake()
 	v := q.setupQueue(0, 64)
 	const hdrA, dataA = 0x1000, 0x2000
 	seg := make([]byte, 16)
@@ -686,9 +707,10 @@ func TestVringBaseResume(t *testing.T) {
 	if want := getVringBaseReply(0, v.availIdx); base != want {
 		t.Fatalf("GET_VRING_BASE = %#x, want %#x", base, want)
 	}
-	// QEMU save/restore: new ADDR + BASE(avail) + ENABLE(1) on the
-	// SAME fds; a second request must complete.
+	// QEMU save/restore: BASE(avail) + ENABLE(1) on the SAME fds;
+	// a second request must complete.
 	q.qcall(ReqSetVringBase, stateBytes(0, uint32(v.availIdx)))
+	q.qcall(ReqSetVringEnable, stateBytes(0, 1))
 	v.chain(1, blkOut, 9, hdrA, dataA, 512, false)
 	v.publish(1)
 	v.awaitUsed(1)
@@ -782,8 +804,8 @@ func TestMultipleQueues(t *testing.T) {
 	// sector 1. Both must land.
 	q.gm.put(dataA, bytesVal(0xaa, 512))
 	v0.chain(0, blkOut, 0, hdrA, dataA, 512, false)
-	q.gm.put(dataA, bytesVal(0xbb, 512))
-	v1.chain(0, blkOut, 1, hdrA+1024, dataA, 512, false)
+	q.gm.put(dataA+2048, bytesVal(0xbb, 512))
+	v1.chain(0, blkOut, 1, hdrA+1024, dataA+2048, 512, false)
 	v0.publish(0)
 	v1.publish(0)
 	v0.awaitUsed(1)

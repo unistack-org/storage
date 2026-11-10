@@ -38,7 +38,7 @@ func TestExecInWritesGuestData(t *testing.T) {
 		DataSegs:  []Seg{{Addr: 0x2000, Len: 512, Write: true}},
 		StatusSeg: Seg{Addr: 0x3000, Len: 1, Write: true},
 	}
-	status, n := d.exec(br, BlkReqHeader{Type: ReqIn, Sector: 2})
+	status, n := d.exec(&queueState{}, br, BlkReqHeader{Type: ReqIn, Sector: 2})
 	if status != StatusOK || n != 512 {
 		t.Fatalf("exec IN: status=%d n=%d, want OK/512", status, n)
 	}
@@ -65,7 +65,7 @@ func TestExecOutReadsDriverData(t *testing.T) {
 		DataSegs:  []Seg{{Addr: 0x2000, Len: 512, Write: false}},
 		StatusSeg: Seg{Addr: 0x3000, Len: 1, Write: true},
 	}
-	status, _ := d.exec(br, BlkReqHeader{Type: ReqOut, Sector: 1})
+	status, _ := d.exec(&queueState{}, br, BlkReqHeader{Type: ReqOut, Sector: 1})
 	if status != StatusOK {
 		t.Fatalf("exec OUT: status=%d, want OK", status)
 	}
@@ -114,7 +114,7 @@ func TestExecCoalescesSegments(t *testing.T) {
 		DataSegs:  segs,
 		StatusSeg: Seg{Addr: 0x3000, Len: 1, Write: true},
 	}
-	status, _ := d.exec(br, BlkReqHeader{Type: ReqOut, Sector: 8})
+	status, _ := d.exec(&queueState{}, br, BlkReqHeader{Type: ReqOut, Sector: 8})
 	if status != StatusOK {
 		t.Fatalf("exec OUT: status=%d", status)
 	}
@@ -132,7 +132,7 @@ func TestExecCoalescesSegments(t *testing.T) {
 	for i := range segs {
 		segs[i].Write = true
 	}
-	status, n := d.exec(br, BlkReqHeader{Type: ReqIn, Sector: 8})
+	status, n := d.exec(&queueState{}, br, BlkReqHeader{Type: ReqIn, Sector: 8})
 	if status != StatusOK || n != uint32(len(payload)) {
 		t.Fatalf("exec IN: status=%d n=%d", status, n)
 	}
@@ -158,7 +158,7 @@ func TestExecPastVolumeEnd(t *testing.T) {
 		DataSegs:  []Seg{{Addr: 0x2000, Len: 4096}, {Addr: 0x3000, Len: 4096}},
 		StatusSeg: Seg{Addr: 0x4000, Len: 1, Write: true},
 	}
-	status, _ := d.exec(br, BlkReqHeader{Type: ReqOut, Sector: 1})
+	status, _ := d.exec(&queueState{}, br, BlkReqHeader{Type: ReqOut, Sector: 1})
 	if status != StatusIOErr {
 		t.Fatalf("status=%d, want IOErr", status)
 	}
@@ -186,7 +186,7 @@ func TestExecReadOnlyRefusesWrites(t *testing.T) {
 		if typ != ReqOut { // discard/zeroout segs are driver-owned too
 			br.DataSegs[0].Write = false
 		}
-		if st, _ := d.exec(br, BlkReqHeader{Type: typ, Sector: 1}); st != StatusIOErr {
+		if st, _ := d.exec(&queueState{}, br, BlkReqHeader{Type: typ, Sector: 1}); st != StatusIOErr {
 			t.Fatalf("RO exec type %d: status=%d, want IOErr", typ, st)
 		}
 	}
@@ -201,7 +201,7 @@ func TestExecReadOnlyRefusesWrites(t *testing.T) {
 		DataSegs:  []Seg{{Addr: 0x2000, Len: 512, Write: true}},
 		StatusSeg: Seg{Addr: 0x3000, Len: 1, Write: true},
 	}
-	if st, n := d.exec(br, BlkReqHeader{Type: ReqIn, Sector: 0}); st != StatusOK || n != 512 {
+	if st, n := d.exec(&queueState{}, br, BlkReqHeader{Type: ReqIn, Sector: 0}); st != StatusOK || n != 512 {
 		t.Fatalf("RO exec IN: status=%d n=%d, want OK/512", st, n)
 	}
 }

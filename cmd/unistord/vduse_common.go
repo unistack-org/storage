@@ -20,6 +20,10 @@ type vduseDeviceInfo struct {
 type vduseFlags struct {
 	Trim        bool
 	WriteZeroes bool
+	ReadAhead   bool
+	// ReadAheadWindow bounds the per-queue prefetch window in bytes;
+	// 0 selects the package default (256 KiB).
+	ReadAheadWindow int
 }
 
 // parseVDUSESpec splits "export" / "export=devname".

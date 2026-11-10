@@ -280,15 +280,27 @@ func (d *device) handle(c *Conn, h Header, body []byte, fds []int) error {
 		if err != nil {
 			return err
 		}
-		return d.setVringNum(idx, num)
+		if err := d.setVringNum(idx, num); err != nil {
+			return err
+		}
+		// QEMU reads a reply for NUM/ADDR/BASE (vhost_user_exchange:
+		// the ack under REPLY_ACK, the payload reply for GET_VRING_BASE
+		// only differs in content).
+		return ack()
 	case ReqSetVringAddr:
-		return d.setVringAddr(body)
+		if err := d.setVringAddr(body); err != nil {
+			return err
+		}
+		return ack()
 	case ReqSetVringBase:
 		idx, avail, err := vringState(body)
 		if err != nil {
 			return err
 		}
-		return d.setVringBase(idx, uint16(avail))
+		if err := d.setVringBase(idx, uint16(avail)); err != nil {
+			return err
+		}
+		return ack()
 	case ReqGetVringBase, ReqGetVringBaseSkipDrain:
 		// QEMU sends SKIP_DRAIN (45) on teardown; draining is our
 		// documented behaviour and is always safe (workers finish
@@ -441,7 +453,7 @@ func (d *device) queueAt(idx int) (*queue, error) {
 	}
 	q := d.queues[idx]
 	if q == nil {
-		q = &queue{idx: idx, num: vqMaxSize, d: d}
+		q = &queue{idx: idx, num: vqMaxSize, d: d, kickFD: -1}
 		d.queues[idx] = q
 	}
 	return q, nil
@@ -494,6 +506,7 @@ func (d *device) setVringAddr(body []byte) error {
 		availIdx, usedIdx = q.base, q.lastUsed
 	}
 	q.ring = vduse.NewSplitRing(d.gm, q.num, desc, avail, used)
+	q.gm = d.gm
 	q.ring.SetState(availIdx, usedIdx)
 	return nil
 }
@@ -544,6 +557,14 @@ func (d *device) setVringFD(body []byte, fds []int, isKick bool) error {
 	}
 	var f *os.File
 	if !noFD && len(fds) > 0 {
+		// SCM_RIGHTS dups arrive in blocking mode, and os.NewFile only
+		// registers a descriptor with the Go poller when it is already
+		// O_NONBLOCK: without this, a blocking kick read can never be
+		// interrupted by stop()'s read deadline and queue teardown
+		// hangs forever. (eventfd semantics are unaffected.)
+		if _, err := unix.FcntlInt(uintptr(fds[0]), unix.F_SETFL, unix.O_NONBLOCK); err != nil {
+			return fmt.Errorf("vub: SET_VRING_FD: O_NONBLOCK: %w", err)
+		}
 		f = fdOwner(fds[0])
 		fds[0] = -1 // consumed
 		for i := 1; i < len(fds); i++ {
@@ -591,12 +612,17 @@ func (d *device) setVringFD(body []byte, fds []int, isKick bool) error {
 			_ = q.kick.Close()
 		}
 		q.kick = f
-		// Nonblocking + Go netpoll: the dispatcher's read must be
-		// cancellable by Close (QEMU creates eventfds blocking).
+		q.kickFD = int32(f.Fd())
+		// The dispatcher polls the raw fd (unix.Poll + nonblocking
+		// read): SCM_RIGHTS fds are not registered with Go's netpoll
+		// on macOS, so a parked os.File read cannot be woken by a
+		// deadline there, and poll(2)+timeout is portable to Linux
+		// eventfds as well.
 		if err := unix.SetNonblock(int(f.Fd()), true); err != nil {
-			_ = q.kick.Close()
+			_ = f.Close()
 			q.kick = nil
-			return fmt.Errorf("vub: kick fd nonblock: %w", err)
+			q.kickFD = -1
+			return fmt.Errorf("vub: SET_VRING_KICK %d: %w", idx, err)
 		}
 	} else {
 		if q.call != nil {
@@ -630,7 +656,7 @@ func (d *device) exec(br *vduse.BlkReq, hdr vduse.BlkReqHeader) (uint8, uint32) 
 				return vduse.StatusIOErr, 0
 			}
 		}
-		n, st := d.execIO(br.DataSegs, false, off)
+		n, st := d.execIO(br.DataSegs, true, off)
 		return st, uint32(n)
 	case vduse.ReqOut:
 		for _, sg := range br.DataSegs {
@@ -638,7 +664,7 @@ func (d *device) exec(br *vduse.BlkReq, hdr vduse.BlkReqHeader) (uint8, uint32) 
 				return vduse.StatusIOErr, 0
 			}
 		}
-		_, st := d.execIO(br.DataSegs, true, off)
+		_, st := d.execIO(br.DataSegs, false, off)
 		return st, 0
 	case vduse.ReqFlush:
 		if d.b != nil {
@@ -772,6 +798,14 @@ func (d *device) reset() {
 			d.queues[i] = nil
 		}
 	}
+	d.mu.Unlock()
+	// Drain the queues BEFORE dropping the memory table: workers may
+	// still be executing requests against those mappings.
+	for _, q := range queues {
+		q.stop()
+		q.closeFDs()
+	}
+	d.mu.Lock()
 	old := d.mem
 	oldFds := d.regionFds
 	d.mem = nil
@@ -781,10 +815,6 @@ func (d *device) reset() {
 	d.negotiated = 0
 	d.protoNegot = 0
 	d.mu.Unlock()
-	for _, q := range queues {
-		q.stop()
-		q.closeFDs()
-	}
 	for _, f := range oldFds {
 		_ = f.Close()
 	}
