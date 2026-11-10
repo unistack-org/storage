@@ -116,10 +116,12 @@ jobs:
             *)
               echo "unhandled event/ref: $EVENT_NAME $GITHUB_REF"; exit 1 ;;
           esac
-          echo "channel=$CHANNEL" >>"$GITHUB_OUTPUT"
-          echo "version=$VERSION" >>"$GITHUB_OUTPUT"
-          echo "tag=$TAG" >>"$GITHUB_OUTPUT"
-          echo "prerelease=$PRERELEASE" >>"$GITHUB_OUTPUT"
+          {
+            echo "channel=$CHANNEL"
+            echo "version=$VERSION"
+            echo "tag=$TAG"
+            echo "prerelease=$PRERELEASE"
+          } >>"$GITHUB_OUTPUT"
           echo "channel=$CHANNEL version=$VERSION tag=$TAG prerelease=$PRERELEASE"
 
   build:
@@ -202,15 +204,15 @@ jobs:
           - runner: ubuntu-24.04-arm
     container:
       image: alpine:3.21
-    defaults:
-      run:
-        shell: bash
+    # В alpine:3.21 нет bash "из коробки" (он ставится первым шагом),
+    # поэтому шаги пишутся на POSIX sh (дефолтная оболочка container job).
     steps:
       - uses: actions/checkout@v4
 
       - name: Prepare toolchain
         run: |
-          set -euo pipefail
+          set -eu
+          apk update
           apk add --no-cache abuild sudo bash
           adduser -D builder
           addgroup builder abuild
@@ -228,15 +230,25 @@ jobs:
         run: chown -R builder:builder sds-nbd/dist
 
       - name: Build apk
-        user: builder
         env:
           VERSION: ${{ needs.meta.outputs.version }}
           APK_DIR: ${{ github.workspace }}/apkout
-          HOME: /home/builder
         run: |
-          set -euo pipefail
-          abuild-keygen -a -i -n
-          bash sds-nbd/scripts/package.sh
+          set -eu
+          # abuild отказывается работать под root: собираем под builder.
+          # sudo сбрасывает окружение, поэтому переменные передаём явно.
+          sudo -u builder -H env \
+            HOME=/home/builder \
+            VERSION="$VERSION" \
+            APK_DIR="$APK_DIR" \
+            WORKDIR="$GITHUB_WORKSPACE" \
+            bash -c '
+              set -euo pipefail
+              cd "$WORKDIR"
+              abuild-keygen -a -i -n
+              bash sds-nbd/scripts/package.sh
+            '
+          chown -R "$(id -u):$(id -g)" "$APK_DIR" || true
 
       - name: Upload apk
         uses: actions/upload-artifact@v4
@@ -275,6 +287,7 @@ jobs:
       - name: Ensure tag exists
         env:
           TAG: ${{ needs.meta.outputs.tag }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
           if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
@@ -285,15 +298,14 @@ jobs:
           git tag -a "$TAG" -m "release $TAG [skip ci]"
           # Push через GITHUB_TOKEN: не триггерит повторный прогон workflow.
           git push "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "refs/tags/$TAG"
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Finalize SHA256SUMS over all assets
         working-directory: sds-nbd/dist
         run: |
           set -euo pipefail
           rm -f SHA256SUMS
-          sha256sum $(ls | grep -v '^SHA256SUMS$' | grep -v '^release-notes.md$') >SHA256SUMS
+          find . -maxdepth 1 -type f ! -name SHA256SUMS ! -name release-notes.md -printf '%P\0' \
+            | sort -z | xargs -0 sha256sum >SHA256SUMS
           cat SHA256SUMS
 
       - name: Publish GitHub Release
@@ -306,14 +318,13 @@ jobs:
         run: |
           set -euo pipefail
           cd sds-nbd
-          ARGS=(--title "$TAG" --notes-file dist/release-notes.md)
-          [ "$PRERELEASE" = "true" ] && ARGS+=(--prerelease)
+          EXTRA=()
+          [ "$PRERELEASE" = "true" ] && EXTRA+=(--prerelease)
           if gh release view "$TAG" >/dev/null 2>&1; then
-            gh release edit "$TAG" --notes-file dist/release-notes.md \
-              $( [ "$PRERELEASE" = "true" ] && echo --prerelease )
+            gh release edit "$TAG" --notes-file dist/release-notes.md "${EXTRA[@]}"
             gh release upload "$TAG" dist/* --clobber
           else
-            gh release create "$TAG" dist/* "${ARGS[@]}"
+            gh release create "$TAG" dist/* --title "$TAG" --notes-file dist/release-notes.md "${EXTRA[@]}"
           fi
           gh release view "$TAG" --json tagName,prerelease,assets \
             --jq '{tag:.tagName, prerelease:.prerelease, assets:[.assets[].name]}'
