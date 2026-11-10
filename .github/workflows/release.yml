@@ -9,15 +9,15 @@ name: release
 #   v2026.02.12.01-stable  -> stable   (голый тег = stable)
 #   v2026.02.12.01-testing -> testing
 #   v2026.02.12.01-rc.1    -> testing, prerelease
-#   v2026.02.12.01-dev     -> develop, prerelease
-#   push в master          -> develop (автотег vYYYY.MM.DD.NN-dev), prerelease
+#   v2026.02.12.01-dev|-devel|-develop -> develop, prerelease
 #
-# Формат версии в бинарях/пакетах: YYYYmmddNN (NN из тега, для develop —
-# счётчик тегов этого дня + 1).
+# Релизы делаются ТОЛЬКО по тегу (или вручную через workflow_dispatch);
+# обычный push в master релиз не публикует.
+#
+# Формат версии в бинарях/пакетах: YYYYmmddNN (NN — 4-я часть тега).
 
 on:
   push:
-    branches: [master]
     tags: ["v*"]
   workflow_dispatch:
     inputs:
@@ -86,11 +86,11 @@ jobs:
               BASE="${T%%-*}"
               SUFFIX="${T#*-}"; [ "$SUFFIX" = "$T" ] && SUFFIX=""
               case "$SUFFIX" in
-                testing)      CHANNEL=testing ;;
-                stable)       CHANNEL=stable ;;
-                dev|develop)  CHANNEL=develop ;;
-                rc.*)         CHANNEL=testing ;;
-                "")           CHANNEL=stable ;;
+                testing)           CHANNEL=testing ;;
+                stable)            CHANNEL=stable ;;
+                dev|devel|develop) CHANNEL=develop ;;
+                rc.*)              CHANNEL=testing ;;
+                "")                CHANNEL=stable ;;
                 *) echo "unknown tag suffix: $SUFFIX"; exit 1 ;;
               esac
               Y="$(cut -d. -f1 <<<"$BASE")"
@@ -100,18 +100,9 @@ jobs:
               NN="$(printf %02d "$NN")"
               VERSION="${Y}${M}${D}${NN}"
               case "$SUFFIX" in
-                dev|develop|rc.*) PRERELEASE=true ;;
+                dev|devel|develop|rc.*) PRERELEASE=true ;;
                 *) PRERELEASE=false ;;
               esac
-              ;;
-            push:refs/heads/master)
-              CHANNEL=develop
-              PRERELEASE=true
-              Y="$(date -u +%Y)"; M="$(date -u +%m)"; D="$(date -u +%d)"
-              NN="$(( $(git tag -l "v${Y}.${M}.${D}.*" | wc -l) + 1 ))"
-              NN="$(printf %02d "$NN")"
-              VERSION="${Y}${M}${D}${NN}"
-              TAG="v${Y}.${M}.${D}.${NN}-dev"
               ;;
             *)
               echo "unhandled event/ref: $EVENT_NAME $GITHUB_REF"; exit 1 ;;
