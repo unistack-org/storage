@@ -162,7 +162,6 @@ func main() {
 	writeZeroes := flag.Bool("write-zeroes", true, "advertise and handle WRITE_ZEROES")
 	vduseReadAhead := flag.Bool("vduse-readahead", true, "with -vduse: prefetch a window on sequential guest read runs (ideas §3.8); disable to force one backend read per request")
 	vduseReadAheadWindow := flag.Int("vduse-readahead-window", 0, "with -vduse-readahead: prefetch window bytes per queue (default 262144 = 256 KiB)")
-	vduseQueues := flag.Int("vduse-queues", 1, "with -vduse: virtqueues per device (VIRTIO_BLK_F_MQ multi-queue); 1 = single queue (default)")
 	storeMode := flag.Bool("store", false, "treat export paths as object-store directories (phase-1 data path) instead of sparse files")
 	direct := flag.Bool("direct", false, "with -store: request O_DIRECT on object files")
 	prealloc := flag.Bool("preallocate", false, "with -store: fallocate each new object to full size")
@@ -420,7 +419,7 @@ func main() {
 			}()
 		}
 		if *httpAddr != "" || len(vduseSpecs) > 0 {
-			vdm = newVDUSEManager(logger, vduseFlags{Trim: *trim, WriteZeroes: *writeZeroes, ReadAhead: *vduseReadAhead, ReadAheadWindow: *vduseReadAheadWindow, Queues: *vduseQueues})
+			vdm = newVDUSEManager(logger, vduseFlags{Trim: *trim, WriteZeroes: *writeZeroes, ReadAhead: *vduseReadAhead, ReadAheadWindow: *vduseReadAheadWindow})
 		}
 		if *httpAddr != "" || len(vubSpecs) > 0 {
 			vubm = newVUBManager(logger, vubFlags{Trim: *trim, WriteZeroes: *writeZeroes, Queues: *vubQueues, Workers: *vubWorkers})
@@ -573,7 +572,7 @@ func main() {
 	}
 
 	if len(vduseSpecs) > 0 {
-		if _, err := startVDUSE(ctx, logger, es, vduseSpecs, *trim, *writeZeroes, *vduseReadAhead, *vduseReadAheadWindow, *vduseQueues); err != nil {
+		if _, err := startVDUSE(ctx, logger, es, vduseSpecs, *trim, *writeZeroes, *vduseReadAhead, *vduseReadAheadWindow); err != nil {
 			logger.Fatalf("vduse: %v", err)
 		}
 	}
