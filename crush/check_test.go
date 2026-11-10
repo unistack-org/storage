@@ -1,4 +1,4 @@
-package crushmap
+package crush
 
 import (
 	"strings"
@@ -6,8 +6,8 @@ import (
 )
 
 // goodMap — мини-карта: 2 хоста, ssd+spool на каждом, правила ssd/hdd.
-func goodMap() *Map {
-	m := NewMap()
+func goodMap() *Wrapper {
+	m := NewWrapper()
 	m.Types = []*Type{{ID: 0, Name: "device"}, {ID: 1, Name: "host"}, {ID: 2, Name: "root"}}
 	m.Devices = []*Device{
 		{ID: 0, Name: "osd0", Class: "ssd"},
@@ -15,7 +15,7 @@ func goodMap() *Map {
 		{ID: 2, Name: "osd2", Class: "hdd"},
 		{ID: 3, Name: "osd3", Class: "hdd"},
 	}
-	m.Buckets = []*Bucket{
+	m.Buckets = []*BucketDecl{
 		{Name: "cn01", TypeID: 1, TypeName: "host", ID: -1, Alg: "straw2", Hash: "rjenkins1",
 			Items: []*Item{{ID: 0, Name: "osd0", Weight: 1, Pos: 0}, {ID: 2, Name: "osd2", Weight: 1, Pos: 1}}},
 		{Name: "cn02", TypeID: 1, TypeName: "host", ID: -2, Alg: "straw2", Hash: "rjenkins1",
@@ -23,13 +23,13 @@ func goodMap() *Map {
 		{Name: "root", TypeID: 2, TypeName: "root", ID: -3, Alg: "straw2", Hash: "rjenkins1",
 			Items: []*Item{{ID: -1, Name: "cn01", Weight: 2, Pos: 0}, {ID: -2, Name: "cn02", Weight: 2, Pos: 1}}},
 	}
-	m.Rules = []*Rule{
-		{Name: "rule-data-ssd", ID: 1, Type: 1, MinSize: 2, MaxSize: 3, Steps: []*Step{
+	m.Rules = []*RuleDecl{
+		{Name: "rule-data-ssd", ID: 1, Type: 1, MinSize: 2, MaxSize: 3, Steps: []*StepDecl{
 			{Op: "take", Item: -3, ItemName: "root", ItemClass: "ssd"},
 			{Op: "chooseleaf_firstn", Num: 0, ItemType: "host"},
 			{Op: "emit"},
 		}},
-		{Name: "rule-data-hdd", ID: 2, Type: 1, MinSize: 2, MaxSize: 2, Steps: []*Step{
+		{Name: "rule-data-hdd", ID: 2, Type: 1, MinSize: 2, MaxSize: 2, Steps: []*StepDecl{
 			{Op: "take", Item: -3, ItemName: "root", ItemClass: "hdd"},
 			{Op: "chooseleaf_firstn", Num: 0, ItemType: "host"},
 			{Op: "emit"},

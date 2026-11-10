@@ -1,4 +1,4 @@
-package crushmap
+package crush
 
 import (
 	"io/ioutil"
@@ -11,7 +11,7 @@ func TestText(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	m := NewMap()
+	m := NewWrapper()
 	err = m.DecodeText(buf)
 	if err != nil {
 		t.Fatal(err)

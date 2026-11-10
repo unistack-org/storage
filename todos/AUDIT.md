@@ -76,15 +76,21 @@
 несовместимый с Ceph; движок расходился с Ceph по шагам выбора).
 Состояние после переработки:
 
-- `crush/` — port C-ядра Ceph: все 5 алгоритмов bucket, choose/chooseleaf,
-  tunables-профили, LN/jenkins — **byte-exact** (~6000 golden-векторов от
-  настоящего Ceph-кода, 100%);
-- `crushmap/` — парсеры: текст `*.crush`, JSON, **бинарный формат Ceph
-  CrushWrapper** (decode+encode, байт-стабильный encode, круговые
-  golden-тесты);
+- `crush/` — один пакет: port C-ядра Ceph (все 5 алгоритмов bucket,
+  choose/chooseleaf, tunables-профили, LN/jenkins — **byte-exact**, ~6000
+  golden-векторов от настоящего Ceph-кода, 100%) плюс формат карты:
+  текст `*.crush`, JSON и **бинарный формат Ceph CrushWrapper**
+  (decode+encode, байт-стабильный encode, круговые golden-тесты).
+  Точка входа — `crush.Decode` (авто-определение text/JSON/binary) и
+  `(*Wrapper).EncodeText/EncodeJson/EncodeBinary`;
+  **`crushmap/` слит в `crush/` 2026-11-10** (был отдельным пакетом;
+  AST-типы формата получили имена `Wrapper`/`BucketDecl`/`RuleDecl`/
+  `StepDecl`, чтобы не сталкиваться с движковыми `Map`/`Bucket`/`Rule`/`Step`);
 - GC: placement в mmap-арене, `DoRule` 225 OSD/straw2/rep3 = 34.5 мкс,
   **0 аллокаций** (`docs/GC_ARENA.md`);
-- legacy-формат crushkv удалён, двоичный кодек теперь только Ceph-совместимый.
+- legacy-формат crushkv удалён, двоичный кодек теперь только Ceph-совместимый
+  (при слиянии вырезаны мёртвые `Crushmap`/`CrushTree`/`CrushRule`/`CrushChild`,
+  AST-`Tunables`, дубль `Magic` и реплицированные tree-хелперы).
 
 ## MVP-экспорт в ВМ (фаза 4a) — готов
 

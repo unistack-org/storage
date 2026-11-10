@@ -1,4 +1,4 @@
-package crushmap
+package crush
 
 import (
 	"strings"
@@ -55,7 +55,7 @@ func TestDecodeTextMalformedInput(t *testing.T) {
 					}
 					close(done)
 				}()
-				m := NewMap()
+				m := NewWrapper()
 				err = m.DecodeText([]byte(tc.input))
 			}()
 			select {
@@ -72,7 +72,7 @@ func TestDecodeTextMalformedInput(t *testing.T) {
 
 // Comment as the last line without trailing newline must not hang.
 func TestDecodeTextCommentAtEOF(t *testing.T) {
-	m0 := NewMap()
+	m0 := NewWrapper()
 	err := m0.DecodeText([]byte("device 0 osd.0\ndevice 1 osd.1\n" +
 		"root root { id -1 alg straw2 hash 0 }\n# trailing comment"))
 	if err != nil {
@@ -82,7 +82,7 @@ func TestDecodeTextCommentAtEOF(t *testing.T) {
 
 // Device lines terminated at EOF (no trailing newline) must parse.
 func TestDecodeTextNoTrailingNewline(t *testing.T) {
-	m := NewMap()
+	m := NewWrapper()
 	err := m.DecodeText([]byte("# begin crush map\ntunable require_max_osd 32\n" +
 		"# types\ntype 0 osd\ntype 1 host\n" +
 		"# devices\ndevice 0 osd.0\ndevice 1 osd.1\n" +
@@ -102,7 +102,7 @@ func TestDecodeTextLongGarbageToken(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		m := NewMap()
+		m := NewWrapper()
 		if err := m.DecodeText([]byte(input)); err == nil {
 			t.Error("expected error for garbage bucket")
 		}
@@ -126,7 +126,7 @@ func TestDecodeTextOneLineMap(t *testing.T) {
 		"host h1 { id -1 alg straw2 hash 0 item osd.0 id 0 weight 1.000 item osd.1 id 1 weight 1.000 }\n" +
 		"root r { id -2 alg straw2 hash 0 item h1 id -1 weight 2.000 }\n" +
 		"rule data { id 0 type replicated min_size 1 max_size 10 step take r step chooseleaf firstn 0 type host step emit }\n"
-	m := NewMap()
+	m := NewWrapper()
 	if err := m.DecodeText([]byte(src)); err != nil {
 		t.Fatalf("DecodeText: %v", err)
 	}
@@ -164,7 +164,7 @@ func TestDecodeTextOneLineMap(t *testing.T) {
 // `id <n> class <c>` inside a bucket must keep both the id and the class.
 func TestDecodeTextBucketIDClass(t *testing.T) {
 	src := "type 0 osd\ntype 2 root\nroot r { id -2 class ssd alg straw2 hash 0 }\n"
-	m := NewMap()
+	m := NewWrapper()
 	if err := m.DecodeText([]byte(src)); err != nil {
 		t.Fatalf("DecodeText: %v", err)
 	}
@@ -190,11 +190,11 @@ func TestDecodeTextPositionalItem(t *testing.T) {
 		"\titem osd.2 weight 1.000\n\titem osd.3 weight 1.000\n}\n" +
 		"root r {\n\tid -2\n\talg straw2\n\thash 0\n" +
 		"\titem host h1\n\titem host h2\n}\n"
-	m := NewMap()
+	m := NewWrapper()
 	if err := m.DecodeText([]byte(src)); err != nil {
 		t.Fatalf("DecodeText: %v", err)
 	}
-	var root *Bucket
+	var root *BucketDecl
 	for _, b := range m.Buckets {
 		if b.ID == -2 {
 			root = b

@@ -1,4 +1,4 @@
-package crushmap
+package crush
 
 import (
 	"errors"
@@ -99,7 +99,7 @@ func topState(l *lex) stateFn {
 	}
 }
 
-func (cmap *Map) DecodeText(data []byte) error {
+func (cmap *Wrapper) DecodeText(data []byte) error {
 	mapItems := make(map[string]int32)
 	p := &textParser{l: lexNew(string(data), topState)}
 	p.l.lexStart()

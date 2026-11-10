@@ -1,4 +1,4 @@
-package crushmap
+package crush
 
 // Валидатор crush-карты: компилируемость + семантика объёмных классов (SSD/HDD).
 //
@@ -55,7 +55,7 @@ func (r *CheckResult) Sort() {
 
 // Check — структурная валидация карты: устройства, типы, бакеты, иерархия,
 // правила и их шаги.
-func (m *Map) Check() *CheckResult {
+func (m *Wrapper) Check() *CheckResult {
 	res := &CheckResult{}
 	m.checkDevices(res)
 	m.checkBuckets(res)
@@ -64,7 +64,7 @@ func (m *Map) Check() *CheckResult {
 	return res
 }
 
-func (m *Map) checkDevices(res *CheckResult) {
+func (m *Wrapper) checkDevices(res *CheckResult) {
 	byID := map[int32]string{}
 	byName := map[string]int32{}
 	for _, d := range m.Devices {
@@ -82,7 +82,7 @@ func (m *Map) checkDevices(res *CheckResult) {
 	}
 }
 
-func (m *Map) checkBuckets(res *CheckResult) {
+func (m *Wrapper) checkBuckets(res *CheckResult) {
 	typeRank := map[string]int{}
 	for i, t := range m.sortedTypes() {
 		typeRank[t.Name] = i
@@ -153,7 +153,7 @@ func (m *Map) checkBuckets(res *CheckResult) {
 	}
 }
 
-func (m *Map) checkRules(res *CheckResult) {
+func (m *Wrapper) checkRules(res *CheckResult) {
 	knownType := map[string]bool{}
 	for _, t := range m.Types {
 		knownType[t.Name] = true
@@ -263,7 +263,7 @@ func classSuffix(class string) string {
 //
 // Правила без фильтра класса считаются применимыми к любому классу и
 // получают предупреждение: изоляции класса нет.
-func (m *Map) CheckClass(class string) *CheckResult {
+func (m *Wrapper) CheckClass(class string) *CheckResult {
 	res := &CheckResult{}
 	res.Merge(m.checkClassWeights(class, nil))
 	res.Sort()
@@ -273,14 +273,14 @@ func (m *Map) CheckClass(class string) *CheckResult {
 // CheckWeights — валидатор перевеса: применяет веса (CRUSH-единицы:
 // 1.0 = вес 1.0, 0 = osd out) и отвечает, выживет ли размещение класса.
 // weights == nil эквивалентно CheckClass.
-func (m *Map) CheckWeights(class string, weights map[int32]float64) *CheckResult {
+func (m *Wrapper) CheckWeights(class string, weights map[int32]float64) *CheckResult {
 	res := &CheckResult{}
 	res.Merge(m.checkClassWeights(class, weights))
 	res.Sort()
 	return res
 }
 
-func (m *Map) checkClassWeights(class string, weights map[int32]float64) *CheckResult {
+func (m *Wrapper) checkClassWeights(class string, weights map[int32]float64) *CheckResult {
 	res := &CheckResult{}
 	alive := func(id int32) bool {
 		if weights == nil {
@@ -351,7 +351,7 @@ func (m *Map) checkClassWeights(class string, weights map[int32]float64) *CheckR
 
 // devicesForRule — устройства, до которых правило дотянется: под take-корнем,
 // нужного класса, живые по весам.
-func (m *Map) devicesForRule(cls, take string, alive func(int32) bool) []*Device {
+func (m *Wrapper) devicesForRule(cls, take string, alive func(int32) bool) []*Device {
 	set := map[int32]bool{}
 	if take != "" {
 		b := m.GetBucketByName(take)
@@ -382,15 +382,15 @@ func (m *Map) devicesForRule(cls, take string, alive func(int32) bool) []*Device
 
 // domainsForClass — число бакетов типа leafType (например host), под take
 // которым есть хотя бы одно живое устройство класса.
-func (m *Map) domainsForClass(take, leafType, cls string, alive func(int32) bool) int {
+func (m *Wrapper) domainsForClass(take, leafType, cls string, alive func(int32) bool) int {
 	root := m.GetBucketByName(take)
 	if root == nil {
 		return 0
 	}
 	count := 0
 	visited := map[int32]bool{}
-	var walk func(b *Bucket)
-	walk = func(b *Bucket) {
+	var walk func(b *BucketDecl)
+	walk = func(b *BucketDecl) {
 		if visited[b.ID] {
 			return
 		}
@@ -413,7 +413,7 @@ func (m *Map) domainsForClass(take, leafType, cls string, alive func(int32) bool
 	return count
 }
 
-func (m *Map) hasAliveDevice(b *Bucket, cls string, alive func(int32) bool) bool {
+func (m *Wrapper) hasAliveDevice(b *BucketDecl, cls string, alive func(int32) bool) bool {
 	for _, it := range b.Items {
 		if it.ID >= 0 {
 			if d, ok := m.DeviceByID(it.ID); ok && (cls == "" || d.Class == cls) && alive(it.ID) {
@@ -429,7 +429,7 @@ func (m *Map) hasAliveDevice(b *Bucket, cls string, alive func(int32) bool) bool
 }
 
 // ruleClass — фильтр класса правила (первый step с item_class).
-func ruleClass(ru *Rule) string {
+func ruleClass(ru *RuleDecl) string {
 	for _, st := range ru.Steps {
 		if st.ItemClass != "" {
 			return st.ItemClass
@@ -439,7 +439,7 @@ func ruleClass(ru *Rule) string {
 }
 
 // ruleTake — имя take-корня правила ("" — take по id/устройству либо нет take).
-func (m *Map) ruleTake(ru *Rule) string {
+func (m *Wrapper) ruleTake(ru *RuleDecl) string {
 	for _, st := range ru.Steps {
 		if st.Op == "take" {
 			if st.ItemName != "" {
@@ -455,7 +455,7 @@ func (m *Map) ruleTake(ru *Rule) string {
 }
 
 // ruleChooseLeaf — тип домена первой chooseleaf-ступени и её num.
-func ruleChooseLeaf(ru *Rule) (string, int) {
+func ruleChooseLeaf(ru *RuleDecl) (string, int) {
 	for _, st := range ru.Steps {
 		if st.Op == "chooseleaf_firstn" || st.Op == "chooseleaf_indep" {
 			return st.ItemType, int(st.Num)
@@ -465,7 +465,7 @@ func ruleChooseLeaf(ru *Rule) (string, int) {
 }
 
 // Classes — отсортированный список классов устройств карты (для CLI-подсказок).
-func (m *Map) Classes() []string {
+func (m *Wrapper) Classes() []string {
 	set := map[string]bool{}
 	for _, d := range m.Devices {
 		if d.Class != "" {
@@ -481,7 +481,7 @@ func (m *Map) Classes() []string {
 }
 
 // classExists — встречается ли класс хотя бы у одного устройства.
-func (m *Map) classExists(class string) bool {
+func (m *Wrapper) classExists(class string) bool {
 	for _, d := range m.Devices {
 		if d.Class == class {
 			return true
@@ -490,8 +490,8 @@ func (m *Map) classExists(class string) bool {
 	return false
 }
 
-// DeviceByID — устройство по id (в Map нет индекса, обход линейный).
-func (m *Map) DeviceByID(id int32) (*Device, bool) {
+// DeviceByID — устройство по id (в Wrapper нет индекса, обход линейный).
+func (m *Wrapper) DeviceByID(id int32) (*Device, bool) {
 	for _, d := range m.Devices {
 		if d.ID == id {
 			return d, true
@@ -500,7 +500,7 @@ func (m *Map) DeviceByID(id int32) (*Device, bool) {
 	return nil, false
 }
 
-func (m *Map) deviceByName(name string) (*Device, bool) {
+func (m *Wrapper) deviceByName(name string) (*Device, bool) {
 	for _, d := range m.Devices {
 		if d.Name == name {
 			return d, true
@@ -510,10 +510,10 @@ func (m *Map) deviceByName(name string) (*Device, bool) {
 }
 
 // collectDevices — рекурсивно собирает id устройств под бакетом.
-func (m *Map) collectDevices(b *Bucket, into map[int32]bool) {
+func (m *Wrapper) collectDevices(b *BucketDecl, into map[int32]bool) {
 	seen := map[int32]bool{}
-	var walk func(*Bucket)
-	walk = func(x *Bucket) {
+	var walk func(*BucketDecl)
+	walk = func(x *BucketDecl) {
 		if seen[x.ID] {
 			return
 		}
@@ -530,7 +530,7 @@ func (m *Map) collectDevices(b *Bucket, into map[int32]bool) {
 }
 
 // sortedTypes — типы по возрастанию id (device -> ... -> root).
-func (m *Map) sortedTypes() []*Type {
+func (m *Wrapper) sortedTypes() []*Type {
 	out := append([]*Type{}, m.Types...)
 	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
 	return out

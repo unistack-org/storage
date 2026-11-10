@@ -1,4 +1,4 @@
-package crushmap
+package crush
 
 import (
 	"bufio"
@@ -6,8 +6,6 @@ import (
 	"strconv"
 	"strings"
 	"testing"
-
-	"github.com/unistack-org/storage/crush"
 )
 
 func TestBinary(t *testing.T) {
@@ -16,7 +14,7 @@ func TestBinary(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	m := NewMap()
+	m := NewWrapper()
 	if err = m.DecodeBinary(buf); err != nil {
 		t.Fatal(err)
 	}
@@ -51,7 +49,7 @@ func TestBinaryGolden(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	text := NewMap()
+	text := NewWrapper()
 	if err := text.DecodeText(data); err != nil {
 		t.Fatal(err)
 	}
@@ -60,7 +58,7 @@ func TestBinaryGolden(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	m := NewMap()
+	m := NewWrapper()
 	if err := m.DecodeBinary(bin); err != nil {
 		t.Fatal(err)
 	}
@@ -77,10 +75,10 @@ func TestBinaryGolden(t *testing.T) {
 	copy(out0, full)
 	out0[0] = 0
 
-	work := crush.NewWork(cm, 10, nil)
+	work := NewWork(cm, 10, nil)
 	res := make([]int32, 3)
 
-	f, err := os.Open("../crush/testdata/golden_maptxt.txt")
+	f, err := os.Open("testdata/golden_maptxt.txt")
 	if err != nil {
 		t.Fatal(err)
 	}

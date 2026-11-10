@@ -1,4 +1,4 @@
-package crush_test
+package crush
 
 import (
 	"bufio"
@@ -6,9 +6,6 @@ import (
 	"strconv"
 	"strings"
 	"testing"
-
-	"github.com/unistack-org/storage/crush"
-	"github.com/unistack-org/storage/crushmap"
 )
 
 // TestGoldenMapTxt compares placements produced by the Go engine against
@@ -21,11 +18,11 @@ import (
 //	R = all osd weights 0x10000
 //	W = osd.0 weight 0 (out of service)
 func TestGoldenMapTxt(t *testing.T) {
-	data, err := os.ReadFile("../crushmap/testdata/map.txt")
+	data, err := os.ReadFile("testdata/map.txt")
 	if err != nil {
 		t.Fatal(err)
 	}
-	m := crushmap.NewMap()
+	m := NewWrapper()
 	if err := m.DecodeText(data); err != nil {
 		t.Fatal(err)
 	}
@@ -42,7 +39,7 @@ func TestGoldenMapTxt(t *testing.T) {
 	copy(out0, full)
 	out0[0] = 0
 
-	work := crush.NewWork(cm, 10, nil)
+	work := NewWork(cm, 10, nil)
 	res := make([]int32, 3)
 
 	f, err := os.Open("testdata/golden_maptxt.txt")
@@ -95,16 +92,16 @@ func fieldPrefix(s string) string {
 // TestGoldenMap2 covers uniform/list/tree/straw2 buckets, choose to non-leaf
 // types, fixed numrep, toosmall (result_max > devices), and progressive-out
 // straw2 stability. Vectors from golden2_harness.c (verbatim Ceph core),
-// map in crushmap/testdata/map2.txt.
+// map in testdata/map2.txt.
 //
 //	B = all weights 1.0; T2 = rule 2 with result_max 8;
 //	O = osd.3 out; A0 = rule 0 with osd.4 and osd.5 out.
 func TestGoldenMap2(t *testing.T) {
-	data, err := os.ReadFile("../crushmap/testdata/map2.txt")
+	data, err := os.ReadFile("testdata/map2.txt")
 	if err != nil {
 		t.Fatal(err)
 	}
-	m := crushmap.NewMap()
+	m := NewWrapper()
 	if err := m.DecodeText(data); err != nil {
 		t.Fatal(err)
 	}
@@ -125,7 +122,7 @@ func TestGoldenMap2(t *testing.T) {
 	weightsFor := map[byte][]uint32{'B': full, 'T': full, 'O': out3, 'A': out45}
 	maxFor := map[byte]int{'B': 3, 'T': 8, 'O': 3, 'A': 3}
 
-	work := crush.NewWork(cm, 10, nil)
+	work := NewWork(cm, 10, nil)
 	res := make([]int32, 8)
 
 	f, err := os.Open("testdata/golden_map2txt.txt")
@@ -174,15 +171,15 @@ func TestGoldenMap2(t *testing.T) {
 // local 2 / local fallback 5 / total 19) with varied fractional weights,
 // set_choose_tries and set_choose_local_tries rule overrides, N-1 numrep,
 // and fractional-weight probabilistic out. Vectors from golden3_harness.c
-// (verbatim Ceph core), map in crushmap/testdata/map3.txt.
+// (verbatim Ceph core), map in testdata/map3.txt.
 //
 //	B = all weights 1.0; F = osd.1 weight 0.5 (probabilistically out).
 func TestGoldenMap3(t *testing.T) {
-	data, err := os.ReadFile("../crushmap/testdata/map3.txt")
+	data, err := os.ReadFile("testdata/map3.txt")
 	if err != nil {
 		t.Fatal(err)
 	}
-	m := crushmap.NewMap()
+	m := NewWrapper()
 	if err := m.DecodeText(data); err != nil {
 		t.Fatal(err)
 	}
@@ -199,7 +196,7 @@ func TestGoldenMap3(t *testing.T) {
 
 	weightsFor := map[byte][]uint32{'B': full, 'F': half1}
 
-	work := crush.NewWork(cm, 3, nil)
+	work := NewWork(cm, 3, nil)
 	res := make([]int32, 3)
 
 	f, err := os.Open("testdata/golden_map3txt.txt")

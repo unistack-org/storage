@@ -1,4 +1,4 @@
-package crushmap
+package crush
 
 import (
 	"errors"
@@ -267,8 +267,8 @@ loop:
 	return ruleIdentState
 }
 
-func (p *textParser) handleRule() (*Rule, error) {
-	irule := &Rule{}
+func (p *textParser) handleRule() (*RuleDecl, error) {
+	irule := &RuleDecl{}
 	ended := false
 
 Loop:
@@ -340,8 +340,8 @@ Loop:
 	return irule, nil
 }
 
-func (p *textParser) handleRuleStep() (*Step, error) {
-	istep := &Step{}
+func (p *textParser) handleRuleStep() (*StepDecl, error) {
+	istep := &StepDecl{}
 	var chooseOp string
 
 Loop:

@@ -195,7 +195,7 @@
         choose/chooseleaf, все tunables-профили (legacy…optimal), LN-таблицы,
         jenkins hash. Проверено ~6000 golden-векторами, сгенерированными
         настоящим C-кодом Ceph (`crush/testdata/golden_*.txt`) — 100% совпадение.
-  - [x] `crushkv/crushmap`: текстовый парсер `*.crush` (совместим с Ceph),
+  - [x] `crushkv/crushmap` (ныне `crush/`): текстовый парсер `*.crush` (совместим с Ceph),
         JSON, и **двоичный кодек формата Ceph CrushWrapper** (`binary.go`:
         magic 0x00010000, bucket-slots с per-alg хвостами, rule-slots,
         string-мапы с историческим 64-бит quirk, tunables, class maps,
@@ -212,7 +212,7 @@
         down-строках); reweight покрыт `map reweight` + тестами. Эмуляция
         отказов и chi-square равномерность покрыты тестами:
         `storage/pkg/placement/uniformity_test.go`. Rule-валидатор под
-        volume-class (SSD/HDD) **сделано 2026-11-10**: crushkv `crushmap.Check`
+        volume-class (SSD/HDD) **сделано 2026-11-10**: crushkv `crush.Check`
         (AST: правила/step/классы, pop-count rep3/rep2) + `CheckClass`/
         `CheckWeights` (правила против устройств класса и весов реестра), в CLI —
         `unistorctl map check [-class ssd|hdd]` (exit 1 на ошибках).

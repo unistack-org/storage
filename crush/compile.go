@@ -1,14 +1,12 @@
-package crushmap
+package crush
 
 import (
 	"fmt"
 	"math"
 	"strconv"
-
-	"github.com/unistack-org/storage/crush"
 )
 
-// Compile converts the parsed CRUSH map AST into an executable crush.Map
+// Compile converts the parsed CRUSH map AST into an executable Map
 // whose placement decisions are byte-compatible with Ceph.
 //
 // Weight conversion mirrors CrushCompiler.cc:
@@ -17,8 +15,8 @@ import (
 //
 // i.e. a float32 multiply followed by truncation toward zero, clamped to
 // the device / bucket weight maxima.
-func (m *Map) Compile() (*crush.Map, error) {
-	mb := crush.NewMapBuilder()
+func (m *Wrapper) Compile() (*Map, error) {
+	mb := NewMapBuilder()
 	t, err := tunablesFromMap(m.Tunables)
 	if err != nil {
 		return nil, err
@@ -63,14 +61,14 @@ func (m *Map) Compile() (*crush.Map, error) {
 	// buckets it references, so that computed child weights are available.
 	// Type-id ordering is not safe (custom types can number arbitrarily),
 	// so use a DFS topological sort with cycle detection.
-	byID := make(map[int32]*Bucket, len(m.Buckets))
+	byID := make(map[int32]*BucketDecl, len(m.Buckets))
 	for _, b := range m.Buckets {
 		byID[b.ID] = b
 	}
-	buckets := make([]*Bucket, 0, len(m.Buckets))
+	buckets := make([]*BucketDecl, 0, len(m.Buckets))
 	state := make(map[int32]int) // 0 unvisited, 1 in progress, 2 done
-	var visit func(b *Bucket) error
-	visit = func(b *Bucket) error {
+	var visit func(b *BucketDecl) error
+	visit = func(b *BucketDecl) error {
 		switch state[b.ID] {
 		case 1:
 			return fmt.Errorf("bucket %s: reference cycle", b.Name)
@@ -123,13 +121,13 @@ func (m *Map) Compile() (*crush.Map, error) {
 	}
 
 	for _, b := range buckets {
-		items := make([]crush.ItemSpec, len(b.Items))
+		items := make([]ItemSpec, len(b.Items))
 		for i, it := range b.Items {
 			w, werr := itemWeight(it.ID)
 			if werr != nil {
 				return nil, fmt.Errorf("bucket %s item %d: %w", b.Name, it.ID, werr)
 			}
-			items[i] = crush.ItemSpec{ID: it.ID, Weight: w}
+			items[i] = ItemSpec{ID: it.ID, Weight: w}
 		}
 		hash, herr := parseHash(b.Hash)
 		if herr != nil {
@@ -169,7 +167,7 @@ func (m *Map) Compile() (*crush.Map, error) {
 			maxRule = int(r.ID)
 		}
 	}
-	rules := make([]*crush.Rule, maxRule+1)
+	rules := make([]*Rule, maxRule+1)
 	for _, r := range m.Rules {
 		cr, rerr := compileRule(r, m)
 		if rerr != nil {
@@ -182,15 +180,15 @@ func (m *Map) Compile() (*crush.Map, error) {
 }
 
 // scaleDeviceWeight converts an AST float32 weight to 16.16, clamping at
-// crush.MaxDeviceWeight exactly like CrushCompiler::bucket_add_device.
+// MaxDeviceWeight exactly like CrushCompiler::bucket_add_device.
 func scaleDeviceWeight(w float32) (uint32, error) {
 	if math.IsNaN(float64(w)) || w < 0 {
 		return 0, fmt.Errorf("invalid weight %v", w)
 	}
-	const max = float64(crush.MaxDeviceWeight) // 0xfffe
+	const max = float64(MaxDeviceWeight) // 0xfffe
 	scaled := float64(w) * 65536.0
 	if scaled > max*65536.0 {
-		return uint32(crush.MaxDeviceWeight << 16), nil
+		return uint32(MaxDeviceWeight << 16), nil
 	}
 	return uint32(scaled), nil
 }
@@ -199,17 +197,17 @@ func scaleBucketWeight(w float32) (uint32, error) {
 	if math.IsNaN(float64(w)) || w < 0 {
 		return 0, fmt.Errorf("invalid weight %v", w)
 	}
-	const max = float64(crush.MaxBucketWeight)
+	const max = float64(MaxBucketWeight)
 	scaled := float64(w) * 65536.0
 	if scaled > max*65536.0 {
-		return uint32(crush.MaxBucketWeight << 16), nil
+		return uint32(MaxBucketWeight << 16), nil
 	}
 	return uint32(scaled), nil
 }
 
 func parseHash(s string) (uint32, error) {
 	if s == "" || s == "rjenkins1" {
-		return crush.HashRjenkins1, nil
+		return HashRjenkins1, nil
 	}
 	n, err := strconv.ParseUint(s, 10, 32)
 	if err != nil {
@@ -219,8 +217,8 @@ func parseHash(s string) (uint32, error) {
 }
 
 // compileRule translates one AST rule into engine steps.
-func compileRule(r *Rule, m *Map) (*crush.Rule, error) {
-	out := &crush.Rule{
+func compileRule(r *RuleDecl, m *Wrapper) (*Rule, error) {
+	out := &Rule{
 		Ruleset: r.Ruleset,
 		Type:    r.Type,
 		MinSize: r.MinSize,
@@ -242,48 +240,48 @@ func compileRule(r *Rule, m *Map) (*crush.Rule, error) {
 	return out, nil
 }
 
-func compileStep(st *Step, m *Map) (crush.Step, error) {
+func compileStep(st *StepDecl, m *Wrapper) (Step, error) {
 	switch st.Op {
 	case "take":
 		id, err := resolveItemID(st, m)
 		if err != nil {
-			return crush.Step{}, err
+			return Step{}, err
 		}
-		return crush.Step{Op: crush.OpTake, Arg1: id}, nil
+		return Step{Op: OpTake, Arg1: id}, nil
 	case "choose_firstn":
-		return crush.Step{Op: crush.OpChooseFirstN, Arg1: st.Num, Arg2: typeID(st, m)}, nil
+		return Step{Op: OpChooseFirstN, Arg1: st.Num, Arg2: typeID(st, m)}, nil
 	case "choose_indep":
-		return crush.Step{Op: crush.OpChooseIndep, Arg1: st.Num, Arg2: typeID(st, m)}, nil
+		return Step{Op: OpChooseIndep, Arg1: st.Num, Arg2: typeID(st, m)}, nil
 	case "chooseleaf_firstn":
-		return crush.Step{Op: crush.OpChooseLeafFirstN, Arg1: st.Num, Arg2: typeID(st, m)}, nil
+		return Step{Op: OpChooseLeafFirstN, Arg1: st.Num, Arg2: typeID(st, m)}, nil
 	case "chooseleaf_indep":
-		return crush.Step{Op: crush.OpChooseLeafIndep, Arg1: st.Num, Arg2: typeID(st, m)}, nil
+		return Step{Op: OpChooseLeafIndep, Arg1: st.Num, Arg2: typeID(st, m)}, nil
 	case "emit":
-		return crush.Step{Op: crush.OpEmit}, nil
+		return Step{Op: OpEmit}, nil
 	case "set_choose_tries":
-		return crush.Step{Op: crush.OpSetChooseTries, Arg1: st.Num}, nil
+		return Step{Op: OpSetChooseTries, Arg1: st.Num}, nil
 	case "set_chooseleaf_tries":
-		return crush.Step{Op: crush.OpSetChooseLeafTries, Arg1: st.Num}, nil
+		return Step{Op: OpSetChooseLeafTries, Arg1: st.Num}, nil
 	case "set_choose_local_tries":
-		return crush.Step{Op: crush.OpSetChooseLocalTries, Arg1: st.Num}, nil
+		return Step{Op: OpSetChooseLocalTries, Arg1: st.Num}, nil
 	case "set_choose_local_fallback_tries":
-		return crush.Step{Op: crush.OpSetChooseLocalFallbackTries, Arg1: st.Num}, nil
+		return Step{Op: OpSetChooseLocalFallbackTries, Arg1: st.Num}, nil
 	case "set_chooseleaf_vary_r":
-		return crush.Step{Op: crush.OpSetChooseLeafVaryR, Arg1: st.Num}, nil
+		return Step{Op: OpSetChooseLeafVaryR, Arg1: st.Num}, nil
 	case "set_chooseleaf_stable":
-		return crush.Step{Op: crush.OpSetChooseLeafStable, Arg1: st.Num}, nil
+		return Step{Op: OpSetChooseLeafStable, Arg1: st.Num}, nil
 	case "set_msr_descents":
-		return crush.Step{Op: crush.OpSetMSRDescents, Arg1: st.Num}, nil
+		return Step{Op: OpSetMSRDescents, Arg1: st.Num}, nil
 	case "set_msr_collision_tries":
-		return crush.Step{Op: crush.OpSetMSRCollisionTries, Arg1: st.Num}, nil
+		return Step{Op: OpSetMSRCollisionTries, Arg1: st.Num}, nil
 	case "choosemsr_firstn", "choosemsr_indep":
-		return crush.Step{}, fmt.Errorf("msr rules are not supported by this engine build")
+		return Step{}, fmt.Errorf("msr rules are not supported by this engine build")
 	default:
-		return crush.Step{}, fmt.Errorf("unknown step op %q", st.Op)
+		return Step{}, fmt.Errorf("unknown step op %q", st.Op)
 	}
 }
 
-func typeID(st *Step, m *Map) int32 {
+func typeID(st *StepDecl, m *Wrapper) int32 {
 	if st.ItemType != "" {
 		for _, t := range m.Types {
 			if t.Name == st.ItemType {
@@ -294,7 +292,7 @@ func typeID(st *Step, m *Map) int32 {
 	return st.ItemTypeID
 }
 
-func resolveItemID(st *Step, m *Map) (int32, error) {
+func resolveItemID(st *StepDecl, m *Wrapper) (int32, error) {
 	if st.ItemName != "" {
 		if st.ItemName[0] >= '0' && st.ItemName[0] <= '9' {
 			// numeric device id written as a name
@@ -317,33 +315,33 @@ func resolveItemID(st *Step, m *Map) (int32, error) {
 }
 
 // tunablesFromMap converts the loose tunables map (text/binary parsers)
-// into a typed crush.Tunables. Recognised profile names select the Ceph
+// into a typed Tunables. Recognised profile names select the Ceph
 // baseline profile; individual keys override it.
-func tunablesFromMap(tm map[string]interface{}) (crush.Tunables, error) {
-	t := crush.TunablesOptimal()
+func tunablesFromMap(tm map[string]interface{}) (Tunables, error) {
+	t := TunablesOptimal()
 	if tm == nil {
 		return t, nil
 	}
 	if prof, ok := tm["profile"].(string); ok {
 		switch prof {
 		case "legacy", "argonaut":
-			t = crush.TunablesLegacy()
+			t = TunablesLegacy()
 		case "bobtail":
-			t = crush.TunablesBobtail()
+			t = TunablesBobtail()
 		case "firefly", "ghost":
-			t = crush.TunablesFirefly()
+			t = TunablesFirefly()
 		case "hammer", "infernalis", "jewel":
 			// jewel = optimal; hammer/infernalis = hammer profile.
 			// The AST stores profile name only; per-key overrides below
 			// (from binary maps) make it exact. For text maps without
 			// explicit keys, treat jewel as optimal and older as their own.
 			if prof == "jewel" {
-				t = crush.TunablesOptimal()
+				t = TunablesOptimal()
 			} else {
-				t = crush.TunablesHammer()
+				t = TunablesHammer()
 			}
 		case "optimal":
-			t = crush.TunablesOptimal()
+			t = TunablesOptimal()
 		default:
 			return t, fmt.Errorf("unknown tunables profile %q", prof)
 		}

@@ -1,4 +1,4 @@
-package crushmap
+package crush
 
 import (
 	"encoding/binary"
@@ -6,14 +6,9 @@ import (
 	"fmt"
 	"sort"
 	"strconv"
-
-	"github.com/unistack-org/storage/crush"
 )
 
-// Magic is the CRUSH binary map magic (CRUSH_MAGIC in CrushWrapper.h).
-const Magic = uint32(0x00010000)
-
-// Rule step opcodes on the wire (enum crush_opcodes in crush.h).
+// RuleDecl step opcodes on the wire (enum crush_opcodes in h).
 const (
 	CrushRuleStepNoop                        = uint32(0)
 	CrushRuleStepTake                        = uint32(1)
@@ -125,7 +120,7 @@ func (w *binWriter) u8(v uint8)   { w.b = append(w.b, v) }
 // (the format produced by `crushtool --compile` and stored in the OSDMap).
 // It mirrors CrushWrapper::decode byte-for-byte, including the historical
 // 32/64-bit string-map key quirk and the gated optional tail sections.
-func (cmap *Map) DecodeBinary(buf []byte) error {
+func (cmap *Wrapper) DecodeBinary(buf []byte) error {
 	r := &binReader{b: buf}
 
 	magic, err := r.u32()
@@ -153,7 +148,7 @@ func (cmap *Map) DecodeBinary(buf []byte) error {
 	}
 
 	// Ceph starts from the legacy profile and lets the tail override it.
-	legacy := crush.TunablesLegacy()
+	legacy := TunablesLegacy()
 	tun := map[string]interface{}{
 		"choose_local_tries":          legacy.ChooseLocalTries,
 		"choose_local_fallback_tries": legacy.ChooseLocalFallbackTries,
@@ -221,7 +216,7 @@ func (cmap *Map) DecodeBinary(buf []byte) error {
 		if err != nil {
 			return err
 		}
-		rule := &Rule{
+		rule := &RuleDecl{
 			ID:      uint8(i),
 			Ruleset: ruleset,
 			Type:    typ,
@@ -251,7 +246,7 @@ func (cmap *Map) DecodeBinary(buf []byte) error {
 			if !ok {
 				return fmt.Errorf("crush binary: unknown step op %d", op)
 			}
-			st := &Step{Op: name}
+			st := &StepDecl{Op: name}
 			switch op {
 			case CrushRuleStepTake:
 				st.Item = int(arg1)
@@ -291,7 +286,7 @@ func (cmap *Map) DecodeBinary(buf []byte) error {
 
 	// Devices: ids 0..max_devices-1, synthesising names when absent.
 	devName := make(map[int32]string)
-	byID := make(map[int32]*Bucket, len(cmap.Buckets))
+	byID := make(map[int32]*BucketDecl, len(cmap.Buckets))
 	for _, b := range cmap.Buckets {
 		byID[b.ID] = b
 	}
@@ -312,7 +307,7 @@ func (cmap *Map) DecodeBinary(buf []byte) error {
 			it.Name = nameMap[it.ID]
 		}
 	}
-	ruleByID := make(map[uint8]*Rule, len(cmap.Rules))
+	ruleByID := make(map[uint8]*RuleDecl, len(cmap.Rules))
 	for _, ru := range cmap.Rules {
 		ruleByID[ru.ID] = ru
 	}
@@ -363,7 +358,7 @@ func (cmap *Map) DecodeBinary(buf []byte) error {
 		}
 		tun["choose_total_tries"] = v
 	}
-	// chooseleaf_descend_once is __u32 on the wire (crush.h).
+	// chooseleaf_descend_once is __u32 on the wire (h).
 	if r.remaining() >= 4 {
 		v, err := r.u32()
 		if err != nil {
@@ -545,19 +540,19 @@ func (cmap *Map) DecodeBinary(buf []byte) error {
 	return nil
 }
 
-// The crushmap AST bucket-alg enums use the same values as crush.h on the
-// wire (1-based: uniform=1..straw2=5); the crush engine constants are the
-// same algs 0-based. Pin the relationships at compile time.
+// The AST bucket-alg enums (CrushAlg*) use the same values as Ceph's
+// CrushWrapper.h on the wire (1-based: uniform=1..straw2=5); the engine
+// constants (Alg*) are the same algs 0-based. Pin the relationships.
 const (
-	_ = int(CrushAlgUniform) - int(crush.AlgUniform) - 1
-	_ = int(CrushAlgStraw2) - int(crush.AlgStraw2) - 1
+	_ = int(CrushAlgUniform) - int(AlgUniform) - 1
+	_ = int(CrushAlgStraw2) - int(AlgStraw2) - 1
 )
 
 // decodeBucket decodes one non-empty bucket slot. algWord is the wire alg
 // already read from the slot header (0 means absent and is handled by the
-// caller). Wire algs are 1-based (crush.h: uniform=1..straw2=5), matching
-// the crushmap AST enums; the engine constants are 0-based.
-func decodeBucket(r *binReader, algWord uint32) (*Bucket, error) {
+// caller). Wire algs are 1-based (CrushWrapper.h: uniform=1..straw2=5),
+// matching the AST enums; the engine constants are 0-based.
+func decodeBucket(r *binReader, algWord uint32) (*BucketDecl, error) {
 	if algWord < uint32(CrushAlgUniform) || algWord > uint32(CrushAlgStraw2) {
 		return nil, fmt.Errorf("unknown bucket alg %d", algWord)
 	}
@@ -580,7 +575,7 @@ func decodeBucket(r *binReader, algWord uint32) (*Bucket, error) {
 	if err != nil {
 		return nil, err
 	}
-	if hash != crush.HashRjenkins1 {
+	if hash != HashRjenkins1 {
 		return nil, fmt.Errorf("bucket %d: unknown hash %d", id, hash)
 	}
 	weightWord, err := r.u32()
@@ -604,7 +599,7 @@ func decodeBucket(r *binReader, algWord uint32) (*Bucket, error) {
 
 	itemW := make([]uint32, size)
 	switch alg - 1 { // wire 1-based -> engine 0-based
-	case crush.AlgUniform:
+	case AlgUniform:
 		w, err := r.u32()
 		if err != nil {
 			return nil, err
@@ -612,7 +607,7 @@ func decodeBucket(r *binReader, algWord uint32) (*Bucket, error) {
 		for i := range itemW {
 			itemW[i] = w
 		}
-	case crush.AlgList, crush.AlgStraw:
+	case AlgList, AlgStraw:
 		// size x (item_weight, sum_weight|straw) interleaved
 		for i := range itemW {
 			itemW[i], err = r.u32()
@@ -623,7 +618,7 @@ func decodeBucket(r *binReader, algWord uint32) (*Bucket, error) {
 				return nil, err
 			}
 		}
-	case crush.AlgTree:
+	case AlgTree:
 		numNodes, err := r.u32()
 		if err != nil {
 			return nil, err
@@ -646,7 +641,7 @@ func decodeBucket(r *binReader, algWord uint32) (*Bucket, error) {
 				itemW[i] = nodeW[node]
 			}
 		}
-	case crush.AlgStraw2:
+	case AlgStraw2:
 		for i := range itemW {
 			itemW[i], err = r.u32()
 			if err != nil {
@@ -655,7 +650,7 @@ func decodeBucket(r *binReader, algWord uint32) (*Bucket, error) {
 		}
 	}
 
-	b := &Bucket{
+	b := &BucketDecl{
 		TypeID: CrushBucketType(typWord),
 		Weight: float32(weightWord) / 65536.0,
 		ID:     id,
@@ -749,7 +744,7 @@ func profileFromTunables(tun map[string]interface{}) {
 		prof = "firefly"
 	case u("choose_local_tries") == 0 && u("choose_local_fallback_tries") == 0 && u("choose_total_tries") == 50 &&
 		u("chooseleaf_descend_once") == 1 && u("chooseleaf_vary_r") == 1 && u("chooseleaf_stable") == 1 &&
-		u("allowed_bucket_algs") == uint32(crush.TunablesHammer().AllowedBucketAlgs):
+		u("allowed_bucket_algs") == uint32(TunablesHammer().AllowedBucketAlgs):
 		prof = "hammer"
 	case u("choose_local_tries") == 0 && u("choose_local_fallback_tries") == 0 && u("choose_total_tries") == 50 &&
 		u("chooseleaf_descend_once") == 1 && u("chooseleaf_vary_r") == 1 && u("chooseleaf_stable") == 1:
@@ -765,7 +760,7 @@ func profileFromTunables(tun map[string]interface{}) {
 // EncodeBinary serialises the map in Ceph CrushWrapper format. The output
 // is byte-compatible with `crushtool --compile` on Quincy+ (ruleset==ruleid,
 // min/max size 1/100) and always writes the full modern tail.
-func (cmap *Map) EncodeBinary() ([]byte, error) {
+func (cmap *Wrapper) EncodeBinary() ([]byte, error) {
 	w := &binWriter{}
 	w.u32(Magic)
 
@@ -806,7 +801,7 @@ func (cmap *Map) EncodeBinary() ([]byte, error) {
 	w.s32(maxDevices)
 
 	// Buckets, in slot order.
-	bucketByIndex := make(map[int]*Bucket, len(cmap.Buckets))
+	bucketByIndex := make(map[int]*BucketDecl, len(cmap.Buckets))
 	for _, b := range cmap.Buckets {
 		idx := crushBucketIndex(b.ID)
 		if _, dup := bucketByIndex[idx]; dup {
@@ -826,7 +821,7 @@ func (cmap *Map) EncodeBinary() ([]byte, error) {
 	}
 
 	// Rules, in slot order (ruleset == rule id).
-	ruleByIndex := make(map[int]*Rule, len(cmap.Rules))
+	ruleByIndex := make(map[int]*RuleDecl, len(cmap.Rules))
 	for _, r := range cmap.Rules {
 		if _, dup := ruleByIndex[int(r.ID)]; dup {
 			return nil, fmt.Errorf("crush binary: duplicate rule id %d", r.ID)
@@ -1058,7 +1053,7 @@ func (cmap *Map) EncodeBinary() ([]byte, error) {
 // encodeBucket writes one bucket slot: u32 alg (0=absent, handled by the
 // caller), then the header, items and the per-alg tail, exactly as
 // CrushWrapper::encode.
-func encodeBucket(w *binWriter, b *Bucket) error {
+func encodeBucket(w *binWriter, b *BucketDecl) error {
 	algType, ok := crushAlgStringTypeMap[b.Alg]
 	if !ok || algType == CrushAlgInvalid {
 		return fmt.Errorf("unknown alg %q", b.Alg)
@@ -1103,13 +1098,13 @@ func encodeBucket(w *binWriter, b *Bucket) error {
 	}
 
 	switch algWord - 1 { // wire 1-based -> engine 0-based
-	case crush.AlgUniform:
+	case AlgUniform:
 		var iw uint32
 		if len(itemWeights) > 0 {
 			iw = itemWeights[0]
 		}
 		w.u32(iw)
-	case crush.AlgList:
+	case AlgList:
 		// sum_weights are suffix sums (crush_create_list)
 		sum := uint32(0)
 		sums := make([]uint32, len(itemWeights))
@@ -1121,9 +1116,9 @@ func encodeBucket(w *binWriter, b *Bucket) error {
 			w.u32(iw)
 			w.u32(sums[i])
 		}
-	case crush.AlgTree:
+	case AlgTree:
 		n := len(itemWeights)
-		depth := crushCalcDepth(n)
+		depth := calcDepth(n)
 		numNodes := uint32(0)
 		nodeW := []uint32(nil)
 		if n > 0 {
@@ -1133,7 +1128,7 @@ func encodeBucket(w *binWriter, b *Bucket) error {
 				node := crushCalcTreeNode(i)
 				nodeW[node] += iw
 				for j := 1; j < depth; j++ {
-					node = crushTreeBuilderParent(node)
+					node = treeBuilderParent(node)
 					nodeW[node] += iw
 				}
 			}
@@ -1142,14 +1137,14 @@ func encodeBucket(w *binWriter, b *Bucket) error {
 		for _, nw := range nodeW {
 			w.u32(nw)
 		}
-	case crush.AlgStraw:
+	case AlgStraw:
 		// straw multipliers are recomputed by the engine on decode
 		// (crush_calc_straw), so the wire values are placeholders.
 		for _, iw := range itemWeights {
 			w.u32(iw)
 			w.u32(0x10000)
 		}
-	case crush.AlgStraw2:
+	case AlgStraw2:
 		for _, iw := range itemWeights {
 			w.u32(iw)
 		}
@@ -1158,39 +1153,5 @@ func encodeBucket(w *binWriter, b *Bucket) error {
 }
 
 // crushBucketIndex maps a (negative) bucket id to its slot index,
-// matching crush_bucket_index() in crush.h.
+// matching crush_bucket_index() in h.
 func crushBucketIndex(id int32) int { return int(-1 - id) }
-
-// Tree layout helpers replicated from crush/builder.go (the encoder must
-// produce the same node_weights the engine builds).
-func crushCalcTreeNode(i int) int32 { return int32(((i + 1) << 1) - 1) }
-
-func crushTreeBuilderHeight(n int32) int {
-	h := 0
-	for n&1 == 0 {
-		h++
-		n >>= 1
-	}
-	return h
-}
-
-func crushTreeBuilderParent(n int32) int32 {
-	h := crushTreeBuilderHeight(n)
-	if n&(1<<uint(h+1)) != 0 { // on_right
-		return n - int32(1)<<uint(h)
-	}
-	return n + int32(1)<<uint(h)
-}
-
-func crushCalcDepth(size int) int {
-	if size == 0 {
-		return 0
-	}
-	depth := 1
-	t := size - 1
-	for t != 0 {
-		t >>= 1
-		depth++
-	}
-	return depth
-}

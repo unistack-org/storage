@@ -1,4 +1,4 @@
-package crushmap
+package crush
 
 import "fmt"
 

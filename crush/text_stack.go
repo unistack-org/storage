@@ -1,4 +1,4 @@
-package crushmap
+package crush
 
 type runeNode struct {
 	r    rune

@@ -36,7 +36,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/unistack-org/storage/crushmap"
+	"github.com/unistack-org/storage/crush"
 	"github.com/unistack-org/storage/pkg/meta"
 	"github.com/unistack-org/storage/pkg/object"
 	"github.com/unistack-org/storage/pkg/placement"
@@ -797,7 +797,7 @@ func (c *Cluster) MapEpoch(ctx context.Context, epoch uint32, src []byte) error 
 	switch {
 	case len(src) > 0 && src[0] == '{':
 		format = "json"
-	case len(src) >= 4 && binary.LittleEndian.Uint32(src[:4]) == crushmap.Magic:
+	case len(src) >= 4 && binary.LittleEndian.Uint32(src[:4]) == crush.Magic:
 		format = "binary"
 	}
 	b, err := json.Marshal(meta.MapRecord{Epoch: epoch, Format: format, Map: src})

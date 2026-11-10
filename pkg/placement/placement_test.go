@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"math"
 	"testing"
+
+	"github.com/unistack-org/storage/crush"
 )
 
 // mapRep3 is a three-host rep3 map (two osds per host) with a single
@@ -291,7 +293,7 @@ func TestEpochStabilityMinimalDisruption(t *testing.T) {
 func TestDecodeFormats(t *testing.T) {
 	// Text is the baseline; JSON round-trip must place identically.
 	txt := []byte(mapRep3)
-	m, err := decodeAny(txt)
+	m, err := crush.Decode(txt)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -402,7 +404,7 @@ func TestEncodeMapTextRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	txt, err := EncodeMapText(m)
+	txt, err := m.EncodeText()
 	if err != nil {
 		t.Fatal(err)
 	}

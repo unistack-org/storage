@@ -1,4 +1,4 @@
-package crushmap
+package crush
 
 import (
 	"errors"
@@ -352,8 +352,8 @@ loop:
 	return bucketIdentState
 }
 
-func (p *textParser) handleBucket(itype string) (*Bucket, error) {
-	ibucket := &Bucket{TypeName: itype}
+func (p *textParser) handleBucket(itype string) (*BucketDecl, error) {
+	ibucket := &BucketDecl{TypeName: itype}
 
 Loop:
 	for {

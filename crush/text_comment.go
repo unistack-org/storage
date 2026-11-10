@@ -1,4 +1,4 @@
-package crushmap
+package crush
 
 func commentLineState(l *lex) stateFn {
 loop:

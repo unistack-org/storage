@@ -3,7 +3,7 @@
 Распределённая блочная СХД на чистом Go. Цели (зафиксированы владельцем):
 
 1. **CRUSH-крашмапы как в Ceph** — размещение объектов по topology-карте
-   (region → zone → rack → host → disk). Движок: `crush/` + `crushmap/`
+   (region → zone → rack → host → disk). Движок и формат карты: `crush/`
    (byte-exact порт C-ядра Ceph из репозитория
    [crushkv](https://github.com/unistack-org/crushkv), влит в этот
    репозиторий; golden-тесты против настоящего Ceph, 0 аллокаций на
@@ -24,8 +24,8 @@
   VDUSE (`/dev/vduseX`, Linux) и vhost-user-blk (UNIX-сокет для
   QEMU/Dragonball); управление через REST `POST/GET/DELETE /v1/exports`
   и `unistorctl export …`.
-- ✅ CRUSH: `crush/` + `crushmap/` (движок + формат карты Ceph + арена
-  без GC) — влиты в этот репозиторий из crushkv.
+- ✅ CRUSH: `crush/` (движок + формат карты Ceph: чтение/запись text,
+  JSON, binary + арена без GC) — влит в этот репозиторий из crushkv.
 - ✅ Метрики: `unistord -metrics 0.0.0.0:8080` → `GET /metrics` в формате
   Prometheus (скрейп VictoriaMetrics): состояние кластера, raft (состояние
   и участники), статус и диски всех OSD (в т.ч. удалённых — зонд StatFS),
@@ -51,7 +51,7 @@
 | `pkg/vduse` | VDUSE (Linux) — userspace virtio-blk бэкенд |
 | `pkg/vub` | vhost-user-blk бэкенд (UNIX-сокет, QEMU/Dragonball) |
 | `pkg/store`, `pkg/object`, `pkg/volume`, … | ядро SDS |
-| `crush/`, `crushmap/` | CRUSH-движок (порт C-ядра Ceph, ex-crushkv) |
+| `crush/` | CRUSH-движок и крашмапы (порт C-ядра Ceph, ex-crushkv) |
 
 ## Сборка / тесты
 

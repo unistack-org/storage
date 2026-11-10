@@ -2,8 +2,9 @@ package crush
 
 // Ready-made rule presets so operators never hand-write CRUSH rule text.
 // Each preset returns a *Rule ready to pass to MapBuilder.Build for the
-// crush engine. (The crushmap text/JSON compiler has its own AST types;
-// hand-write text there, or build the crush.Map via MapBuilder directly.)
+// crush engine. (The text/JSON decoders have their own AST types —
+// Wrapper, RuleDecl — so hand-write text there, or build a Map via
+// MapBuilder directly.)
 // The pool/volume "size" (replica or shard count) is supplied by the
 // caller at placement time as len(result): every preset uses numrep=0
 // ("as many as the pool asks for"), like Ceph's stock rules.

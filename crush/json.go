@@ -1,8 +1,8 @@
-package crushmap
+package crush
 
 import "encoding/json"
 
-func (cmap *Map) DecodeJson(data []byte) error {
+func (cmap *Wrapper) DecodeJson(data []byte) error {
 	err := json.Unmarshal(data, &cmap)
 	if err != nil {
 		return err
@@ -12,6 +12,6 @@ func (cmap *Map) DecodeJson(data []byte) error {
 	return nil
 }
 
-func (cmap *Map) EncodeJson() ([]byte, error) {
+func (cmap *Wrapper) EncodeJson() ([]byte, error) {
 	return json.Marshal(cmap)
 }
