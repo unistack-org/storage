@@ -77,8 +77,25 @@ type uring struct {
 	filesMu sync.Mutex
 	files   []*os.File // keep registered *os.File alive for the ring's lifetime
 
+	// work carries ops to submitLoop. Submit sends under submitMu and
+	// Close closes the channel under the same mutex, so a send can
+	// never race the close; submitLoop exits once work is closed and
+	// drained, guaranteeing every accepted op reaches the kernel.
 	work chan Op
-	done chan struct{}
+
+	// submitMu serialises Submit (send) against Close (close). It is
+	// deliberately distinct from producerMu: submitLoop may drain work
+	// (it needs producerMu for SQ/kick) while a Submit blocks holding
+	// submitMu, which is what lets Close proceed.
+	submitMu sync.Mutex
+
+	// outstanding counts submitted ops whose completion callback has
+	// not run: incremented when Submit enqueues an op, decremented per
+	// CQE by the completion loop and by kick (or the defensive no-slot
+	// path) when an op the kernel never referenced is reclaimed. The
+	// completion loop must not exit while it is positive, even after
+	// Close: those ops still need their callbacks.
+	outstanding atomic.Int64
 
 	producerMu sync.Mutex
 	wg         sync.WaitGroup
@@ -133,7 +150,6 @@ func New(entries int) (Ring, error) {
 		r.ids <- i
 	}
 	r.work = make(chan Op, p.sqEntries)
-	r.done = make(chan struct{})
 	r.wg.Add(2)
 	go r.submitLoop()
 	go r.completionLoop()
@@ -194,64 +210,69 @@ func (r *uring) fillSqe(idx uint32, opCode uint8, fd int32, buf []byte, off int6
 	*(*uint32)(unsafe.Pointer(uintptr(unsafe.Pointer(r.sqArray)) + uintptr(idx)*4)) = idx
 }
 
-// produceOne acquires a slot, fills the SQE at tail, and publishes.
-func (r *uring) produceOne(op Op, slot uint32) bool {
-	tail := atomic.LoadUint32(r.sqTail)
-	if tail-atomic.LoadUint32(r.sqHead) >= r.sqEntries {
-		return false
-	}
-	idx := tail & atomic.LoadUint32(r.sqMask)
-	opCode := uint8(opRead)
-	if op.Write {
-		opCode = opWrite
-	}
-	r.fillSqe(idx, opCode, op.Fd, op.Buf, op.Off, uint64(slot))
-	atomic.StoreUint32(r.sqTail, tail+1)
-	return true
-}
-
 // submitLoop is the data-path producer: collect a batch, fill SQEs, one
-// io_uring_enter per batch.
+// io_uring_enter per batch. It exits only after Close has closed the
+// work channel and the channel is drained, so every accepted op is
+// either handed to the kernel or failed by kick's reclaim path.
 func (r *uring) submitLoop() {
 	defer r.wg.Done()
 	batch := make([]uint32, 0, 128)
+	cap := int(r.sqEntries)
+	if cap > 128 {
+		cap = 128
+	}
 	for {
-		var first Op
-		ok := false
-		select {
-		case <-r.done:
-			r.drainWork()
+		first, ok := <-r.work
+		if !ok {
 			return
-		case first = <-r.work:
-			ok = true
 		}
-		if ok {
-			batch = batch[:0]
-			r.ringSubmit(first, &batch)
-		collect:
-			for len(batch) < 128 {
-				select {
-				case op := <-r.work:
-					r.ringSubmit(op, &batch)
-				default:
+		batch = batch[:0]
+		r.submitOp(first, &batch)
+		drained := false
+	collect:
+		for len(batch) < cap {
+			select {
+			case op, ok2 := <-r.work:
+				if !ok2 {
+					drained = true // channel closed and fully drained
 					break collect
 				}
+				r.submitOp(op, &batch)
+			default:
+				break collect
 			}
-			r.kick(len(batch), batch)
 		}
+		r.kick(len(batch), batch)
+		if drained {
+			return
+		}
+	}
+}
+
+// submitOp hands one op to the SQ. A full SQ flushes the batch collected
+// so far (the kernel consumes entries, freeing space) and retries: the
+// data path applies backpressure through the work channel instead of
+// failing ops the kernel was never told about.
+func (r *uring) submitOp(op Op, batch *[]uint32) {
+	for !r.ringSubmit(op, batch) {
+		k := *batch
+		*batch = k[:0]
+		r.kick(len(k), k)
 	}
 }
 
 // ringSubmit fills one op and appends its slot to batch (producerMu
-// held). On sq-full/no-slot the slot is never taken, so the batch owner
-// (completions) stays the single owner of every handed-out slot.
-func (r *uring) ringSubmit(op Op, batch *[]uint32) {
+// held). It reports whether the op is resolved: false means the SQ was
+// full (the slot was never taken, so the caller must free SQ entries and
+// retry), true means the op is queued (slot appended) or was failed here
+// (no free slot). On a non-true return no slot is taken, so the batch
+// owner stays the single owner of every handed-out slot.
+func (r *uring) ringSubmit(op Op, batch *[]uint32) bool {
 	r.producerMu.Lock()
 	defer r.producerMu.Unlock()
 	tail := atomic.LoadUint32(r.sqTail)
 	if tail-atomic.LoadUint32(r.sqHead) >= r.sqEntries {
-		op.Done0(errors.New("iouring: sq full"))
-		return
+		return false // SQ full: caller flushes the batch and retries
 	}
 	select {
 	case slot := <-r.ids:
@@ -269,8 +290,15 @@ func (r *uring) ringSubmit(op Op, batch *[]uint32) {
 		r.fillSqe(idx, opCode, op.Fd, op.Buf, op.Off, uint64(slot))
 		atomic.StoreUint32(r.sqTail, tail+1)
 		*batch = append(*batch, slot)
+		return true
 	default:
+		// Defensive: ids capacity equals sqEntries, so this is
+		// unreachable while the SQ-full check gates publishing. The op
+		// was counted outstanding at Submit and the kernel will never
+		// see it: undo the count.
+		r.outstanding.Add(-1)
 		op.Done0(errors.New("iouring: no free slots"))
+		return true // resolved with an error: nothing to retry
 	}
 }
 
@@ -278,6 +306,14 @@ func (r *uring) ringSubmit(op Op, batch *[]uint32) {
 // (EINTR partial, refused batch) get an immediate error callback. Those
 // slots were never visible to the kernel, so the completion loop cannot
 // complete them: reclaiming them here is race-free.
+// kick hands the batch's SQEs to the kernel. Ops are counted as
+// outstanding at Submit-enqueue; completions (CQE) and reclaiming
+// un-kernelled SQEs here are the only decrements, so re-submitting
+// the same SQEs (backpressure re-kick) must not touch the counter.
+// SQEs the kernel did not consume (EINTR partial, refused enter) get
+// an immediate error callback: the kernel never referenced those
+// slots, so the completion loop cannot complete them and reclaiming
+// them here is race-free.
 func (r *uring) kick(n int, batch []uint32) {
 	if n == 0 {
 		return
@@ -292,8 +328,14 @@ func (r *uring) kick(n int, batch []uint32) {
 		consumed = 0
 	}
 	if err != nil && !errors.Is(err, syscall.EINTR) {
-		consumed = 0 // kernel refused the batch wholesale
+		// The kernel refused the enter and consumed nothing: every
+		// SQE in the batch stays unreferenced by the kernel and must
+		// be reclaimed (a partial consumption always reports EINTR).
+		consumed = 0
 	}
+	// Reclaimed ops were counted at Submit and the kernel never saw
+	// them: drop their outstanding count so completionLoop can exit.
+	r.outstanding.Add(int64(consumed - n))
 	for _, slot := range batch[consumed:n] {
 		r.slotsMu.Lock()
 		op := r.slots[slot]
@@ -322,6 +364,7 @@ func (r *uring) completionLoop() {
 			if userData == wakeSentinel {
 				continue
 			}
+			r.outstanding.Add(-1)
 			slot := uint32(userData)
 			r.slotsMu.Lock()
 			op := r.slots[slot]
@@ -337,8 +380,8 @@ func (r *uring) completionLoop() {
 				op.Done(n, err)
 			}
 		}
-		if r.closed.Load() {
-			return // drainWork + kick guarantee every op got a callback
+		if r.closed.Load() && r.outstanding.Load() <= 0 {
+			return // every enqueued op was completed or reclaimed by kick
 		}
 		if _, err := uringEnter(uintptr(r.ringFd), 0, 1, true); err != nil {
 			if errors.Is(err, syscall.EINTR) || errors.Is(err, syscall.EAGAIN) {
@@ -352,8 +395,14 @@ func (r *uring) completionLoop() {
 	}
 }
 
+// Submit queues ops to the ring. Senders serialise against Close on
+// submitMu: once Close has closed the work channel, no Send can slip
+// in behind it, so every op that reaches the channel is drained and
+// kicked by submitLoop before it exits.
 func (r *uring) Submit(ops []Op) error {
+	r.submitMu.Lock()
 	if r.closed.Load() {
+		r.submitMu.Unlock()
 		for _, op := range ops {
 			op.DoneGo(ErrClosed)
 		}
@@ -364,8 +413,13 @@ func (r *uring) Submit(ops []Op) error {
 			op.DoneGo(nil)
 			continue
 		}
+		// Counted before enqueue: from here until the CQE (or kick's
+		// reclaim) the op is outstanding and completionLoop must stay
+		// alive to resolve it.
+		r.outstanding.Add(1)
 		r.work <- op
 	}
+	r.submitMu.Unlock()
 	return nil
 }
 
@@ -380,8 +434,13 @@ func (r *uring) Close() error {
 	var err error
 	r.closer.Do(func() {
 		r.closed.Store(true)
-		close(r.done) // submitLoop: drains work (ErrClosed), exits
-		r.wake()      // NOP completion unblocks the enter in completionLoop
+		// Under submitMu this serialises with Submit's send, so no
+		// op can be enqueued after the channel closes; submitLoop
+		// drains everything already in it, kicks, and exits.
+		r.submitMu.Lock()
+		close(r.work)
+		r.submitMu.Unlock()
+		r.wake() // NOP completion unblocks the enter in completionLoop
 		r.wg.Wait()
 		err = syscall.Close(r.ringFd)
 		for _, b := range [][]byte{r.sqRingMap, r.cqRingMap, r.sqesMap} {
@@ -403,15 +462,4 @@ func (r *uring) wake() {
 	r.fillSqe(idx, opNop, -1, nil, 0, wakeSentinel)
 	atomic.StoreUint32(r.sqTail, tail+1)
 	uringEnter(uintptr(r.ringFd), 1, 0, false)
-}
-
-func (r *uring) drainWork() {
-	for {
-		select {
-		case op := <-r.work:
-			op.DoneGo(ErrClosed)
-		default:
-			return
-		}
-	}
 }
