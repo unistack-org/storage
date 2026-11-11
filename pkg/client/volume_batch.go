@@ -70,6 +70,11 @@ func BatchStats() (dispatches, slots int64) {
 }
 
 // batchSlot is one chunk read handed to a collector for one OSD.
+// Slots circulate through the owning group's free list. The buffered
+// reply channel is the ownership token: whoever receives a posted
+// reply recycles the slot (the submitter normally; dispatch itself
+// when the submitter walked away), so a slot is put back exactly once
+// and its channel is always empty on pool entry.
 type batchSlot struct {
 	oid   uint64
 	inObj uint64
@@ -98,11 +103,115 @@ type batchGroup struct {
 
 	intake chan *batchSlot
 
-	// inflight bounds concurrent windows per OSD (pipeline depth):
-	// while one round-trip drains, the collector keeps forming the
-	// next window. Pool.Get hands each dispatch its own connection
-	// (pool limit is unlimited by default).
-	inflight chan struct{}
+	// work queues finished windows for the group's two persistent
+	// workers: pipeline depth 2 (while one round-trip drains, the
+	// collector forms the next window; Pool.Get hands each dispatch
+	// its own connection, pool limit is unlimited by default). A
+	// send blocks when both slots are busy: the natural backpressure.
+	work chan []*batchSlot
+
+	// slotFree recycles slots (reply channel included); winFree
+	// recycles window slices; scratchFree the reqs/res arrays. They are
+	// channels, not sync.Pools: a Pool caches per-P and is flushed at
+	// every GC, so on a contended runner (workload goroutines migrate,
+	// collectors are descheduled) Get misses its cache and New re-allocs
+	// per operation. A capacity-bounded channel queue recycles across
+	// goroutines reliably; the caps bound residency, and a full free
+	// list just hands the object to the GC.
+	slotFree    chan *batchSlot
+	winFree     chan []*batchSlot
+	scratchFree chan *batchScratch
+}
+
+// batchScratch is one dispatch's request/reply arrays.
+type batchScratch struct {
+	reqs []sdsnet.BatchReq
+	res  []sdsnet.BatchResult
+}
+
+func (bg *batchGroup) takeSlot() *batchSlot {
+	var s *batchSlot
+	select {
+	case s = <-bg.slotFree:
+	default:
+		s = &batchSlot{reply: make(chan batchSlotResult, 1)}
+	}
+	s.oid, s.inObj, s.p = 0, 0, nil
+	s.abandoned.Store(false)
+	select {
+	case <-s.reply: // defensive: a posted reply nobody drained
+	default:
+	}
+	return s
+}
+
+func (bg *batchGroup) putSlot(s *batchSlot) {
+	s.p = nil
+	select {
+	case bg.slotFree <- s:
+	default: // free list full: let the GC take it
+	}
+}
+
+func (bg *batchGroup) takeWin() []*batchSlot {
+	select {
+	case w := <-bg.winFree:
+		return w[:0]
+	default:
+		return make([]*batchSlot, 0, batchWindow)
+	}
+}
+
+func (bg *batchGroup) putWin(win []*batchSlot) {
+	for i := range win {
+		win[i] = nil
+	}
+	select {
+	case bg.winFree <- win[:0]:
+	default: // free list full (2 workers): let the GC take it
+	}
+}
+
+func (bg *batchGroup) takeScratch(n int) *batchScratch {
+	var sc *batchScratch
+	select {
+	case sc = <-bg.scratchFree:
+		if cap(sc.reqs) >= n {
+			return sc
+		}
+	default:
+	}
+	// Cold list (or a window larger than anything seen): allocate the
+	// arrays for this size; the next dispatch of the same shape takes
+	// the recycled pair.
+	return &batchScratch{
+		reqs: make([]sdsnet.BatchReq, n),
+		res:  make([]sdsnet.BatchResult, n),
+	}
+}
+
+func (bg *batchGroup) putScratch(sc *batchScratch) {
+	select {
+	case bg.scratchFree <- sc:
+	default: // free list full: let the GC take it
+	}
+}
+
+// post hands a slot its result. The reply value sitting in the
+// buffered channel is the ownership token: the submitter recycles the
+// slot when it takes the reply; a submitter that walked away (sets
+// abandoned before leaving) cedes it, and post steals its own reply
+// back and recycles. Exactly one party ever wins the receive, so the
+// slot is put exactly once and the channel is empty on pool entry.
+func (bg *batchGroup) post(s *batchSlot, r batchSlotResult) {
+	s.reply <- r
+	if s.abandoned.Load() {
+		select {
+		case <-s.reply:
+			bg.putSlot(s)
+		default: // the submitter took the reply: it owns the slot
+		}
+	}
 }
 
 // batchGroupFor returns (creating on demand) the collector for an OSD.
@@ -133,14 +242,24 @@ func (v *Volume) batchGroupFor(ref placement.Ref) (*batchGroup, error) {
 		return nil, err
 	}
 	bg = &batchGroup{
-		pp:       pp,
-		done:     make(chan struct{}),
-		intake:   make(chan *batchSlot, batchIntakeCap),
-		inflight: make(chan struct{}, 2),
+		pp:      pp,
+		done:    make(chan struct{}),
+		intake:  make(chan *batchSlot, batchIntakeCap),
+		work:    make(chan []*batchSlot, 2),
+		winFree: make(chan []*batchSlot, 2),
+		// Every in-flight slot is held by exactly one of: the intake
+		// queue, a window (collector + 2 work slots + in-flight),
+		// transiently by a submitter, or a cancelled sender awaiting
+		// service — this cap covers them all, so steady-state puts
+		// never overflow.
+		slotFree:    make(chan *batchSlot, batchIntakeCap+4*batchWindow+16),
+		scratchFree: make(chan *batchScratch, 4),
 	}
 	v.batchGroups[ref.OSD] = bg
-	v.batchWG.Add(1)
+	v.batchWG.Add(3) // collector + two persistent workers
 	go v.runBatchGroup(bg)
+	go v.batchWorker(bg)
+	go v.batchWorker(bg)
 	return bg, nil
 }
 
@@ -148,18 +267,26 @@ func (v *Volume) batchGroupFor(ref placement.Ref) (*batchGroup, error) {
 func (v *Volume) runBatchGroup(bg *batchGroup) {
 	defer v.batchWG.Done()
 	var win []*batchSlot
-	var timer *time.Timer
-	var fire <-chan time.Time
+	// One timer object for the collector's life: an isolated stream
+	// (queue depth 1) publishes every arrival, so creating a fresh
+	// timer per window would allocate one timer per operation.
+	timer := time.NewTimer(batchWindowDelay)
+	timer.Stop()
+	fire := timer.C
+	armed := false
 	lastArrival := time.Now().Add(-2 * batchWindowDelay)
 	for {
 		select {
 		case <-bg.done:
-			// Release anyone queued so no sender parks forever.
+			// Release anyone queued so no sender parks forever; the
+			// workers see the closed work queue and exit after their
+			// current window.
 			for {
 				select {
 				case s := <-bg.intake:
-					s.reply <- batchSlotResult{transport: ErrClosed}
+					bg.post(s, batchSlotResult{transport: ErrClosed})
 				default:
+					close(bg.work)
 					return
 				}
 			}
@@ -167,9 +294,28 @@ func (v *Volume) runBatchGroup(bg *batchGroup) {
 			isolated := time.Since(lastArrival) > batchWindowDelay
 			lastArrival = time.Now()
 			win = append(win, s)
-			if timer == nil {
-				timer = time.NewTimer(batchWindowDelay)
-				fire = timer.C
+			if len(win) >= batchWindow {
+				if armed {
+					if !timer.Stop() {
+						select {
+						case <-timer.C:
+						default:
+						}
+					}
+					armed = false
+				}
+				win = v.publish(bg, win)
+				continue
+			}
+			if !armed {
+				if !timer.Stop() {
+					select {
+					case <-timer.C:
+					default:
+					}
+				}
+				timer.Reset(batchWindowDelay)
+				armed = true
 			}
 			// Opportunistic dispatch: an arrival that is isolated in
 			// time (a quiet stream, e.g. queue-depth 1) has nothing to
@@ -184,57 +330,56 @@ func (v *Volume) runBatchGroup(bg *batchGroup) {
 					default:
 					}
 				}
-				timer, fire = nil, nil
-				v.launch(bg, win)
-				win = make([]*batchSlot, 0, batchWindow)
+				armed = false
+				win = v.publish(bg, win)
 				continue
 			}
-			if len(win) >= batchWindow {
-				if !timer.Stop() {
-					select {
-					case <-timer.C:
-					default:
-					}
-				}
-				timer, fire = nil, nil
-				v.launch(bg, win)
-				win = make([]*batchSlot, 0, batchWindow)
-			}
 		case <-fire:
-			timer, fire = nil, nil
-			if len(win) > 0 {
-				v.launch(bg, win)
-				win = make([]*batchSlot, 0, batchWindow)
-			}
+			armed = false
+			win = v.publish(bg, win)
 		}
 	}
 }
 
-// launch dispatches a window without blocking the collector: at most
-// two windows per OSD are in flight; when both slots are busy the
-// collector blocks here, which is the natural backpressure (the intake
-// queue absorbs arrivals meanwhile).
-func (v *Volume) launch(bg *batchGroup, win []*batchSlot) {
+// publish hands a finished window to the workers (the bounded work
+// queue IS the pipeline limit: a send blocks while both worker slots
+// are busy, the intake queue absorbs arrivals meanwhile) and returns
+// the recycled slice the collector fills next. Only the collector
+// publishes, and only the collector closes bg.work, so the send can
+// never race the close.
+func (v *Volume) publish(bg *batchGroup, win []*batchSlot) []*batchSlot {
+	if len(win) == 0 {
+		return win
+	}
 	select {
-	case bg.inflight <- struct{}{}:
+	case bg.work <- win:
 	case <-bg.done:
 		for _, s := range win {
-			s.reply <- batchSlotResult{transport: ErrClosed}
+			bg.post(s, batchSlotResult{transport: ErrClosed})
 		}
-		return
+		bg.putWin(win)
 	}
-	v.batchWG.Add(1)
-	go func() {
-		defer v.batchWG.Done()
+	return bg.takeWin()
+}
+
+// batchWorker runs windows off the work queue: persistent goroutines
+// (one per group, two groups' worth of slots), one Batch round-trip at
+// a time each, so forming a window costs no goroutine.
+func (v *Volume) batchWorker(bg *batchGroup) {
+	defer v.batchWG.Done()
+	for win := range bg.work {
 		v.dispatch(bg, win)
-		<-bg.inflight
-	}()
+	}
 }
 
 // dispatch issues the batch and reports per-slot status verbatim.
+// Every slot leaves through bg.post, which routes the slot back to
+// the pool exactly once (submitter-owned slots stay with the
+// submitter).
 func (v *Volume) dispatch(bg *batchGroup, win []*batchSlot) {
-	reqs := make([]sdsnet.BatchReq, len(win))
-	res := make([]sdsnet.BatchResult, len(win))
+	sc := bg.takeScratch(len(win))
+	reqs, res := sc.reqs[:len(win)], sc.res[:len(win)]
+	defer bg.putScratch(sc)
 	for i, s := range win {
 		reqs[i] = sdsnet.BatchReq{
 			Op:     sdsnet.OpRead,
@@ -255,18 +400,20 @@ func (v *Volume) dispatch(bg *batchGroup, win []*batchSlot) {
 		// applies its normal noteFailure + next-replica logic. Pool.Do
 		// already retried the window once on a dead connection.
 		for _, s := range win {
-			s.reply <- batchSlotResult{transport: err}
+			bg.post(s, batchSlotResult{transport: err})
 		}
+		bg.putWin(win)
 		return
 	}
 	for i, s := range win {
 		if i >= len(res) {
 			// Defensive: a short reply array means a desyncing peer.
-			s.reply <- batchSlotResult{transport: sdsnet.ErrProtocol}
+			bg.post(s, batchSlotResult{transport: sdsnet.ErrProtocol})
 			continue
 		}
-		s.reply <- batchSlotResult{n: int(res[i].Value), status: res[i].Status}
+		bg.post(s, batchSlotResult{n: int(res[i].Value), status: res[i].Status})
 	}
+	bg.putWin(win)
 }
 
 // batchRead performs one batched read of p at oid/inObj against ref.
@@ -289,21 +436,22 @@ func (v *Volume) batchRead(ctx context.Context, ref placement.Ref, oid, inObj ui
 	if gerr != nil {
 		return 0, nil, false
 	}
-	s := &batchSlot{
-		oid:   oid,
-		inObj: inObj,
-		p:     p,
-		reply: make(chan batchSlotResult, 1),
-	}
+	s := bg.takeSlot()
+	s.oid, s.inObj, s.p = oid, inObj, p
 	select {
 	case bg.intake <- s:
 	case <-bg.done:
+		bg.putSlot(s)
 		return 0, nil, false
 	case <-ctx.Done():
+		bg.putSlot(s)
 		return 0, ctx.Err(), true
 	}
 	select {
 	case r := <-s.reply:
+		// The reply was ours, so the slot is: recycling here is the
+		// normal (non-abandoned) path and pairs with post's rule.
+		bg.putSlot(s)
 		if r.transport != nil {
 			// A peer without negotiated batch support: stop batching
 			// for this volume (the pool may hand out more such
@@ -320,8 +468,9 @@ func (v *Volume) batchRead(ctx context.Context, ref placement.Ref, oid, inObj ui
 		}
 		return r.n, nil, true
 	case <-bg.done:
-		// Closing mid-flight: abandon the slot. Its reply is a
-		// buffered channel, so the collector's write cannot block.
+		// Closing (or cancelling) mid-flight: abandon the slot. Its
+		// reply is a buffered channel, so the reply write cannot
+		// block, and abandoned transfers recycling ownership to post.
 		s.abandoned.Store(true)
 		return 0, nil, false
 	case <-ctx.Done():

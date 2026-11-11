@@ -3,6 +3,7 @@ package client
 import (
 	"context"
 	"runtime"
+	"runtime/debug"
 	"testing"
 	"time"
 )
@@ -98,6 +99,14 @@ func BenchmarkVolumeRead4K(b *testing.B) {
 // fan-out channels back on the hot path.
 func TestClientZeroAllocGate(t *testing.T) {
 	v, ctx := benchVolume(t)
+	// The gate measures the WriteAt/ReadAt data path, not the placement
+	// refresh. At the bench default (50ms) a throttle-miss refresh costs
+	// a LatestMap + Registry read plus a snapshot compile; on a loaded
+	// CI runner tens of those land inside the measured window and the
+	// gate fails on refresh allocations that have nothing to do with the
+	// data path. Pin the interval so Refresh serves the cached snapshot
+	// for the whole test.
+	v.cluster.SetRefreshInterval(time.Hour)
 	const ops = 2000
 	p := make([]byte, 4096)
 	// Warm the caches (pool connections, store file entries).
@@ -111,6 +120,15 @@ func TestClientZeroAllocGate(t *testing.T) {
 	}
 	var before, after runtime.MemStats
 	runtime.GC()
+	// Freeze the GC across the measured window. sync.Pool is flushed at
+	// every collection, so on a contended CI runner a GC landing inside
+	// the loop empties the payload / connection / completion-channel
+	// pools and the gate then charges the refill churn (bufio buffers,
+	// re-dials, 4 KiB payload allocations) to the data path. The pools
+	// are warm from the loop above; pinning the GC measures the steady
+	// state the pools are meant to provide, not the collector's schedule.
+	gcPrev := debug.SetGCPercent(-1)
+	defer debug.SetGCPercent(gcPrev)
 	runtime.ReadMemStats(&before)
 	for i := 0; i < ops; i++ {
 		off := uint64(i&31) * 4096
