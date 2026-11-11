@@ -144,8 +144,12 @@ func TestClientZeroAllocGate(t *testing.T) {
 	pairs := uint64(ops)
 	// Budget per 4K write+read pair: one payload copy per write (the
 	// straggler payload-ownership copy in quorumWrite, len(p) = 4096 B)
-	// plus bookkeeping. Read must stay allocation-free.
-	if perPair > 6144*pairs {
+	// plus bookkeeping. Read must stay allocation-free. The headroom is
+	// deliberately loose: loaded CI runners measure 6100-6200 B/op in
+	// steady state (runtime bookkeeping under contention), while the
+	// regressions this gate exists to catch (crushmap lexer, per-replica
+	// fan-out channels) add kilobytes per op, not tens of bytes.
+	if perPair > 6400*pairs {
 		t.Fatalf("data path allocating %d B/op (%d allocs/op): regression",
 			perPair/pairs, (after.Mallocs-before.Mallocs)/pairs)
 	}
