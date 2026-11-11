@@ -65,8 +65,14 @@ type uring struct {
 	cqHead, cqTail, cqMask          *uint32
 	cqes                            unsafe.Pointer
 
-	slots []Op
-	ids   chan uint32
+	// slotsMu guards slots[]: the SQE producer writes a slot before
+	// publishing its SQE (sqTail), and the completion loop reads it
+	// after the kernel posts the matching CQE. The kernel mediates the
+	// data dependency, which the race detector cannot see, so the mutex
+	// both serialises the accesses and supplies the happens-before edge.
+	slotsMu sync.Mutex
+	slots   []Op
+	ids     chan uint32
 
 	filesMu sync.Mutex
 	files   []*os.File // keep registered *os.File alive for the ring's lifetime
@@ -254,9 +260,14 @@ func (r *uring) ringSubmit(op Op, batch *[]uint32) {
 		if op.Write {
 			opCode = opWrite
 		}
+		// Publish the slot contents before the SQE: once sqTail is
+		// advanced the kernel may complete it instantly, and the
+		// completion loop must see this op (not a zeroed slot).
+		r.slotsMu.Lock()
+		r.slots[slot] = op
+		r.slotsMu.Unlock()
 		r.fillSqe(idx, opCode, op.Fd, op.Buf, op.Off, uint64(slot))
 		atomic.StoreUint32(r.sqTail, tail+1)
-		r.slots[slot] = op
 		*batch = append(*batch, slot)
 	default:
 		op.Done0(errors.New("iouring: no free slots"))
@@ -284,8 +295,10 @@ func (r *uring) kick(n int, batch []uint32) {
 		consumed = 0 // kernel refused the batch wholesale
 	}
 	for _, slot := range batch[consumed:n] {
+		r.slotsMu.Lock()
 		op := r.slots[slot]
 		r.slots[slot] = Op{}
+		r.slotsMu.Unlock()
 		r.ids <- slot
 		op.Done0(err)
 	}
@@ -310,8 +323,10 @@ func (r *uring) completionLoop() {
 				continue
 			}
 			slot := uint32(userData)
+			r.slotsMu.Lock()
 			op := r.slots[slot]
 			r.slots[slot] = Op{}
+			r.slotsMu.Unlock()
 			r.ids <- slot
 			n := int(res)
 			var err error
