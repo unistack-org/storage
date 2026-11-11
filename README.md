@@ -51,7 +51,7 @@
 | Пакет / команда | Назначение |
 |---|---|
 | `cmd/unistord` | демон SDS: тома, кластер, REST admin API, экспорты (NBD/VDUSE/vhost-user-blk) |
-| `cmd/unistorctl` | CLI: тома, кластер, `export create/ls/rm` |
+| `cmd/unistorctl` | CLI: пулы, тома, кластер, `export create/ls/rm` |
 | `cmd/sdsbench` | бенчмарк data path |
 | `pkg/nbd` | NBD-сервер (stdlib, zero-alloc data path) |
 | `pkg/vduse` | VDUSE (Linux) — userspace virtio-blk бэкенд |
