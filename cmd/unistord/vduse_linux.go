@@ -4,9 +4,12 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
+	"os"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/unistack-org/storage/pkg/client"
@@ -141,6 +144,11 @@ func (m *vduseManager) remove(name string) error {
 	}
 	m.mu.Unlock()
 	if !ok {
+		if _, statErr := os.Stat("/dev/vduse/control"); statErr != nil {
+			// No kernel interface at all: answer like the stub (501),
+			// not as a 500 on a device that could never have existed.
+			return errVDUSEKernelAbsent
+		}
 		return fmt.Errorf("vduse device %q not found", name)
 	}
 	if err := d.dev.Close(); err != nil {
@@ -191,6 +199,11 @@ func (m *vduseManager) create(ctx context.Context, devname, volume string, be vd
 	}, be)
 	if err != nil {
 		stop()
+		if errors.Is(err, syscall.ENOENT) {
+			// /dev/vduse/control (or the device node) missing: the
+			// vduse module is not loaded. Map to 501, not 500.
+			return fmt.Errorf("%w: %v", errVDUSEKernelAbsent, err)
+		}
 		return err
 	}
 	go dev.Serve()

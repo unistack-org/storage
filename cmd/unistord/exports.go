@@ -460,7 +460,7 @@ func (a *adminAPI) exportError(w http.ResponseWriter, name string, err error) {
 		jsonError(w, http.StatusConflict, "export %q is in use", name)
 	case errors.Is(err, meta.ErrNotFound):
 		jsonError(w, http.StatusNotFound, "%v", err)
-	case errors.Is(err, errVDUSEUnsupported):
+	case errors.Is(err, errVDUSEUnsupported), errors.Is(err, errVDUSEKernelAbsent):
 		jsonError(w, http.StatusNotImplemented, "%v", err)
 	case strings.HasPrefix(err.Error(), "nbd: export") && strings.HasSuffix(err.Error(), "not found"):
 		jsonError(w, http.StatusNotFound, "%v", err)

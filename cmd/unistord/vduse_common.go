@@ -56,3 +56,10 @@ func validateDevName(name string) error {
 // errVDUSEUnsupported answers VDUSE operations on platforms without the
 // kernel interface; the linux manager never returns it.
 var errVDUSEUnsupported = errors.New("vduse requires Linux (vduse kernel module); this binary was built for a non-Linux platform")
+
+// errVDUSEKernelAbsent answers VDUSE operations on Linux when the kernel
+// interface is missing: /dev/vduse/control does not exist (the vduse
+// module is not loaded). The admin API maps it to 501, like the
+// cross-platform stub, so a control plane sees "unsupported here", not
+// an internal error.
+var errVDUSEKernelAbsent = errors.New("vduse requires the vduse kernel module on Linux (/dev/vduse/control missing; load it with `modprobe vduse`)")
