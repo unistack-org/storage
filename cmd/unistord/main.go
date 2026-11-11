@@ -8,7 +8,8 @@
 //	unistord -listen :10809 -export vol0=/var/lib/unistord/vol0.img:10G [-readonly vol0] [-trim] [-write-zeroes]
 //	unistord ... -export vol0 -vduse vol0=sds-vol0   # VDUSE virtio-blk device (Linux)
 //	unistord ... -export vol0 -vub vol0=/run/vol0.sock   # vhost-user-blk socket (QEMU/Dragonball)
-//	unistord ... -cluster ... -metrics 0.0.0.0:8080  # Prometheus /metrics endpoint
+//	unistord ... -meta-dir /var/lib/unistord/meta -osd 1@/var/lib/unistord/osd1 ...  # cluster mode
+//	unistord ... -meta-dir ... -metrics 0.0.0.0:8080  # Prometheus /metrics endpoint
 package main
 
 import (
@@ -168,22 +169,24 @@ func main() {
 	prealloc := flag.Bool("preallocate", false, "with -store: fallocate each new object to full size")
 	asyncRing := flag.Int("async-ring", 0, "with -store: route object reads/writes through the async I/O ring (io_uring on Linux, worker-pool fallback elsewhere); value = ring depth, e.g. 128; 0 = plain pread/pwrite")
 	maxConns := flag.Int("max-conns", 0, "max concurrent client connections (0 = unlimited)")
-	clusterDir := flag.String("cluster", "", "meta directory of a cluster (enables clustered exports backed by OSDs)")
+	metaDir := flag.String("meta-dir", "", "meta directory of a cluster (enables clustered exports backed by OSDs): holds the volume/OSD registry, crush epochs, export records and jobs - not the data, which lives in the OSD directories")
+	clusterDir := flag.String("cluster", "", "deprecated alias for -meta-dir")
 	var osds osdFlag
-	flag.Var(&osds, "osd", "with -cluster: start an in-process OSD as id@data-dir[@host:port], repeatable")
-	crushPath := flag.String("crushmap", "", "with -cluster: crushmap file (text/json/binary) to publish")
-	epoch := flag.Uint("epoch", 1, "with -cluster: epoch to publish -crushmap under (must be unique)")
-	pgNum := flag.Int("pg-num", 64, "with -cluster: cluster pg_num for the placement table")
-	replicas := flag.Int("replicas", 3, "with -cluster: replicas per object")
-	minSize := flag.Int("min-size", 0, "with -cluster: write quorum width (0 = replicas/2+1); below it writes fail fast (degraded volume)")
-	rule := flag.String("rule", "", "with -cluster: crush rule name (default: first rule in the map)")
+	flag.Var(&osds, "osd", "with -meta-dir: start an in-process OSD as id@data-dir[@host:port[@ctrl-host:ctrl-port]], repeatable")
+	crushPath := flag.String("crushmap", "", "with -meta-dir: crushmap file (text/json/binary) to publish")
+	epoch := flag.Uint("epoch", 1, "with -meta-dir: epoch to publish -crushmap under (must be unique)")
+	pgNum := flag.Int("pg-num", 64, "with -meta-dir: cluster pg_num for the placement table")
+	replicas := flag.Int("replicas", 3, "with -meta-dir: replicas per object")
+	minSize := flag.Int("min-size", 0, "with -meta-dir: write quorum width (0 = replicas/2+1); below it writes fail fast (degraded volume)")
+	rule := flag.String("rule", "", "with -meta-dir: crush rule name (default: first rule in the map)")
 	var creates exportFlag
-	flag.Var(&creates, "create", "with -cluster: create volume name:size if absent, repeatable")
+	flag.Var(&creates, "create", "with -meta-dir: create volume name:size if absent, repeatable")
 	flag.Var(&exports, "export", "export spec name=path[:size] (file/-store) or name (cluster), repeatable")
 	var vduseSpecs exportFlag
 	flag.Var(&vduseSpecs, "vduse", "export a -export as a VDUSE virtio-blk device (Linux): spec export or export=devname, repeatable")
 	var vubSpecs exportFlag
-	flag.Var(&vubSpecs, "vub", "export a -export as a vhost-user-blk unix socket (QEMU/Dragonball): spec export or export=socket[:ro], repeatable")
+	flag.Var(&vubSpecs, "vhost-user-blk", "export a -export as a vhost-user-blk unix socket (QEMU/Dragonball): spec export or export=socket[:ro], repeatable")
+	flag.Var(&vubSpecs, "vub", "deprecated alias of -vhost-user-blk, repeatable")
 	vubQueues := flag.Int("vub-queues", 1, "vhost-user-blk request queues per export (num-queues)")
 	vubWorkers := flag.Int("vub-workers", 4, "vhost-user-blk concurrent in-flight requests per queue")
 	gogc := flag.Int("gogc", 0, "GOGC heap-growth percent (0 = runtime default 100; higher = fewer GC cycles, more memory)")
@@ -193,18 +196,18 @@ func main() {
 	var qosSpecs qosFlag
 	flag.Var(&qosSpecs, "qos", "per-export limits name=riops:rbps:wiops:wbps (bandwidth accepts K/M/G/T, 0/empty = unlimited), repeatable; applies to -export exports and cluster exports")
 	var qosClasses qosFlag
-	flag.Var(&qosClasses, "qos-class", "with -cluster: register a QoS class name=riops:rbps:wiops:wbps in meta (volumes reference it via QoSTemplate), repeatable")
-	osdQoS := flag.String("osd-qos", "", "with -cluster: aggregate limits per in-process OSD riops:rbps:wiops:wbps (the per-disk ceiling shared by all volumes on it; 0/empty = unlimited)")
-	httpAddr := flag.String("http", "", "with -cluster: admin HTTP API on this address (e.g. 127.0.0.1:8443; empty = disabled): volumes, QoS, import/export over octet-stream, runtime exports")
+	flag.Var(&qosClasses, "qos-class", "with -meta-dir: register a QoS class name=riops:rbps:wiops:wbps in meta (volumes reference it via QoSTemplate), repeatable")
+	osdQoS := flag.String("osd-qos", "", "with -meta-dir: aggregate limits per in-process OSD riops:rbps:wiops:wbps (the per-disk ceiling shared by all volumes on it; 0/empty = unlimited)")
+	httpAddr := flag.String("http", "", "with -meta-dir: admin HTTP API on this address (e.g. 127.0.0.1:8443; empty = disabled): volumes, QoS, import/export over octet-stream, runtime exports")
 	adminToken := flag.String("admin-token", "", "with -http: require Authorization: Bearer <token> on every admin endpoint except /healthz (the export endpoints attach volumes to VMs, so a control plane on a shared network must authenticate; empty = no auth)")
-	metricsAddr := flag.String("metrics", "", "with -cluster: Prometheus metrics endpoint (VictoriaMetrics scrape target) on this address, served at http://<addr>/metrics (e.g. 0.0.0.0:8080; empty = disabled). Independent of -http: metrics are served only here, never on the admin API")
+	metricsAddr := flag.String("metrics", "", "with -meta-dir: Prometheus metrics endpoint (VictoriaMetrics scrape target) on this address, served at http://<addr>/metrics (e.g. 0.0.0.0:8080; empty = disabled). Independent of -http: metrics are served only here, never on the admin API")
 	commit := flag.String("commit", "none", "durability of OSD/-store writes: none (page cache; a guest FLUSH/FUA syncs the disk), flush (fsync every write/punch), sync (O_SYNC at open; on macOS degrades to flush semantics), journal (append to a write-ahead log + fsync per write, background flattening into objects; fastest safe mode for small random writes)")
 	fsyncBatch := flag.Duration("fsync-batch", 0, "with -commit none: coalesce Sync() calls that land within this window (e.g. 2ms) into one fsync pass (0 = fsync disk on every sync request)")
 	intentLog := flag.Bool("intent", false, "with -commit none|flush|sync (OSD and -store exports): keep a write intent log (vitastor-ideas §2.1) — every write is announced before its data and verified at reopen, so a power loss produces a loud damage report (status warnings, unistor_osd_intent mismatches) instead of silent corruption. Ignored in -commit journal mode (the WAL already rebuilds objects)")
-	vacuumInterval := flag.Int("vacuum-interval", 0, "with -cluster: seconds between background vacuums that unlink deleted volumes' objects from the OSDs (0 = off; the admin API and unistorctl vacuum run are the manual triggers)")
-	raftAddr := flag.String("raft", "", "with -cluster: replicate meta over raft on this bind address (host:port). Reads always work; writes need a quorum, without one the meta is read-only (503 on the admin API). A node with -raft but no -osd/-export is a storage-less witness voter")
+	vacuumInterval := flag.Int("vacuum-interval", 0, "with -meta-dir: seconds between background vacuums that unlink deleted volumes' objects from the OSDs (0 = off; the admin API and unistorctl vacuum run are the manual triggers)")
+	raftAddr := flag.String("raft", "", "with -meta-dir: replicate meta over raft on this bind address (host:port). Reads always work; writes need a quorum, without one the meta is read-only (503 on the admin API). A node with -raft but no -osd/-export is a storage-less witness voter")
 	raftPeers := flag.String("raft-peers", "", "with -raft: FULL voter set as comma-separated host:port (including this node), e.g. 10.0.0.1:9401,10.0.0.2:9401,10.0.0.3:9401")
-	raftDir := flag.String("raft-dir", "", "with -raft: raft data directory (default: <cluster>/raft)")
+	raftDir := flag.String("raft-dir", "", "with -raft: raft data directory (default: <meta-dir>/raft)")
 	raftProxy := flag.String("raft-proxy", "", "with -raft: serve write forwarding on this host:port, so writes that reach a follower are relayed to the leader (recommended; use the storage net)")
 	raftProxyPeers := flag.String("raft-proxy-peers", "", "with -raft-proxy: proxy addresses parallel to -raft-peers (same order, including this node), e.g. 10.0.0.1:9501,10.0.0.2:9501,10.0.0.3:9501")
 	tlsCert := flag.String("tls-cert", "", "PEM certificate (with -tls-key): enables mutual TLS on the OSD data plane, raft transport and the admin API; the certificate must list the node's dial addresses (IPs included) as SANs")
@@ -236,6 +239,26 @@ func main() {
 	}
 
 	logger := log.New(os.Stderr, "unistord: ", log.LstdFlags|log.Lmsgprefix)
+
+	// -cluster was the original name of -meta-dir. It stays accepted (units
+	// and scripts in the field use it), but the canonical spelling is
+	// -meta-dir, which says what the directory is and matches unistorctl.
+	clusterPath := *metaDir
+	if *clusterDir != "" {
+		if clusterPath != "" && clusterPath != *clusterDir {
+			logger.Fatalf("-meta-dir and -cluster point to different directories (%q and %q); use only -meta-dir", clusterPath, *clusterDir)
+		}
+		clusterPath = *clusterDir
+		logger.Printf("flag -cluster is deprecated, it is the same as -meta-dir (%s)", *clusterDir)
+	}
+
+	// -vub was the original short name of -vhost-user-blk. The export TYPE on
+	// the wire is "vhost-user-blk" too; the old spelling keeps working here.
+	flag.Visit(func(f *flag.Flag) {
+		if f.Name == "vub" {
+			logger.Printf("flag -vub is deprecated, it is the same as -vhost-user-blk")
+		}
+	})
 
 	commitMode, err := store.ParseCommitMode(*commit)
 	if err != nil {
@@ -313,7 +336,7 @@ func main() {
 
 	// Clustered mode: exports are volumes placed by CRUSH across OSDs
 	// (this process hosts -osd daemons; peers may run in other unistord).
-	if *clusterDir != "" {
+	if clusterPath != "" {
 		if *raftAddr != "" && *raftPeers == "" {
 			logger.Fatalf("-raft requires -raft-peers (the full voter set)")
 		}
@@ -329,7 +352,7 @@ func main() {
 		if *raftAddr != "" {
 			dir := *raftDir
 			if dir == "" {
-				dir = filepath.Join(*clusterDir, "raft")
+				dir = filepath.Join(clusterPath, "raft")
 			}
 			var peers []string
 			for _, p := range strings.Split(*raftPeers, ",") {
@@ -367,7 +390,7 @@ func main() {
 				logger.Printf("raft write forwarding on %s (leaders writes are relayed to the leader)", *raftProxy)
 			}
 		} else {
-			ds, err := meta.OpenDir(*clusterDir)
+			ds, err := meta.OpenDir(clusterPath)
 			if err != nil {
 				logger.Fatalf("meta: %v", err)
 			}
@@ -460,7 +483,7 @@ func main() {
 			var err error
 			es, err = clusterExports(ctx, clusterParams{
 				store:      ms,
-				metaDir:    *clusterDir,
+				metaDir:    clusterPath,
 				osds:       osds,
 				crushmap:   *crushPath,
 				epoch:      uint32(*epoch),

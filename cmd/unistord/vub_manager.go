@@ -64,16 +64,16 @@ func (m *vubManager) start(ctx context.Context, es []*nbd.Export, specs []string
 		expName, sock, ro := parseVUBSpec(spec)
 		e, ok := byName[expName]
 		if !ok {
-			return fmt.Errorf("-vub %q: no such -export", spec)
+			return fmt.Errorf("-vhost-user-blk %q: no such -export", spec)
 		}
 		if err := validateVUBSocket(sock); err != nil {
-			return fmt.Errorf("-vub %q: %w", spec, err)
+			return fmt.Errorf("-vhost-user-blk %q: %w", spec, err)
 		}
 		ro = ro || e.ReadOnly
 		// nbd.Backend and vduse.Backend are the same method set, so the
 		// export backend satisfies the vub backend interface directly.
 		if err := m.create(ctx, expName, "", sock, e.Backend, e.Backend.Size(), ro); err != nil {
-			return fmt.Errorf("-vub %q: %w", spec, err)
+			return fmt.Errorf("-vhost-user-blk %q: %w", spec, err)
 		}
 	}
 	return nil
@@ -92,7 +92,7 @@ func (m *vubManager) add(volume, name string, cl *client.Cluster, spec meta.Volu
 	}
 	m.mu.Unlock()
 	if cl == nil {
-		return vubDeviceInfo{}, false, fmt.Errorf("runtime vub exports need cluster mode (-cluster)")
+		return vubDeviceInfo{}, false, fmt.Errorf("runtime vhost-user-blk exports need cluster mode (-meta-dir)")
 	}
 	if _, err := cl.Refresh(context.Background()); err != nil {
 		return vubDeviceInfo{}, false, fmt.Errorf("placement: %w", err)
@@ -127,7 +127,7 @@ func (m *vubManager) remove(name string) error {
 	}
 	m.mu.Unlock()
 	if !ok {
-		return fmt.Errorf("vub export %q not found", name)
+		return fmt.Errorf("vhost-user-blk export %q not found", name)
 	}
 	if d.stop != nil {
 		d.stop()
@@ -157,10 +157,10 @@ func (m *vubManager) create(ctx context.Context, name, volume, sock string, be v
 	_, dup := m.devs[name]
 	m.mu.Unlock()
 	if dup {
-		return fmt.Errorf("vub export %q already exists", name)
+		return fmt.Errorf("vhost-user-blk export %q already exists", name)
 	}
 	if err := os.MkdirAll(filepath.Dir(sock), 0o755); err != nil {
-		return fmt.Errorf("vub: socket dir: %w", err)
+		return fmt.Errorf("vhost-user-blk: socket dir: %w", err)
 	}
 	run, stop := context.WithCancel(ctx)
 	exp, err := vub.Listen(sock, be, size, vub.Options{
@@ -185,11 +185,11 @@ func (m *vubManager) create(ctx context.Context, name, volume, sock string, be v
 		m.mu.Unlock()
 		stop()
 		_ = exp.Close()
-		return fmt.Errorf("vub export %q already exists", name)
+		return fmt.Errorf("vhost-user-blk export %q already exists", name)
 	}
 	m.devs[name] = &vubDevice{name: name, volume: volume, socket: sock, readOnly: readOnly, size: size, exp: exp, stop: stop}
 	m.mu.Unlock()
-	m.logger.Printf("vub %q -> %s (volume %q, %s, ro=%v): attach with `-chardev socket,id=%s,path=%s -device vhost-user-blk-pci,chardev=%s`",
+	m.logger.Printf("vhost-user-blk %q -> %s (volume %q, %s, ro=%v): attach with `-chardev socket,id=%s,path=%s -device vhost-user-blk-pci,chardev=%s`",
 		name, sock, volume, humanSize(size), readOnly, qdevID(name), sock, qdevID(name))
 	return nil
 }
@@ -234,7 +234,7 @@ func (m *vubManager) closeAll() {
 			d.stop()
 		}
 		if err := d.exp.Close(); err != nil {
-			m.logger.Printf("vub %s close: %v", d.name, err)
+			m.logger.Printf("vhost-user-blk %s close: %v", d.name, err)
 		}
 	}
 }

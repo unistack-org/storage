@@ -45,22 +45,26 @@ func parseVUBSpec(spec string) (exp, sock string, readOnly bool) {
 	return exp, rest, readOnly
 }
 
+// runtimeVUBSocketDir is the directory a runtime (admin API) vub export
+// derives its socket from. Tests point it at a temp dir.
+var runtimeVUBSocketDir = "/var/run/unistord"
+
 func defaultVUBSocket(exp string) string {
-	return filepath.Join("/var/run/unistord", exp+".sock")
+	return filepath.Join(runtimeVUBSocketDir, exp+".sock")
 }
 
 // validateVUBSocket keeps socket paths out of surprising territory:
 // absolute, no traversal past cleaning.
 func validateVUBSocket(p string) error {
 	if p == "" {
-		return errors.New("vub: socket path is empty")
+		return errors.New("vhost-user-blk: socket path is empty")
 	}
 	if !filepath.IsAbs(p) {
-		return errors.New("vub: socket path must be absolute")
+		return errors.New("vhost-user-blk: socket path must be absolute")
 	}
 	if len(p) > 107 {
 		// The unix socket address limit (108 bytes incl. NUL).
-		return errors.New("vub: socket path too long (>107 bytes)")
+		return errors.New("vhost-user-blk: socket path too long (>107 bytes)")
 	}
 	return nil
 }

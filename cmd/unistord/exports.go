@@ -89,7 +89,7 @@ func (h *exportHub) addNBD(name string, readOnly bool) (nbd.ExportInfo, bool, er
 		}
 	}
 	if h.clusterClient() == nil {
-		return nbd.ExportInfo{}, false, fmt.Errorf("runtime exports need cluster mode (-cluster)")
+		return nbd.ExportInfo{}, false, fmt.Errorf("runtime exports need cluster mode (-meta-dir)")
 	}
 	vol, err := h.clusterClient().OpenVolume(context.Background(), name)
 	if err != nil {
@@ -144,7 +144,7 @@ func (h *exportHub) list() map[string]any {
 		out["vduse"] = h.vduse.list()
 	}
 	if h.vub != nil {
-		out["vub"] = h.vub.list()
+		out["vhost-user-blk"] = h.vub.list()
 	}
 	return out
 }
@@ -154,9 +154,25 @@ func (h *exportHub) list() map[string]any {
 // exportRequest is the POST /v1/exports body.
 type exportRequest struct {
 	Volume   string `json:"volume"`
-	Type     string `json:"type"`      // "nbd" (default) | "vduse" | "vub"
-	DevName  string `json:"devname"`   // vduse: kernel device name; vub: export name (both optional for vub)
+	Type     string `json:"type"`      // "nbd" (default) | "vduse" | "vhost-user-blk" (legacy alias "vub")
+	DevName  string `json:"devname"`   // vduse: kernel device name; vhost-user-blk: export name (optional)
 	ReadOnly bool   `json:"read_only"` // serve the device/export read-only
+}
+
+// normalizeExportType maps the accepted spellings of a transport onto the
+// canonical name used on the wire, in meta records and in replies.
+// "vhost-user-blk" is that canonical name (it matches the QEMU device
+// name); "vub" is the legacy short form, accepted inbound for callers
+// (and meta records) written before the rename. Empty means the default
+// transport. An unknown type returns ok=false.
+func normalizeExportType(typ string) (string, bool) {
+	switch typ {
+	case "", "nbd", "vduse", "vhost-user-blk":
+		return typ, true
+	case "vub", "vhost_user_blk", "vhostuserblk", "vhost-user":
+		return "vhost-user-blk", true
+	}
+	return "", false
 }
 
 // handleAddExport creates a runtime export. The read_only flag is
@@ -173,7 +189,11 @@ func (a *adminAPI) handleAddExport(w http.ResponseWriter, r *http.Request) {
 		jsonError(w, http.StatusBadRequest, "bad volume name")
 		return
 	}
-	typ := req.Type
+	typ, okType := normalizeExportType(req.Type)
+	if !okType {
+		jsonError(w, http.StatusBadRequest, "type must be nbd, vduse or vhost-user-blk")
+		return
+	}
 	if typ == "" {
 		typ = "nbd"
 	}
@@ -244,9 +264,9 @@ func (a *adminAPI) handleAddExport(w http.ResponseWriter, r *http.Request) {
 		}
 		writeJSON(w, code, map[string]any{"type": "vduse", "name": req.DevName, "volume": req.Volume,
 			"read_only": req.ReadOnly, "size": spec.Size})
-	case "vub":
+	case "vhost-user-blk":
 		if a.exports.vub == nil {
-			jsonError(w, http.StatusServiceUnavailable, "vub exports are not enabled")
+			jsonError(w, http.StatusServiceUnavailable, "vhost-user-blk exports are not enabled")
 			return
 		}
 		if req.ReadOnly {
@@ -276,16 +296,16 @@ func (a *adminAPI) handleAddExport(w http.ResponseWriter, r *http.Request) {
 			a.exportError(w, name, err)
 			return
 		}
-		a.persistExport("vub", info.Name, req.Volume, req.ReadOnly)
+		a.persistExport("vhost-user-blk", info.Name, req.Volume, req.ReadOnly)
 		code := http.StatusOK
 		if created {
 			code = http.StatusCreated
-			a.logger.Printf("admin: vub socket %s -> volume %q (%s, ro=%v)", info.Socket, req.Volume, humanSize(info.Size), req.ReadOnly)
+			a.logger.Printf("admin: vhost-user-blk socket %s -> volume %q (%s, ro=%v)", info.Socket, req.Volume, humanSize(info.Size), req.ReadOnly)
 		}
-		writeJSON(w, code, map[string]any{"type": "vub", "name": info.Name, "socket": info.Socket,
+		writeJSON(w, code, map[string]any{"type": "vhost-user-blk", "name": info.Name, "socket": info.Socket,
 			"volume": req.Volume, "read_only": req.ReadOnly, "size": info.Size})
 	default:
-		jsonError(w, http.StatusBadRequest, "type must be nbd, vduse or vub")
+		jsonError(w, http.StatusBadRequest, "type must be nbd, vduse or vhost-user-blk")
 	}
 }
 
@@ -301,7 +321,12 @@ func (a *adminAPI) handleDeleteExport(w http.ResponseWriter, r *http.Request) {
 		jsonError(w, http.StatusServiceUnavailable, "runtime exports are not enabled (cluster mode required)")
 		return
 	}
-	switch r.URL.Query().Get("type") {
+	typ, okType := normalizeExportType(r.URL.Query().Get("type"))
+	if !okType {
+		jsonError(w, http.StatusBadRequest, "type must be nbd, vduse or vhost-user-blk")
+		return
+	}
+	switch typ {
 	case "", "nbd":
 		if err := a.exports.removeNBD(name); err != nil {
 			a.exportError(w, name, err)
@@ -318,20 +343,23 @@ func (a *adminAPI) handleDeleteExport(w http.ResponseWriter, r *http.Request) {
 		a.forgetExport("vduse", name)
 		a.logger.Printf("admin: removed vduse device %q", name)
 		writeJSON(w, http.StatusOK, map[string]any{"type": "vduse", "name": name, "removed": true})
-	case "vub":
+	case "vhost-user-blk":
 		if a.exports.vub == nil {
-			jsonError(w, http.StatusServiceUnavailable, "vub exports are not enabled")
+			jsonError(w, http.StatusServiceUnavailable, "vhost-user-blk exports are not enabled")
 			return
 		}
 		if err := a.exports.vub.remove(name); err != nil {
 			a.exportError(w, name, err)
 			return
 		}
+		// Records written before the rename carry the legacy short name;
+		// forget both spellings so the old key never survives.
+		a.forgetExport("vhost-user-blk", name)
 		a.forgetExport("vub", name)
-		a.logger.Printf("admin: removed vub export %q", name)
-		writeJSON(w, http.StatusOK, map[string]any{"type": "vub", "name": name, "removed": true})
+		a.logger.Printf("admin: removed vhost-user-blk export %q", name)
+		writeJSON(w, http.StatusOK, map[string]any{"type": "vhost-user-blk", "name": name, "removed": true})
 	default:
-		jsonError(w, http.StatusBadRequest, "type must be nbd, vduse or vub")
+		jsonError(w, http.StatusBadRequest, "type must be nbd, vduse or vhost-user-blk")
 	}
 }
 
@@ -428,15 +456,20 @@ func (a *adminAPI) replayExports(ctx context.Context) {
 			} else if created {
 				a.logger.Printf("admin: export replay: vduse %q -> %q restored (ro=%v)", rec.Name, rec.Volume, rec.ReadOnly)
 			}
-		case "vub":
+		case "vhost-user-blk", "vub": // "vub" = records written before the rename
 			if a.exports.vub == nil {
 				continue
 			}
 			_, created, err := a.exports.vub.add(rec.Volume, rec.Name, a.cl, spec, rec.ReadOnly)
 			if err != nil {
-				a.logger.Printf("admin: export replay: vub %q: %v", rec.Name, err)
+				a.logger.Printf("admin: export replay: vhost-user-blk %q: %v", rec.Name, err)
 			} else if created {
-				a.logger.Printf("admin: export replay: vub %q -> %q restored (ro=%v)", rec.Name, rec.Volume, rec.ReadOnly)
+				a.logger.Printf("admin: export replay: vhost-user-blk %q -> %q restored (ro=%v)", rec.Name, rec.Volume, rec.ReadOnly)
+			}
+			if rec.Type == "vub" {
+				// Migrate the legacy record onto the canonical type name.
+				a.persistExport("vhost-user-blk", rec.Name, rec.Volume, rec.ReadOnly)
+				a.forgetExport("vub", rec.Name)
 			}
 		}
 	}
@@ -444,7 +477,7 @@ func (a *adminAPI) replayExports(ctx context.Context) {
 
 func (a *adminAPI) handleListExports(w http.ResponseWriter, r *http.Request) {
 	if a.exports == nil {
-		writeJSON(w, http.StatusOK, map[string]any{"nbd": []nbd.ExportInfo{}, "vduse": []vduseDeviceInfo{}, "vub": []vubDeviceInfo{}})
+		writeJSON(w, http.StatusOK, map[string]any{"nbd": []nbd.ExportInfo{}, "vduse": []vduseDeviceInfo{}, "vhost-user-blk": []vubDeviceInfo{}})
 		return
 	}
 	writeJSON(w, http.StatusOK, a.exports.list())

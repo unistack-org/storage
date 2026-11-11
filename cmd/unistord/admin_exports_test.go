@@ -1,16 +1,19 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -137,6 +140,49 @@ func TestAdminExportEndpoints(t *testing.T) {
 	code, _ = doAdminBody(t, h, http.MethodDelete, "/v1/exports/vol-a", "")
 	if code != http.StatusNotFound {
 		t.Fatalf("remove twice: %d, want 404", code)
+	}
+}
+
+// TestAdminExportTypeAlias: the old shorthand "vub" is accepted on create
+// and delete, while every reply and the list key use the canonical name
+// "vhost-user-blk".
+func TestAdminExportTypeAlias(t *testing.T) {
+	dir := t.TempDir()
+	runtimeVUBSocketDir = dir
+	t.Cleanup(func() { runtimeVUBSocketDir = "/var/run/unistord" })
+
+	env := startHubEnv(t)
+	h := env.admin.srv.Handler
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	if _, err := env.cl.CreateVolume(ctx, "alias-vol", 4<<20, 0, 3, 0, 64, "data"); err != nil {
+		t.Fatal(err)
+	}
+
+	code, info := doAdminBody(t, h, http.MethodPost, "/v1/exports", `{"volume":"alias-vol","type":"vub"}`)
+	if code != http.StatusCreated {
+		t.Fatalf("POST type=vub: %d %+v", code, info)
+	}
+	if info["type"] != "vhost-user-blk" || info["name"] != "alias-vol" {
+		t.Fatalf("alias reply must carry the canonical type: %+v", info)
+	}
+	if info["socket"] != filepath.Join(dir, "alias-vol.sock") {
+		t.Fatalf("socket: %+v", info)
+	}
+	_, lst := doAdminJSON(t, h, http.MethodGet, "/v1/exports")
+	vubs, _ := lst["vhost-user-blk"].([]any)
+	if len(vubs) != 1 {
+		t.Fatalf("list: %+v", lst)
+	}
+
+	code, _ = doAdminBody(t, h, http.MethodDelete, "/v1/exports/alias-vol?type=vub", "")
+	if code != http.StatusOK {
+		t.Fatalf("DELETE type=vub: %d, want 200", code)
+	}
+	_, lst = doAdminJSON(t, h, http.MethodGet, "/v1/exports")
+	vubs, _ = lst["vhost-user-blk"].([]any)
+	if len(vubs) != 0 {
+		t.Fatalf("list after alias delete: %+v", lst)
 	}
 }
 
@@ -365,6 +411,221 @@ func waitJob(t *testing.T, h http.Handler, id string, timeout time.Duration) map
 	}
 	t.Fatalf("job %s did not finish in %s", id, timeout)
 	return nil
+}
+
+// ---------- checksum files ----------
+
+// TestImportChecksumFile drives the sha256_url form of the import: the
+// caller names a checksum file next to the image, the daemon fetches
+// and parses it before the first byte is written, and the digest then
+// verifies the transfer. A digest that cannot be resolved is a hard
+// failure answered on the request — an import that cannot be verified
+// must never be accepted.
+func TestImportChecksumFile(t *testing.T) {
+	env := startHubEnv(t)
+	h := env.admin.srv.Handler
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	if _, err := env.cl.CreateVolume(ctx, "chk", 8<<20, 0, 3, 0, 64, "data"); err != nil {
+		t.Fatal(err)
+	}
+
+	payload := make([]byte, 1<<20)
+	for i := range payload {
+		payload[i] = byte(i * 7)
+	}
+	sum := sha256.Sum256(payload)
+	hexsum := hex.EncodeToString(sum[:])
+	osum := sha256.Sum256([]byte("other image"))
+	other := hex.EncodeToString(osum[:])
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/img.iso", func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write(payload) })
+	serve := func(body string) func(http.ResponseWriter, *http.Request) {
+		return func(w http.ResponseWriter, r *http.Request) { _, _ = io.WriteString(w, body) }
+	}
+	// The formats publishers ship, all naming the digest of the image.
+	mux.HandleFunc("/sums", serve(hexsum+"  img.iso\n"))
+	mux.HandleFunc("/binary", serve(hexsum+" *img.iso\r\n"))
+	mux.HandleFunc("/bare", serve(hexsum+"\n"))
+	mux.HandleFunc("/prefixed", serve("sha256:"+hexsum+"\n"))
+	mux.HandleFunc("/gostyle", serve("SHA256(img.iso)= "+hexsum+"\n"))
+	mux.HandleFunc("/named-multi", serve(other+"  a.iso\n"+hexsum+"  img.iso\n"))
+	// Unusable listings: the digest is not the image's, is not the
+	// image's line, is ambiguous, or is not a digest at all.
+	mux.HandleFunc("/wrong-file", serve(hexsum+"  other.iso\n"))
+	mux.HandleFunc("/bare-multi", serve(hexsum+"\n"+other+"\n"))
+	mux.HandleFunc("/conflict", serve(hexsum+"  img.iso\n"+other+"  img.iso\n"))
+	mux.HandleFunc("/garbage", serve("see the project page for the digest\n"))
+	mux.HandleFunc("/huge", func(w http.ResponseWriter, r *http.Request) {
+		w.Write(bytes.Repeat([]byte{'a'}, checksumMaxBytes+1))
+	})
+	src := httptest.NewServer(mux)
+	defer src.Close()
+
+	for _, tc := range []struct{ path, want string }{
+		{"/sums", ""}, {"/binary", ""}, {"/bare", ""}, {"/prefixed", ""},
+		{"/gostyle", ""}, {"/named-multi", ""},
+		{"/wrong-file", `no line for "img.iso"`},
+		{"/bare-multi", "several digests"},
+		{"/conflict", "several digests"},
+		{"/garbage", "no sha256 digest"},
+		{"/huge", "over"},
+	} {
+		code, msg := rawAdmin(t, h, http.MethodPost, "/v1/volumes/chk/import",
+			fmt.Sprintf(`{"url":%q,"sha256_url":%q}`, src.URL+"/img.iso", src.URL+tc.path))
+		if tc.want == "" {
+			if code != http.StatusAccepted {
+				t.Fatalf("%s: import: %d %s", tc.path, code, msg)
+			}
+			continue
+		}
+		if code != http.StatusBadGateway {
+			t.Fatalf("%s: unusable checksum: %d %s, want 502", tc.path, code, msg)
+		}
+		if !strings.Contains(msg, tc.want) {
+			t.Fatalf("%s: error %q must mention %q", tc.path, msg, tc.want)
+		}
+	}
+
+	// The digest from the checksum file really verifies the bytes: a
+	// listing that is valid but describes a different image fails the
+	// job, and the job record shows where the digest came from.
+	mux.HandleFunc("/stale", serve(other+"  img.iso\n"))
+	code, resp := doAdminBody(t, h, http.MethodPost, "/v1/volumes/chk/import",
+		fmt.Sprintf(`{"url":%q,"sha256_url":%q,"offset":%d}`, src.URL+"/img.iso", src.URL+"/stale", 2<<20))
+	if code != http.StatusAccepted {
+		t.Fatalf("stale checksum: %d %+v", code, resp)
+	}
+	job := waitJob(t, h, resp["job_id"].(string), 30*time.Second)
+	if job["state"] != "failed" || !strings.Contains(fmt.Sprint(job["error"]), "sha256 mismatch") {
+		t.Fatalf("stale-checksum job: %+v", job)
+	}
+	if job["sha256_url"] != src.URL+"/stale" || job["sha256"] != other {
+		t.Fatalf("job must record the resolved digest and its source: %+v", job)
+	}
+
+	// A checksum URL that is unreachable, or that answers an error,
+	// fails the request: nothing is imported on trust.
+	mux.HandleFunc("/missing", func(w http.ResponseWriter, r *http.Request) {
+		http.NotFound(w, r)
+	})
+	for _, bad := range []string{src.URL + "/missing", "http://127.0.0.1:1/none"} {
+		code, msg := rawAdmin(t, h, http.MethodPost, "/v1/volumes/chk/import",
+			fmt.Sprintf(`{"url":%q,"sha256_url":%q}`, src.URL+"/img.iso", bad))
+		if code != http.StatusBadGateway {
+			t.Fatalf("checksum %s: %d %s, want 502", bad, code, msg)
+		}
+	}
+
+	// Inline digest and checksum file are alternatives, and the file
+	// URL is validated with the rules of a URL the daemon will fetch.
+	code, _ = doAdminBody(t, h, http.MethodPost, "/v1/volumes/chk/import",
+		fmt.Sprintf(`{"url":%q,"sha256":%q,"sha256_url":%q}`, src.URL+"/img.iso", hexsum, src.URL+"/sums"))
+	if code != http.StatusBadRequest {
+		t.Fatalf("both digests: %d, want 400", code)
+	}
+	code, _ = doAdminBody(t, h, http.MethodPost, "/v1/volumes/chk/import",
+		fmt.Sprintf(`{"url":%q,"sha256_url":"ftp://x/sums"}`, src.URL+"/img.iso"))
+	if code != http.StatusBadRequest {
+		t.Fatalf("ftp checksum: %d, want 400", code)
+	}
+	// The checksum URL must not be fetched for a volume that does not
+	// exist (404, and "нельзя импортировать в никуда").
+	code, _ = doAdminBody(t, h, http.MethodPost, "/v1/volumes/ghost/import",
+		fmt.Sprintf(`{"url":%q,"sha256_url":%q}`, src.URL+"/img.iso", src.URL+"/sums"))
+	if code != http.StatusNotFound {
+		t.Fatalf("ghost volume: %d, want 404", code)
+	}
+
+	// Synchronous mode resolves the checksum file too.
+	code, resp = doAdminBody(t, h, http.MethodPost, "/v1/volumes/chk/import",
+		fmt.Sprintf(`{"url":%q,"sha256_url":%q,"offset":%d,"async":false}`,
+			src.URL+"/img.iso", src.URL+"/sums", 4<<20))
+	if code != http.StatusOK || resp["written"] != float64(len(payload)) {
+		t.Fatalf("sync import with a checksum file: %d %+v", code, resp)
+	}
+}
+
+// TestImportChecksumFileGuarded proves the checksum fetch is served by
+// the guarded client: an address the SSRF policy blocks is refused
+// before the transfer, and the origin never sees the request.
+func TestImportChecksumFileGuarded(t *testing.T) {
+	env := startVacuumEnv(t)
+	h := env.admin.srv.Handler
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	if _, err := env.cl.CreateVolume(ctx, "guard-chk", 4<<20, 0, 3, 0, 64, "data"); err != nil {
+		t.Fatal(err)
+	}
+	var hits int
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits++
+		_, _ = io.WriteString(w, strings.Repeat("00", 32)+"\n")
+	}))
+	defer origin.Close()
+
+	guard := newSSRFGuard(false, log.New(io.Discard, "", 0))
+	env.admin.importHTTP = &http.Client{Transport: guard.importTransport(), CheckRedirect: guard.checkRedirect, Timeout: 0}
+
+	body, _ := json.Marshal(map[string]any{
+		"url": "https://mirror.example/img.iso", "sha256_url": origin.URL + "/SHA256SUMS", "async": false,
+	})
+	code, msg := rawAdmin(t, h, http.MethodPost, "/v1/volumes/guard-chk/import", string(body))
+	if code != http.StatusBadGateway {
+		t.Fatalf("guarded checksum fetch: %d %s, want 502", code, msg)
+	}
+	if !strings.Contains(msg, "loopback") {
+		t.Fatalf("error %q must name the policy reason", msg)
+	}
+	if hits != 0 {
+		t.Fatalf("guarded checksum fetch reached the origin (%d hits)", hits)
+	}
+}
+
+// TestParseChecksum covers the checksum-file formats the parser
+// accepts, and the listings it must refuse.
+func TestParseChecksum(t *testing.T) {
+	const digest = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+	const other = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+	for _, tc := range []struct {
+		name, body, image, want, fail string
+	}{
+		{name: "bare", body: digest + "\n", image: "img.iso", want: digest},
+		{name: "upper", body: strings.ToUpper(digest) + "\n", image: "img.iso", want: digest},
+		{name: "prefixed", body: "sha256:" + digest, image: "img.iso", want: digest},
+		{name: "coreutils", body: digest + "  img.iso\n", image: "img.iso", want: digest},
+		{name: "binary", body: digest + " *img.iso\r\n", image: "img.iso", want: digest},
+		{name: "spaces-in-name", body: digest + "  two words.iso\n", image: "two words.iso", want: digest},
+		{name: "gostyle", body: "SHA256(img.iso)= " + digest + "\n", image: "img.iso", want: digest},
+		{name: "multi-picks-image", body: other + "  a.iso\n" + digest + "  img.iso\n", image: "img.iso", want: digest},
+		{name: "path-prefixed-name", body: digest + "  ./dir/img.iso\n", image: "img.iso", want: digest},
+		{name: "escaped-name", body: digest + "  a%20b.iso\n", image: "a b.iso", want: digest},
+		{name: "empty", image: "img.iso", fail: "no sha256 digest"},
+		{name: "garbage", body: "nothing here\n", image: "img.iso", fail: "no sha256 digest"},
+		{name: "short", body: digest[:63] + "\n", image: "img.iso", fail: "no sha256 digest"},
+		{name: "non-hex", body: strings.Repeat("z", 64) + "\n", image: "img.iso", fail: "no sha256 digest"},
+		{name: "other-file", body: digest + "  other.iso\n", image: "img.iso", fail: `no line for "img.iso"`},
+		{name: "bare-ambiguous", body: digest + "\n" + other + "\n", image: "img.iso", fail: "several digests"},
+		{name: "named-ambiguous", body: digest + "  img.iso\n" + other + "  img.iso\n", image: "img.iso", fail: "several digests"},
+		{name: "mixed-forms", body: digest + "\n" + digest + "  img.iso\n", image: "img.iso", want: digest},
+		{name: "bare-ignores-other-names", body: digest + "\n" + other + "  other.iso\n", image: "img.iso", want: digest},
+	} {
+		got, err := parseChecksum(tc.body, tc.image)
+		if tc.fail != "" {
+			if err == nil || !strings.Contains(err.Error(), tc.fail) {
+				t.Errorf("%s: got %q, %v; want error mentioning %q", tc.name, got, err, tc.fail)
+			}
+			continue
+		}
+		if err != nil {
+			t.Errorf("%s: %v", tc.name, err)
+			continue
+		}
+		if got != tc.want {
+			t.Errorf("%s: got %s, want %s", tc.name, got, tc.want)
+		}
+	}
 }
 
 // ---------- minimal NBD client for the hub tests ----------

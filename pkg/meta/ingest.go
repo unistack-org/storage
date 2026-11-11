@@ -2,7 +2,7 @@
 // (so a daemon restart no longer drops job state, and a transfer can
 // be resumed from its persisted offset), per-volume import locks (two
 // concurrent ingests writing one volume would interleave), and runtime
-// export declarations (so NBD/VDUSE/vub exports added over the admin
+// export declarations (so NBD/VDUSE/vhost-user-blk exports added over the admin
 // API are reproduced when the daemon restarts).
 //
 // All three ride the same meta Store (dir-backed or raft-replicated)
@@ -56,8 +56,13 @@ type ImportJobRecord struct {
 	Size int64 `json:"size,omitempty"`
 	// SHA256 is the hex checksum of the source bytes, verified over
 	// exactly the bytes written (on resume: recomputed by re-reading
-	// the volume range).
+	// the volume range). When the caller passed a checksum file, the
+	// daemon resolves it to this digest before the first byte is
+	// written, so a resume needs no second fetch.
 	SHA256 string `json:"sha256,omitempty"`
+	// SHA256URL records that the digest came from a checksum file, so
+	// the job view can show where the digest came from.
+	SHA256URL string `json:"sha256_url,omitempty"`
 	// Written is the bytes landed since Offset.
 	Written int64 `json:"written"`
 	// Error is set on a failed job.
@@ -308,8 +313,8 @@ func ReleaseImportLock(ctx context.Context, s Store, volume, jobID string) error
 // The daemon replays these at boot, so exports of live VMs are
 // reproduced after a restart instead of silently vanishing.
 type ExportRecord struct {
-	Type   string `json:"type"` // "nbd" | "vduse" | "vub"
-	Name   string `json:"name"` // nbd/vub: export name; vduse: devname
+	Type   string `json:"type"` // "nbd" | "vduse" | "vhost-user-blk" (legacy records may say "vub")
+	Name   string `json:"name"` // nbd/vhost-user-blk: export name; vduse: devname
 	Volume string `json:"volume"`
 	// ReadOnly is kept in sync with the volume's read_only flag (that
 	// flag remains the source of truth; this copy documents intent).

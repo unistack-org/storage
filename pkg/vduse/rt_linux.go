@@ -84,11 +84,31 @@ func buildDevConfig(name string, nq uint16, features uint64, config []byte) []by
 	return cfg
 }
 
+// controlPath is the VDUSE control device the kernel module creates when
+// it loads.
+const controlPath = "/dev/vduse/control"
+
+// openControl opens the VDUSE control device. A missing node means the
+// vduse module is not loaded: the kernel autoloads it on the first open
+// only when the module is available and udev/modalias is working, so the
+// error names the fix (deploy/modules-load.d/unistord.conf makes the load
+// automatic at boot).
+func openControl() (*os.File, error) {
+	cf, err := os.OpenFile(controlPath, os.O_RDWR, 0)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, fmt.Errorf("vduse: %s is missing: the vduse kernel module is not loaded - run `modprobe vduse` (and `modprobe virtio_vdpa vdpa` for the QEMU side), or install deploy/modules-load.d/unistord.conf to load it at boot: %w", controlPath, err)
+		}
+		return nil, fmt.Errorf("vduse: open control: %w", err)
+	}
+	return cf, nil
+}
+
 // CreateDevice creates a VDUSE device on /dev/vduse/control.
 func CreateDevice(name string, nq uint16, features uint64, config []byte) error {
-	cf, err := os.OpenFile("/dev/vduse/control", os.O_RDWR, 0)
+	cf, err := openControl()
 	if err != nil {
-		return fmt.Errorf("vduse: open control: %w", err)
+		return err
 	}
 	defer cf.Close()
 	var ver uint64
@@ -113,7 +133,7 @@ func CreateDevice(name string, nq uint16, features uint64, config []byte) error 
 
 // DestroyDevice removes a VDUSE device by name.
 func DestroyDevice(name string) error {
-	cf, err := os.OpenFile("/dev/vduse/control", os.O_RDWR, 0)
+	cf, err := openControl()
 	if err != nil {
 		return err
 	}

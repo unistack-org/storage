@@ -19,7 +19,10 @@ import (
 
 const exportDefaultType = "nbd"
 
-var exportTypes = []string{"nbd", "vduse", "vub"}
+// exportTypes are the export types the CLI (and the API) knows. The
+// vhost-user-blk wire name is the plain protocol name; "vub" is accepted as a
+// shorthand by canonicalExportType and stays the internal Go type name.
+var exportTypes = []string{"nbd", "vduse", "vhost-user-blk"}
 
 // exportCmd dispatches: export create|ls|rm.
 func exportCmd(ctx context.Context, args []string) error {
@@ -54,26 +57,28 @@ func newExportFlags(name string) *exportFlags {
 	f := &exportFlags{fs: fs}
 	f.httpURL = fs.String("http", "http://127.0.0.1:8443", "unistord admin URL")
 	f.token = fs.String("token", "", "admin bearer token (when unistord runs with -admin-token)")
-	f.typ = fs.String("type", exportDefaultType, "export type: nbd | vduse | vub")
+	f.typ = fs.String("type", exportDefaultType, "export type: nbd | vduse | vhost-user-blk (accepted shorthand: vub)")
 	return f
 }
 
 // exportCreateCmd asks the daemon to attach a volume: nbd (kernel nbd
 // client, the default), vduse (virtio-blk via the vduse kernel module,
-// needs -devname, Linux) or vub (vhost-user-blk unix socket for
+// needs -devname, Linux) or vhost-user-blk (unix socket for
 // QEMU/Dragonball).
 func exportCreateCmd(ctx context.Context, args []string) error {
 	f := newExportFlags("export create")
-	devname := f.fs.String("devname", "", "vduse device name (required with -type vduse); vub export name (optional)")
+	devname := f.fs.String("devname", "", "vduse device name (required with -type vduse); vhost-user-blk export name (optional)")
 	ro := f.fs.Bool("ro", false, "serve read-only (persisted on the volume record)")
 	mustParse(f.fs, args)
 	if f.fs.NArg() != 1 {
-		return fmt.Errorf("usage: unistorctl export create <volume> [-type nbd|vduse|vub] [-devname N] [-ro]")
+		return fmt.Errorf("usage: unistorctl export create <volume> [-type nbd|vduse|vhost-user-blk] [-devname N] [-ro]")
 	}
 	volume := f.fs.Arg(0)
-	if err := checkExportType(*f.typ); err != nil {
+	typ, err := canonicalExportType(*f.typ)
+	if err != nil {
 		return err
 	}
+	*f.typ = typ
 	if *f.typ == "vduse" && *devname == "" {
 		return fmt.Errorf("export: -type vduse needs -devname (the kernel device name)")
 	}
@@ -105,7 +110,7 @@ func exportCreateCmd(ctx context.Context, args []string) error {
 	if ro, ok := reply["read_only"].(bool); ok && ro {
 		fmt.Println("  read-only")
 	}
-	if n, ok := reply["name"].(string); ok && *f.typ == "vub" {
+	if n, ok := reply["name"].(string); ok && *f.typ == "vhost-user-blk" {
 		fmt.Printf("  qemu: -chardev socket,id=vub%s,path=%v -device vhost-user-blk-pci,chardev=vub%s\n",
 			n, reply["socket"], n)
 	}
@@ -168,7 +173,7 @@ func exportDetail(typ string, e map[string]any) string {
 		if n, ok := e["conns"].(float64); ok {
 			return fmt.Sprintf("conns=%d", int(n))
 		}
-	case "vub":
+	case "vhost-user-blk":
 		attached := "detached"
 		if b, ok := e["attached"].(bool); ok && b {
 			attached = "attached"
@@ -185,12 +190,14 @@ func exportRmCmd(ctx context.Context, args []string) error {
 	f := newExportFlags("export rm")
 	mustParse(f.fs, args)
 	if f.fs.NArg() != 1 {
-		return fmt.Errorf("usage: unistorctl export rm <name> [-type nbd|vduse|vub]")
+		return fmt.Errorf("usage: unistorctl export rm <name> [-type nbd|vduse|vhost-user-blk]")
 	}
 	name := f.fs.Arg(0)
-	if err := checkExportType(*f.typ); err != nil {
+	typ, err := canonicalExportType(*f.typ)
+	if err != nil {
 		return err
 	}
+	*f.typ = typ
 	url := "/v1/exports/" + name + "?type=" + *f.typ
 	status, body, err := exportRequest(ctx, f, http.MethodDelete, url, nil)
 	if err != nil {
@@ -252,17 +259,23 @@ func httpReplyError(op string, status int, body []byte) string {
 	return fmt.Sprintf("%s: HTTP %d: %s", op, status, msg)
 }
 
-func checkExportType(t string) error {
-	for _, v := range exportTypes {
-		if t == v {
-			return nil
-		}
+// canonicalExportType maps an accepted -type spelling onto the canonical
+// name the daemon speaks and the ls table is keyed by: "vhost-user-blk".
+// "vub" is the old shorthand and keeps working (the daemon accepts it too,
+// and old meta records stored under "vub" are migrated by unistord), so
+// muscle memory and existing scripts are safe.
+func canonicalExportType(t string) (string, error) {
+	switch strings.ToLower(strings.TrimSpace(t)) {
+	case "", "nbd", "vduse":
+		return strings.ToLower(strings.TrimSpace(t)), nil
+	case "vub", "vhost-user-blk", "vhost_user_blk", "vhostuserblk", "vhost-user":
+		return "vhost-user-blk", nil
 	}
-	return fmt.Errorf("export: -type must be one of %s", strings.Join(exportTypes, ", "))
+	return "", fmt.Errorf("export: -type must be one of %s (vub is accepted as a shorthand for vhost-user-blk)", strings.Join(exportTypes, ", "))
 }
 
 // exportReplyName picks the export identity out of a create reply:
-// vduse names the device, vub the export, nbd the registration.
+// vduse names the device, vhost-user-blk the export, nbd the registration.
 func exportReplyName(reply map[string]any, fallback string) string {
 	for _, k := range []string{"name", "devname"} {
 		if s, ok := reply[k].(string); ok && s != "" {

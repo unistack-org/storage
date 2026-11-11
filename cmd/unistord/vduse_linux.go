@@ -109,7 +109,7 @@ func (m *vduseManager) add(volume, devname string, cl *client.Cluster, spec meta
 		return false, nil
 	}
 	if cl == nil {
-		return false, fmt.Errorf("runtime vduse devices need cluster mode (-cluster)")
+		return false, fmt.Errorf("runtime vduse devices need cluster mode (-meta-dir)")
 	}
 	if _, err := cl.Refresh(context.Background()); err != nil {
 		return false, fmt.Errorf("placement: %w", err)

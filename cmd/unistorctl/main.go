@@ -9,7 +9,7 @@
 //	vol qos     <name> [-class c] [-r iops[:Bps]] [-w iops[:Bps]]
 //	vol quota   <name> <size|0>                (allocation cap; 0 = cap at volume size)
 //	vol resize  <name> <size>                   (online grow; shrink is refused)
-//	vol import  <name> <file|url> [-offset N]   (streamed, 1 MiB chunks)
+//	vol import  <name> <file|url|-> [-offset N]  (streamed, 1 MiB chunks; "-" = stdin)
 //	vol export  <name> <file|->                (holes preserved)
 //	vol snap    create <name>                   (freeze a read-only generation)
 //	vol snap    ls     <name>                   (list generations, newest last)
@@ -27,7 +27,7 @@
 //	map reweight <id> <w>                        (vitastor-style alias of osd out/in)
 //	vacuum      [ls|run [vol]]                 (M1.4: deleted-volume garbage; run <vol> targets one tombstone or punches a live volume's all-zero objects)
 //	recovery    ls | check <vol> | run <vol>   (M6.3: heal diverged/missing replicas)
-//	export      create <vol> [-type nbd|vduse|vub] | ls | rm <name>   (runtime exports via the admin API)
+//	export      create <vol> [-type nbd|vduse|vhost-user-blk] | ls | rm <name>   (runtime exports via the admin API; shorthand: vub)
 //	status      -http URL                       (operational overview, see unistord)
 //
 // Bandwidth rates accept the K/M/G/T suffixes. A volume whose QoS class
@@ -290,7 +290,7 @@ func volCmd(ctx context.Context, cl *client.Cluster, ms meta.Store, args []strin
 		mustParse(fs, rest)
 		if fs.NArg() != 2 {
 			fs.Usage()
-			return errors.New(`vol import: <name> <file|http(s)://url>`)
+			return errors.New(`vol import: <name> <file|http(s)://url|-> ("-" reads stdin)`)
 		}
 		return volImport(ctx, cl, fs.Arg(0), fs.Arg(1), *offset, *size, *sum)
 
@@ -475,7 +475,8 @@ func volSnap(ctx context.Context, cl *client.Cluster, args []string) error {
 	}
 }
 
-// volImport streams a local file or HTTP(S) URL into a volume. The
+// volImport streams a local file, HTTP(S) URL, or stdin (src "-") into a
+// volume. The
 // byte accounting is strict: a declared size (-size, or the server's
 // Content-Length for HTTP) that the stream ends short of is an error,
 // and -sha256 is verified over exactly the bytes written, so a torn
@@ -519,6 +520,10 @@ func volImport(ctx context.Context, cl *client.Cluster, name, src string, offset
 		if size == 0 && resp.ContentLength > 0 {
 			expected = resp.ContentLength
 		}
+	} else if src == "-" {
+		// stdin: qcow2 pipes, dd, zcat, ... The size cannot be stat'ed,
+		// so the stream ends at EOF unless -size declares it.
+		r = os.Stdin
 	} else {
 		f, err := os.Open(src)
 		if err != nil {
@@ -1396,7 +1401,7 @@ vol create <name> <size> [-quota S] [-replicas n] [-min-size n] [-pg-num n] [-ru
 vol ls | vol info <name> | vol rm <name>
 vol qos <name> [-class c] [-r iops[:Bps]] [-w iops[:Bps]]
 vol quota <name> <size|0>  (allocation cap; open volumes pick it up live)
-vol import <name> <file|http(s)://url> [-offset N]
+vol import <name> <file|http(s)://url|-> [-offset N] [-size N] [-sha256 HEX]  ("-" reads stdin)
 vol export <name> <file|->
 vol snap create <name> | vol snap ls <name> | vol snap rm <name> <gen> | vol snap rollback <name> <gen>
 qos ls | qos put <class> <riops:rbps:wiops:wbps> | qos rm <class>
@@ -1404,9 +1409,9 @@ osd ls | osd add <id> <addr> [-data P] [-uuid U] | osd out <id> | osd in <id> [-
 map dump [-format raw|text|json|yaml|binary] | map check [file] [-pg-num n] [-replicas n] [-rule r] | map publish <file> [-epoch n] | map reweight <id> <w>
 vacuum [ls|run [vol]]  (M1.4: free deleted volumes' objects; run <vol> = targeted tombstone, live volume = punch out all-zero objects)
 recovery ls | recovery check <vol> | recovery run <vol> [-iops N] [-bps B]
-export create <volume> [-type nbd|vduse|vub] [-devname N] [-ro] [-http URL] [-token T]  (attach a volume to a running unistord)
+export create <volume> [-type nbd|vduse|vhost-user-blk] [-devname N] [-ro] [-http URL] [-token T]  (attach a volume to a running unistord; -type vub is accepted as a shorthand)
 export ls [-json] [-http URL] [-token T]  (live exports per type)
-export rm <name> [-type nbd|vduse|vub] [-http URL] [-token T]  (detach; 409 when in use)
+export rm <name> [-type nbd|vduse|vhost-user-blk] [-http URL] [-token T]  (detach; 409 when in use; -type vub accepted)
 status [-http URL]  (reads unistord admin /v1/status; default http://127.0.0.1:8443)
 healthcheck [-http URL] [-json]  (verdict on unistord /healthcheck; exit 1 when the cluster is unhealthy)
 

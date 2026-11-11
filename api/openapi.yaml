@@ -433,7 +433,7 @@ paths:
                         volume: {type: string}
                         read_only: {type: boolean}
                         size: {type: integer, format: int64}
-                  vub:
+                  vhost-user-blk:
                     type: array
                     items:
                       type: object
@@ -449,11 +449,13 @@ paths:
       summary: Attach a runtime export of a volume (cluster mode)
       description: >
         nbd registers the volume on the daemon's NBD TCP port; vduse
-        creates a kernel virtio-blk device (Linux, needs devname); vub
-        serves vhost-user-blk on a unix socket (QEMU/Dragonball;
-        devname optionally names the export, the socket path is
-        returned). Idempotent: re-attaching an existing export answers
-        200 with the live registration instead of 201.
+        creates a kernel virtio-blk device (Linux, needs devname);
+        vhost-user-blk serves the vhost-user-blk protocol on a unix
+        socket (QEMU/Dragonball; devname optionally names the export,
+        the socket path is returned). The old shorthand type=vub is
+        accepted on input; replies and meta records use the canonical
+        name vhost-user-blk. Idempotent: re-attaching an existing export
+        answers 200 with the live registration instead of 201.
       requestBody:
         required: true
         content:
@@ -480,8 +482,8 @@ paths:
       - name: type
         in: query
         required: false
-        description: export type (nbd = export name, vduse = devname, vub = export name)
-        schema: {type: string, enum: [nbd, vduse, vub], default: nbd}
+        description: export type (nbd = export name, vduse = devname, vhost-user-blk = export name); the legacy shorthand vub is accepted too
+        schema: {type: string, enum: [nbd, vduse, vhost-user-blk, vub], default: nbd}
     delete:
       tags: [exports]
       summary: Detach a runtime export
@@ -493,7 +495,7 @@ paths:
               schema:
                 type: object
                 properties:
-                  type: {type: string, enum: [nbd, vduse, vub]}
+                  type: {type: string, enum: [nbd, vduse, vhost-user-blk]}
                   name: {type: string}
                   removed: {type: boolean, example: true}
         "404": {$ref: "#/components/responses/NotFound"}
@@ -763,8 +765,12 @@ components:
       required: [volume]
       properties:
         volume: {type: string}
-        type: {type: string, enum: [nbd, vduse, vub], default: nbd}
-        devname: {type: string, description: "vduse kernel device name (required for vduse); vub export name (optional, defaults to the volume name)"}
+        type:
+          type: string
+          enum: [nbd, vduse, vhost-user-blk, vub]
+          default: nbd
+          description: "canonical transport name is vhost-user-blk; the legacy shorthand vub is accepted on input and answered as vhost-user-blk"
+        devname: {type: string, description: "vduse kernel device name (required for vduse); vhost-user-blk export name (optional, defaults to the volume name)"}
         read_only: {type: boolean}
     Job:
       type: object
