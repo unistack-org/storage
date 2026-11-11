@@ -32,6 +32,10 @@
 //	GET    /v1/qos/classes
 //	PUT    /v1/qos/classes/{name}               {"read_iops":...}
 //	DELETE /v1/qos/classes/{name}
+//	GET    /v1/pools
+//	POST   /v1/pools                            {"name":"fast","replicas":3,...}
+//	GET    /v1/pools/{name}
+//	DELETE /v1/pools/{name}                     (409 while volumes reference it)
 //	GET    /v1/vacuum                          pending vacuum tombstones
 //	POST   /v1/vacuum                          run one vacuum pass now
 //	GET    /v1/recovery                         check every volume
@@ -137,6 +141,10 @@ func newAdminServer(ms meta.Store, addr string, logger *log.Logger, raftSt *meta
 	mux.HandleFunc("GET /v1/qos/classes", a.handleListClasses)
 	mux.HandleFunc("PUT /v1/qos/classes/{name}", a.handlePutClass)
 	mux.HandleFunc("DELETE /v1/qos/classes/{name}", a.handleDeleteClass)
+	mux.HandleFunc("GET /v1/pools", a.handleListPools)
+	mux.HandleFunc("POST /v1/pools", a.handleCreatePool)
+	mux.HandleFunc("GET /v1/pools/{name}", a.handleGetPool)
+	mux.HandleFunc("DELETE /v1/pools/{name}", a.handleDeletePool)
 	mux.HandleFunc("GET /v1/vacuum", a.handleVacuumList)
 	mux.HandleFunc("POST /v1/vacuum", a.handleVacuumRun)
 	mux.HandleFunc("POST /v1/vacuum/{name}", a.handleVacuumVolume)
@@ -525,6 +533,10 @@ type createVolumeRequest struct {
 	MinSize  int    `json:"min_size,omitempty"`
 	PGNum    int    `json:"pg_num,omitempty"`
 	Rule     string `json:"rule,omitempty"`
+	// Pool names a pool to create the volume in: omitted placement
+	// fields are filled from the pool, the pool from the cluster
+	// defaults. An explicit value beats the pool.
+	Pool string `json:"pool,omitempty"`
 }
 
 func (a *adminAPI) handleCreateVolume(w http.ResponseWriter, r *http.Request) {
@@ -550,31 +562,60 @@ func (a *adminAPI) handleCreateVolume(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	// Fill omitted placement fields from the compiled cluster defaults
-	// (the same -pg-num/-replicas/-rule the daemon booted with).
-	if req.Replicas == 0 || req.PGNum == 0 || req.Rule == "" {
-		if snap, err := a.cl.Refresh(r.Context()); err == nil {
-			if req.Replicas == 0 {
-				req.Replicas = snap.Replicas
-			}
-			if req.PGNum == 0 {
-				req.PGNum = int(snap.PGNum)
-			}
-			if req.Rule == "" {
-				req.Rule = snap.Rule
-			}
+	// Fill omitted placement fields: the pool (when given) supplies
+	// what the request leaves out; without a pool the compiled cluster
+	// defaults (the same -pg-num/-replicas/-rule the daemon booted
+	// with) do. An explicit request value always wins.
+	if req.Pool != "" {
+		if !meta.ValidName(req.Pool) {
+			jsonError(w, http.StatusBadRequest, "bad pool name")
+			return
+		}
+		if _, err := meta.GetPool(r.Context(), a.ms, req.Pool); errors.Is(err, meta.ErrNotFound) {
+			jsonError(w, http.StatusNotFound, "pool %q not found", req.Pool)
+			return
+		} else if err != nil {
+			jsonError(w, http.StatusInternalServerError, "pool: %v", err)
+			return
 		}
 	}
 	if _, err := meta.GetVolume(r.Context(), a.ms, name); err == nil {
 		jsonError(w, http.StatusConflict, "volume %q exists", name)
 		return
 	}
-	spec, err := a.cl.CreateVolume(r.Context(), name, size, quota, req.Replicas, req.MinSize, req.PGNum, req.Rule)
-	if err != nil {
-		if a.readOnlyGate(w, err) {
+	var spec meta.VolumeSpec
+	var errCreate error
+	if req.Pool != "" {
+		spec, errCreate = a.cl.CreateVolumeInPool(r.Context(), req.Pool, name, size, quota, req.Replicas, req.MinSize, req.PGNum, req.Rule)
+	} else {
+		if req.Replicas == 0 || req.PGNum == 0 || req.Rule == "" {
+			if snap, err := a.cl.Refresh(r.Context()); err == nil {
+				if req.Replicas == 0 {
+					req.Replicas = snap.Replicas
+				}
+				if req.PGNum == 0 {
+					req.PGNum = int(snap.PGNum)
+				}
+				if req.Rule == "" {
+					req.Rule = snap.Rule
+				}
+			}
+		}
+		spec, errCreate = a.cl.CreateVolume(r.Context(), name, size, quota, req.Replicas, req.MinSize, req.PGNum, req.Rule)
+	}
+	if errCreate != nil {
+		if a.readOnlyGate(w, errCreate) {
 			return
 		}
-		jsonError(w, http.StatusInternalServerError, "create: %v", err)
+		if errors.Is(errCreate, meta.ErrNotFound) {
+			jsonError(w, http.StatusNotFound, "create: %v", errCreate)
+			return
+		}
+		if errors.Is(errCreate, meta.ErrInvalidPool) {
+			jsonError(w, http.StatusBadRequest, "create: %v", errCreate)
+			return
+		}
+		jsonError(w, http.StatusInternalServerError, "create: %v", errCreate)
 		return
 	}
 	a.logger.Printf("admin: created volume %q (%s)", name, humanSize(size))
@@ -970,6 +1011,108 @@ func (a *adminAPI) handleDeleteClass(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		jsonError(w, http.StatusInternalServerError, "delete: %v", err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// ---------- pool routes ----------
+
+func (a *adminAPI) handleListPools(w http.ResponseWriter, r *http.Request) {
+	recs, err := a.cl.ListPools(r.Context())
+	if err != nil {
+		jsonError(w, http.StatusInternalServerError, "pools: %v", err)
+		return
+	}
+	writeJSON(w, http.StatusOK, recs)
+}
+
+type createPoolRequest struct {
+	Name        string `json:"name"`
+	Replicas    int    `json:"replicas,omitempty"`
+	MinSize     int    `json:"min_size,omitempty"`
+	PGNum       int    `json:"pg_num,omitempty"`
+	Rule        string `json:"rule,omitempty"`
+	QoSTemplate string `json:"qos_template,omitempty"`
+}
+
+func (a *adminAPI) handleCreatePool(w http.ResponseWriter, r *http.Request) {
+	var req createPoolRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		jsonError(w, http.StatusBadRequest, "bad json: %v", err)
+		return
+	}
+	if !meta.ValidName(req.Name) {
+		jsonError(w, http.StatusBadRequest, "bad pool name")
+		return
+	}
+	rec, err := a.cl.CreatePool(r.Context(), meta.PoolRecord{
+		Name:        req.Name,
+		Replicas:    req.Replicas,
+		MinSize:     req.MinSize,
+		PGNum:       req.PGNum,
+		Rule:        req.Rule,
+		QoSTemplate: req.QoSTemplate,
+	})
+	if err != nil {
+		if a.readOnlyGate(w, err) {
+			return
+		}
+		if errors.Is(err, meta.ErrConflict) {
+			jsonError(w, http.StatusConflict, "pool %q exists", req.Name)
+			return
+		}
+		// A policy the placement layer cannot honour is the caller's
+		// input error, not a server fault.
+		if errors.Is(err, meta.ErrInvalidPool) {
+			jsonError(w, http.StatusBadRequest, "create pool: %v", err)
+			return
+		}
+		jsonError(w, http.StatusInternalServerError, "create pool: %v", err)
+		return
+	}
+	a.logger.Printf("admin: created pool %q (replicas %d, min_size %d, pg_num %d, rule %q)", rec.Name, rec.Replicas, rec.MinSize, rec.PGNum, rec.Rule)
+	writeJSON(w, http.StatusCreated, rec)
+}
+
+func (a *adminAPI) handleGetPool(w http.ResponseWriter, r *http.Request) {
+	name := volumeName(r)
+	if name == "" {
+		jsonError(w, http.StatusBadRequest, "bad pool name")
+		return
+	}
+	rec, err := meta.GetPool(r.Context(), a.ms, name)
+	if errors.Is(err, meta.ErrNotFound) {
+		jsonError(w, http.StatusNotFound, "pool %q not found", name)
+		return
+	}
+	if err != nil {
+		jsonError(w, http.StatusInternalServerError, "get pool: %v", err)
+		return
+	}
+	writeJSON(w, http.StatusOK, rec)
+}
+
+func (a *adminAPI) handleDeletePool(w http.ResponseWriter, r *http.Request) {
+	name := volumeName(r)
+	if name == "" {
+		jsonError(w, http.StatusBadRequest, "bad pool name")
+		return
+	}
+	if err := a.cl.DeletePool(r.Context(), name); err != nil {
+		if errors.Is(err, meta.ErrNotFound) {
+			jsonError(w, http.StatusNotFound, "pool %q not found", name)
+			return
+		}
+		if a.readOnlyGate(w, err) {
+			return
+		}
+		// Volumes still reference the pool: a conflict, not a fault.
+		if errors.Is(err, meta.ErrPoolInUse) {
+			jsonError(w, http.StatusConflict, "delete pool: %v", err)
+			return
+		}
+		jsonError(w, http.StatusInternalServerError, "delete pool: %v", err)
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)

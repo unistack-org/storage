@@ -818,6 +818,36 @@ func (c *Cluster) MapEpoch(ctx context.Context, epoch uint32, src []byte) error 
 // allocate on the OSDs (thin provisioning, plan M0.4); 0 = the logical
 // size (uncapped beyond it).
 func (c *Cluster) CreateVolume(ctx context.Context, name string, size uint64, quota uint64, replicas, minSize, pgNum int, rule string) (meta.VolumeSpec, error) {
+	return c.createVolume(ctx, name, size, quota, replicas, minSize, pgNum, rule, "", "")
+}
+
+// CreateVolumeInPool creates a volume inside a pool: every placement
+// parameter left at 0/"" (replicas, minSize, pgNum, rule) is taken from
+// the pool record; an explicitly passed value wins. The QoS template
+// comes from the pool when the caller does not set one. The resolved
+// values are stored on the volume spec (with the pool name recorded),
+// so later pool edits never move existing data.
+func (c *Cluster) CreateVolumeInPool(ctx context.Context, pool, name string, size uint64, quota uint64, replicas, minSize, pgNum int, rule string) (meta.VolumeSpec, error) {
+	rec, err := meta.GetPool(ctx, c.meta, pool)
+	if err != nil {
+		return meta.VolumeSpec{}, fmt.Errorf("client: pool %q: %w", pool, err)
+	}
+	if replicas == 0 {
+		replicas = rec.Replicas
+	}
+	if minSize == 0 {
+		minSize = rec.MinSize
+	}
+	if pgNum == 0 {
+		pgNum = rec.PGNum
+	}
+	if rule == "" {
+		rule = rec.Rule
+	}
+	return c.createVolume(ctx, name, size, quota, replicas, minSize, pgNum, rule, rec.QoSTemplate, pool)
+}
+
+func (c *Cluster) createVolume(ctx context.Context, name string, size uint64, quota uint64, replicas, minSize, pgNum int, rule, qosTemplate, pool string) (meta.VolumeSpec, error) {
 	if name == "" || size == 0 {
 		return meta.VolumeSpec{}, errors.New("client: volume name and size required")
 	}
@@ -845,15 +875,17 @@ func (c *Cluster) CreateVolume(ctx context.Context, name string, size uint64, qu
 		return meta.VolumeSpec{}, fmt.Errorf("client: create volume %q: %w", name, err)
 	}
 	spec := meta.VolumeSpec{
-		Name:     name,
-		Size:     size,
-		Quota:    quota,
-		OIDBase:  base,
-		OIDShift: object.SizeShift,
-		Replicas: replicas,
-		MinSize:  minSize,
-		Rule:     rule,
-		PGNum:    pgNum,
+		Name:        name,
+		Size:        size,
+		Quota:       quota,
+		OIDBase:     base,
+		OIDShift:    object.SizeShift,
+		Replicas:    replicas,
+		MinSize:     minSize,
+		Rule:        rule,
+		PGNum:       pgNum,
+		QoSTemplate: qosTemplate,
+		Pool:        pool,
 	}
 	if _, err := meta.PutVolume(ctx, c.meta, spec); err != nil {
 		return meta.VolumeSpec{}, err
@@ -952,6 +984,66 @@ func (c *Cluster) PutQoSClass(ctx context.Context, rec meta.QoSClassRecord) erro
 	}
 	if _, err := meta.PutQoSClass(ctx, c.meta, rec); err != nil {
 		return fmt.Errorf("client: put qos class %q: %w", rec.Name, err)
+	}
+	return nil
+}
+
+// CreatePool registers a pool, filling parameters left at 0/"" from the
+// compiled cluster defaults (the -pg-num/-replicas/-rule the daemon
+// booted with, i.e. the current placement snapshot). A pool whose pg_num
+// exceeds the cluster default is refused: a volume may never carry more
+// PGs than the snapshot offers, so such a pool could never place one.
+// Overwriting an existing pool is refused (meta.ErrConflict): delete and
+// re-create to change a policy.
+func (c *Cluster) CreatePool(ctx context.Context, rec meta.PoolRecord) (meta.PoolRecord, error) {
+	snap, err := c.Refresh(ctx)
+	if err != nil {
+		return meta.PoolRecord{}, fmt.Errorf("client: create pool %q: %w", rec.Name, err)
+	}
+	if rec.Replicas == 0 {
+		rec.Replicas = snap.Replicas
+	}
+	if rec.MinSize == 0 {
+		rec.MinSize = rec.Replicas/2 + 1
+	}
+	if rec.PGNum == 0 {
+		rec.PGNum = int(snap.PGNum)
+	}
+	if rec.Rule == "" {
+		rec.Rule = snap.Rule
+	}
+	if _, err := meta.PutPool(ctx, c.meta, rec, int(snap.PGNum)); err != nil {
+		return meta.PoolRecord{}, fmt.Errorf("client: create pool %q: %w", rec.Name, err)
+	}
+	return rec, nil
+}
+
+// GetPool reads one pool record.
+func (c *Cluster) GetPool(ctx context.Context, name string) (meta.PoolRecord, error) {
+	return meta.GetPool(ctx, c.meta, name)
+}
+
+// ListPools returns every registered pool.
+func (c *Cluster) ListPools(ctx context.Context) ([]meta.PoolRecord, error) {
+	return meta.ListPools(ctx, c.meta)
+}
+
+// DeletePool removes a pool. It is refused while volumes still
+// reference the pool: the name is their recorded provenance, and a pool
+// that disappears under live volumes makes their policy unanswerable.
+func (c *Cluster) DeletePool(ctx context.Context, name string) error {
+	if name == "" {
+		return errors.New("client: pool name required")
+	}
+	n, err := meta.CountPoolVolumes(ctx, c.meta, name)
+	if err != nil {
+		return fmt.Errorf("client: delete pool %q: %w", name, err)
+	}
+	if n > 0 {
+		return fmt.Errorf("client: pool %q: %d volume(s) still reference it: %w", name, n, meta.ErrPoolInUse)
+	}
+	if err := meta.DeletePool(ctx, c.meta, name); err != nil {
+		return fmt.Errorf("client: delete pool %q: %w", name, err)
 	}
 	return nil
 }

@@ -123,6 +123,8 @@ func dispatch(ctx context.Context, cl *client.Cluster, ms meta.Store, args []str
 	switch args[0] {
 	case "vol":
 		return volCmd(ctx, cl, ms, args[1:])
+	case "pool":
+		return poolCmd(ctx, cl, args[1:])
 	case "qos":
 		return qosCmd(ctx, cl, args[1:])
 	case "osd":
@@ -156,10 +158,11 @@ func volCmd(ctx context.Context, cl *client.Cluster, ms meta.Store, args []strin
 	switch sub {
 	case "create":
 		fs := flag.NewFlagSet("vol create", flag.ExitOnError)
-		replicas := fs.Int("replicas", 3, "replica count")
+		replicas := fs.Int("replicas", 0, "replica count (0 = pool, else cluster default)")
 		minSize := fs.Int("min-size", 0, "min writable replica set (0 = replicas/2+1)")
-		pgNum := fs.Int("pg-num", 0, "placement groups (0 = cluster default)")
-		rule := fs.String("rule", "replicated", "crush rule name")
+		pgNum := fs.Int("pg-num", 0, "placement groups (0 = pool, else cluster default)")
+		rule := fs.String("rule", "", "crush rule name (empty = pool, else cluster default)")
+		pool := fs.String("pool", "", "create the volume in this pool (pool policy fills omitted placement flags)")
 		quotaStr := fs.String("quota", "", "allocation cap (thin provisioning), e.g. 20G (0/omitted = volume size)")
 		mustParse(fs, rest)
 		if fs.NArg() != 2 {
@@ -176,12 +179,40 @@ func volCmd(ctx context.Context, cl *client.Cluster, ms meta.Store, args []strin
 				return fmt.Errorf("vol create: quota: %w", err)
 			}
 		}
-		spec, err := cl.CreateVolume(ctx, fs.Arg(0), size, quota, *replicas, *minSize, *pgNum, *rule)
+		var spec meta.VolumeSpec
+		if *pool != "" {
+			// Omitted placement flags stay 0/"" and are filled from
+			// the pool record (client side); explicit flags win.
+			spec, err = cl.CreateVolumeInPool(ctx, *pool, fs.Arg(0), size, quota, *replicas, *minSize, *pgNum, *rule)
+		} else {
+			// No pool: omitted placement flags come from the compiled
+			// cluster defaults (the daemon's -replicas/-pg-num/-rule).
+			if *replicas == 0 || *pgNum == 0 || *rule == "" {
+				if snap, rerr := cl.Refresh(ctx); rerr == nil {
+					if *replicas == 0 {
+						*replicas = snap.Replicas
+					}
+					if *pgNum == 0 {
+						*pgNum = int(snap.PGNum)
+					}
+					if *rule == "" {
+						*rule = snap.Rule
+					}
+				} else if *replicas == 0 || *pgNum == 0 || *rule == "" {
+					return fmt.Errorf("vol create: cluster defaults unavailable (%v): pass -replicas/-pg-num/-rule explicitly", rerr)
+				}
+			}
+			spec, err = cl.CreateVolume(ctx, fs.Arg(0), size, quota, *replicas, *minSize, *pgNum, *rule)
+		}
 		if err != nil {
 			return err
 		}
-		fmt.Printf("volume %q: size=%s quota=%s oid_base=%d replicas=%d min_size=%d pg_num=%d epoch=%d\n",
+		fmt.Printf("volume %q: size=%s quota=%s oid_base=%d replicas=%d min_size=%d pg_num=%d epoch=%d",
 			spec.Name, humanSize(spec.Size), quotaLabel(spec), spec.OIDBase, spec.Replicas, spec.MinSize, spec.PGNum, spec.Epoch)
+		if spec.Pool != "" {
+			fmt.Printf(" pool=%s", spec.Pool)
+		}
+		fmt.Println()
 		return nil
 
 	case "ls":
@@ -655,6 +686,77 @@ func volExport(ctx context.Context, cl *client.Cluster, name, dst string) error 
 	}
 	fmt.Fprintf(os.Stderr, "export: done, %s\n", humanSize(v.Size()))
 	return nil
+}
+
+// ---- pool ----
+
+// poolCmd manages cluster pools: a pool is a namespace carrying the
+// shared placement policy (replicas, min_size, pg_num, crush rule, QoS
+// class) for the volumes created inside it. "pool create" registers
+// one, "pool ls" lists them, "pool rm" removes one (refused while
+// volumes still reference it).
+func poolCmd(ctx context.Context, cl *client.Cluster, args []string) error {
+	if len(args) == 0 {
+		usage()
+		return errors.New("pool: subcommand required (create/ls/rm)")
+	}
+	switch args[0] {
+	case "create":
+		fs := flag.NewFlagSet("pool create", flag.ExitOnError)
+		replicas := fs.Int("replicas", 0, "replica count (0 = cluster default)")
+		minSize := fs.Int("min-size", 0, "min writable replica set (0 = replicas/2+1)")
+		pgNum := fs.Int("pg-num", 0, "placement groups (0 = cluster default)")
+		rule := fs.String("rule", "", "crush rule name (empty = cluster default)")
+		qos := fs.String("qos", "", "qos class name applied to volumes created in this pool")
+		mustParse(fs, args[1:])
+		if fs.NArg() != 1 {
+			fs.Usage()
+			return errors.New(`pool create: <name> e.g. "pool create fast -replicas 3"`)
+		}
+		rec, err := cl.CreatePool(ctx, meta.PoolRecord{
+			Name:        fs.Arg(0),
+			Replicas:    *replicas,
+			MinSize:     *minSize,
+			PGNum:       *pgNum,
+			Rule:        *rule,
+			QoSTemplate: *qos,
+		})
+		if err != nil {
+			return err
+		}
+		fmt.Printf("pool %q: replicas=%d min_size=%d pg_num=%d rule=%s", rec.Name, rec.Replicas, rec.MinSize, rec.PGNum, rec.Rule)
+		if rec.QoSTemplate != "" {
+			fmt.Printf(" qos=%s", rec.QoSTemplate)
+		}
+		fmt.Println()
+		return nil
+	case "ls":
+		recs, err := cl.ListPools(ctx)
+		if err != nil {
+			return err
+		}
+		if len(recs) == 0 {
+			fmt.Println("(no pools)")
+			return nil
+		}
+		fmt.Printf("%-16s %8s %8s %8s %-12s %-10s\n", "POOL", "REPLICA", "MINSIZE", "PGNUM", "RULE", "QOS")
+		for _, r := range recs {
+			fmt.Printf("%-16s %8d %8d %8d %-12s %-10s\n", r.Name, r.Replicas, r.MinSize, r.PGNum, r.Rule, r.QoSTemplate)
+		}
+		return nil
+	case "rm":
+		if len(args) != 2 {
+			return errors.New("pool rm: <name>")
+		}
+		if err := cl.DeletePool(ctx, args[1]); err != nil {
+			return err
+		}
+		fmt.Printf("pool %q removed\n", args[1])
+		return nil
+	default:
+		usage()
+		return fmt.Errorf("pool: unknown subcommand %q", args[0])
+	}
 }
 
 // ---- qos ----
@@ -1397,13 +1499,15 @@ func usage() {
 
 unistorctl [-meta-dir DIR] <command> ...
 
-vol create <name> <size> [-quota S] [-replicas n] [-min-size n] [-pg-num n] [-rule r]
+vol create <name> <size> [-pool P] [-quota S] [-replicas n] [-min-size n] [-pg-num n] [-rule r]  (in a pool, omitted placement flags come from the pool; explicit flags win)
 vol ls | vol info <name> | vol rm <name>
 vol qos <name> [-class c] [-r iops[:Bps]] [-w iops[:Bps]]
 vol quota <name> <size|0>  (allocation cap; open volumes pick it up live)
 vol import <name> <file|http(s)://url|-> [-offset N] [-size N] [-sha256 HEX]  ("-" reads stdin)
 vol export <name> <file|->
 vol snap create <name> | vol snap ls <name> | vol snap rm <name> <gen> | vol snap rollback <name> <gen>
+pool create <name> [-replicas n] [-min-size n] [-pg-num n] [-rule r] [-qos class]  (cluster-wide placement policy; volumes created in it inherit it)
+pool ls | pool rm <name>  (rm is refused while volumes reference the pool)
 qos ls | qos put <class> <riops:rbps:wiops:wbps> | qos rm <class>
 osd ls | osd add <id> <addr> [-data P] [-uuid U] | osd out <id> | osd in <id> [-weight w]   (weight 0 = out of placement)
 map dump [-format raw|text|json|yaml|binary] | map check [file] [-pg-num n] [-replicas n] [-rule r] | map publish <file> [-epoch n] | map reweight <id> <w>

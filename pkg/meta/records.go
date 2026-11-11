@@ -21,6 +21,9 @@ const (
 	// PrefixQoSClasses holds named IOPS/bandwidth classes referenced by
 	// volume specs (per-user tiers).
 	PrefixQoSClasses = "qos"
+	// PrefixPools holds cluster-wide pool records (shared placement
+	// policy for the volumes created inside a pool).
+	PrefixPools = "pools"
 )
 
 // AllocOIDs is the allocator key for volume object-id ranges.
@@ -99,10 +102,15 @@ type VolumeSpec struct {
 	// and the class exists, the class rates override the inline fields
 	// (OpenVolume resolves it).
 	QoSTemplate string `json:"qos_template,omitempty"`
-	ReadIOPS    uint64 `json:"read_iops,omitempty"`
-	ReadBPS     uint64 `json:"read_bps,omitempty"`
-	WriteIOPS   uint64 `json:"write_iops,omitempty"`
-	WriteBPS    uint64 `json:"write_bps,omitempty"`
+	// Pool names the PoolRecord the volume was created in. The pool
+	// supplied the shared placement policy at create time (replicas,
+	// min_size, pg_num, rule, QoS template); the spec keeps the
+	// resolved values, so pool edits never move existing data.
+	Pool      string `json:"pool,omitempty"`
+	ReadIOPS  uint64 `json:"read_iops,omitempty"`
+	ReadBPS   uint64 `json:"read_bps,omitempty"`
+	WriteIOPS uint64 `json:"write_iops,omitempty"`
+	WriteBPS  uint64 `json:"write_bps,omitempty"`
 
 	// Gen is the current snapshot generation: 0 on a volume that
 	// never had a snapshot; CreateSnapshot increments it. The live
