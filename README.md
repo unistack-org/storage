@@ -35,9 +35,10 @@
   Экспорт только на отдельном `-metrics`-порту, REST API метрики не отдаёт.
   Детали: [`todos/runbook.md`](todos/runbook.md).
 - ✅ Разделение сетей: у OSD второй слушатель для контроля
-  (`-osd id@dir@data@ctrl`) — пинги/StatFS/health-пробы идут по нему,
+  (`-osd id@dir@data-addr@ctrl-addr`) — пинги/StatFS/health-пробы идут по нему,
   поэтому забитая дата-сеть не эвиктит живые OSD и не разваливает
-  кластер. Пустой ctrl-адрес = одна сеть (обратная совместимость).
+  кластер. Простой запуск — `-data-dir <путь>` (id автоматически).
+  Пустой ctrl-адрес = одна сеть (обратная совместимость).
 - 🚧 Скелет репозитория: интерфейс-реестры `backend/`, `cache/`,
   `cluster/`, `hash/`, `journal/`, `transport/` (legacy-слой sheepdog-era
   удалён в фазе 0).
@@ -78,12 +79,19 @@ qemu-img info nbd://127.0.0.1:10809/vol0
 Кластер без placement-флагов демона (политика размещения живёт в пулах):
 
 ```sh
-./unistord -meta-dir /var/lib/unistord/meta -osd 1@/var/lib/unistord/data1 ... &
+./unistord -meta-dir /var/lib/unistord/meta \
+  -data-dir /var/lib/unistord/data1 -data-dir /var/lib/unistord/data2 \
+  -data-dir /var/lib/unistord/data3 -crushmap /etc/unistord/crush.map &
 unistorctl pool create ssd -replicas 3 -pg-num 128   # политика пула
 unistorctl vol create -pool ssd vm0 100G             # том наследует пул
 ./unistord ... -create ssd/vm0:100G       # то же при старте (-create shortcut)
 ```
 
+`-data-dir` — простой способ поднять OSD: id назначается автоматически
+(наименьший свободный, закрепляется в `<dir>/id`) и больше не указывается
+вручную; `-epoch` не нужен — 0 = авто (1 на пустом кластере, далее публикация
+пропускается). `-osd id@dir[@data-addr[@ctrl-addr]]` остаётся для полных
+спецификаций: id из crushmap, адрес дата-сети и второй (ctrl-)адрес.
 `-replicas/-pg-num/-min-size/-rule` демона — только дефолты для `-create`
 (0/пусто = из snapshot кластера); пулам и `vol create -pool` они не нужны.
 

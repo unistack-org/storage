@@ -8,13 +8,16 @@
 //	unistord -listen :10809 -export vol0=/var/lib/unistord/vol0.img:10G [-readonly vol0] [-trim] [-write-zeroes]
 //	unistord ... -export vol0 -vduse vol0=sds-vol0   # VDUSE virtio-blk device (Linux)
 //	unistord ... -export vol0 -vub vol0=/run/vol0.sock   # vhost-user-blk socket (QEMU/Dragonball)
-//	unistord ... -meta-dir /var/lib/unistord/meta -osd 1@/var/lib/unistord/osd1 ...  # cluster mode
+//	unistord ... -meta-dir /var/lib/unistord/meta -data-dir /var/lib/unistord/data1 -data-dir /var/lib/unistord/data2 ...  # cluster mode
+//	unistord ... -meta-dir ... -osd 1@/var/lib/unistord/data1@10.0.0.5:10810@10.0.1.5:10811  # full OSD spec: id@dir[@data-addr[@ctrl-addr]]
 //	unistord ... -meta-dir ... -metrics 0.0.0.0:8080  # Prometheus /metrics endpoint
 //
 // Cluster placement policy lives in pools (unistorctl pool create), not
 // in daemon flags: start without -replicas/-pg-num/-rule and create
 // volumes with "vol create -pool <pool>" (or -create pool/name:size).
 // The placement flags remain as per-boot defaults for -create only.
+// An OSD data directory is pinned to its id in <dir>/id (written on
+// first start; the id is kept across restarts).
 package main
 
 import (
@@ -163,7 +166,7 @@ func parseQoSNamed(spec string) (name, rates string, err error) {
 func main() {
 	var exports exportFlag
 	listen := flag.String("listen", ":10809", "TCP address to listen on")
-	dataDir := flag.String("data-dir", "", "directory for relative export paths")
+	exportDir := flag.String("export-dir", "", "base directory for relative -export image paths")
 	trim := flag.Bool("trim", true, "advertise and handle TRIM (punches holes: Linux fallocate, darwin APFS F_PUNCHHOLE)")
 	writeZeroes := flag.Bool("write-zeroes", true, "advertise and handle WRITE_ZEROES")
 	vduseReadAhead := flag.Bool("vduse-readahead", true, "with -vduse: prefetch a window on sequential guest read runs (ideas §3.8); disable to force one backend read per request")
@@ -177,9 +180,11 @@ func main() {
 	metaDir := flag.String("meta-dir", "", "meta directory of a cluster (enables clustered exports backed by OSDs): holds the volume/OSD registry, crush epochs, export records and jobs - not the data, which lives in the OSD directories")
 	clusterDir := flag.String("cluster", "", "deprecated alias for -meta-dir")
 	var osds osdFlag
-	flag.Var(&osds, "osd", "with -meta-dir: start an in-process OSD as id@data-dir[@host:port[@ctrl-host:ctrl-port]], repeatable")
+	flag.Var(&osds, "osd", "with -meta-dir: start an in-process OSD as id@data-dir[@host:port[@ctrl-host:ctrl-port]], repeatable (full form; see -data-dir for the simple one)")
+	var dataDirs osdFlag
+	flag.Var(&dataDirs, "data-dir", "with -meta-dir: start an in-process OSD on a data directory (id auto-assigned: lowest free, pinned in <dir>/id), repeatable")
 	crushPath := flag.String("crushmap", "", "with -meta-dir: crushmap file (text/json/binary) to publish")
-	epoch := flag.Uint("epoch", 1, "with -meta-dir: epoch to publish -crushmap under (must be unique)")
+	epoch := flag.Uint("epoch", 0, "with -meta-dir: epoch to publish -crushmap under (0 = auto: latest+1, i.e. 1 on a fresh cluster)")
 	pgNum := flag.Int("pg-num", 0, "with -meta-dir: placement default for -create only (0 = cluster snapshot; pools carry their own pg_num)")
 	replicas := flag.Int("replicas", 0, "with -meta-dir: placement default for -create only (0 = cluster snapshot; pools carry their own replicas)")
 	minSize := flag.Int("min-size", 0, "with -meta-dir: write quorum width for -create (0 = replicas/2+1); below it writes fail fast (degraded volume)")
@@ -417,10 +422,57 @@ func main() {
 			logger.Printf("vacuum: autovacuum every %vs", *vacuumInterval)
 		}
 
+		// -data-dir entries carry no id: assign the lowest free one.
+		// The id is pinned in <dir>/id so a restart gets it back
+		// unchanged (the crush map, the objects on disk and the meta
+		// registration all key on it); ids already used by -osd specs
+		// and by OSDs registered in meta are skipped. On a raft cluster
+		// meta may not be readable yet (no leader), which is why the
+		// pin file is the primary source.
+		var osdSpecs []string
+		osdSpecs = append(osdSpecs, osds...)
+		if len(dataDirs) > 0 {
+			pinned, err := pinnedOSDIDs(dataDirs)
+			if err != nil {
+				logger.Fatalf("-data-dir: %v", err)
+			}
+			used := map[int32]bool{}
+			for _, spec := range osds {
+				id, _, _, _, perr := parseOSDSpec(spec)
+				if perr != nil {
+					logger.Fatalf("-osd %q: %v", spec, perr)
+				}
+				used[id] = true
+			}
+			for dir, id := range pinned {
+				if used[id] {
+					logger.Fatalf("-data-dir %s: id pin %d is already used by an -osd spec", dir, id)
+				}
+				used[id] = true
+			}
+			if infos, rerr := meta.ListOSDs(ctx, ms); rerr == nil {
+				for _, in := range infos {
+					used[in.ID] = true
+				}
+			}
+			for _, dir := range dataDirs {
+				id, ok := pinned[dir]
+				if !ok {
+					id = firstFreeOSDID(used)
+					used[id] = true
+				}
+				if err := pinOSDID(dir, id); err != nil {
+					logger.Fatalf("-data-dir %s: %v", dir, err)
+				}
+				osdSpecs = append(osdSpecs, fmt.Sprintf("%d@%s", id, dir))
+				logger.Printf("osd %d on %s (-data-dir)", id, dir)
+			}
+		}
+
 		// Witness: raft voter without storage. No OSDs, no exports:
 		// the process keeps the quorum (and can serve the read-only
 		// admin/status surface) and hosts no data.
-		witness := len(osds) == 0 && len(exports) == 0 && raftSt != nil
+		witness := len(osdSpecs) == 0 && len(exports) == 0 && raftSt != nil
 		var es []*nbd.Export
 		disks := newDiskRegistry()
 		// One metrics registry per process. The standalone endpoint
@@ -489,7 +541,7 @@ func main() {
 			es, err = clusterExports(ctx, clusterParams{
 				store:      ms,
 				metaDir:    clusterPath,
-				osds:       osds,
+				osds:       osdSpecs,
 				crushmap:   *crushPath,
 				epoch:      uint32(*epoch),
 				pgNum:      *pgNum,
@@ -568,8 +620,8 @@ func main() {
 		if err != nil {
 			logger.Fatalf("bad -export %q: %v", spec, err)
 		}
-		if *dataDir != "" && !filepath.IsAbs(path) {
-			path = filepath.Join(*dataDir, path)
+		if *exportDir != "" && !filepath.IsAbs(path) {
+			path = filepath.Join(*exportDir, path)
 		}
 		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 			logger.Fatalf("mkdir: %v", err)
@@ -895,21 +947,34 @@ func clusterExports(ctx context.Context, p clusterParams) ([]*nbd.Export, error)
 	}
 
 	// Publish the crush map if asked and not already present at this
-	// epoch (idempotent restarts keep the existing map).
+	// epoch (idempotent restarts keep the existing map). Epoch 0 means
+	// "auto": 1 on a fresh cluster; on a running one a map already
+	// exists, so publishing is skipped (use "unistorctl map publish"
+	// to push a new generation).
 	if p.crushmap != "" {
 		src, err := os.ReadFile(p.crushmap)
 		if err != nil {
 			return nil, fmt.Errorf("crushmap: %w", err)
 		}
-		if rec, err := meta.LatestMap(ctx, ms); err != nil || rec.Epoch < p.epoch {
-			if err := writeMeta(fmt.Sprintf("crushmap epoch %d", p.epoch), func() error {
-				return cl.MapEpoch(ctx, p.epoch, src)
+		rec, err := meta.LatestMap(ctx, ms)
+		have := err == nil
+		pubEpoch := p.epoch
+		switch {
+		case p.epoch == 0 && have:
+			p.logger.Printf("crushmap already published (latest epoch %d): keeping it", rec.Epoch)
+			pubEpoch = 0
+		case p.epoch == 0:
+			pubEpoch = 1
+		}
+		if pubEpoch != 0 && (!have || rec.Epoch < pubEpoch) {
+			if err := writeMeta(fmt.Sprintf("crushmap epoch %d", pubEpoch), func() error {
+				return cl.MapEpoch(ctx, pubEpoch, src)
 			}); err != nil && !errors.Is(err, meta.ErrConflict) {
-				return nil, fmt.Errorf("publish map epoch %d: %w", p.epoch, err)
+				return nil, fmt.Errorf("publish map epoch %d: %w", pubEpoch, err)
 			}
-			p.logger.Printf("published crushmap epoch %d (%d bytes)", p.epoch, len(src))
-		} else {
-			p.logger.Printf("crushmap epoch %d already present (latest %d)", p.epoch, rec.Epoch)
+			p.logger.Printf("published crushmap epoch %d (%d bytes)", pubEpoch, len(src))
+		} else if pubEpoch != 0 {
+			p.logger.Printf("crushmap epoch %d already present (latest %d)", pubEpoch, rec.Epoch)
 		}
 	}
 
@@ -1002,12 +1067,65 @@ func clusterExports(ctx context.Context, p clusterParams) ([]*nbd.Export, error)
 	return es, nil
 }
 
-// parseOSDSpec parses "id@data-dir[@host:port[@ctrl-host:ctrl-port]]"
-// (default 127.0.0.1:0, no control plane). The 4th segment is the
-// optional control-plane listen address: pings/StatFS probes dial it
-// instead of the data address, so a saturated data network cannot make
-// the cluster consider this OSD dead.
+// pinnedOSDIDs reads <dir>/id pins for -data-dir entries. A missing
+// file means the directory is new (its id is still to be assigned);
+// any other read/parse failure is an operator-visible error, since
+// silently re-assigning an id would orphan the data on disk.
+func pinnedOSDIDs(dirs []string) (map[string]int32, error) {
+	pinned := map[string]int32{}
+	seen := map[int32]string{}
+	for _, dir := range dirs {
+		b, err := os.ReadFile(filepath.Join(dir, "id"))
+		if err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			return nil, fmt.Errorf("%s: read id pin: %w", dir, err)
+		}
+		id, err := strconv.Atoi(strings.TrimSpace(string(b)))
+		if err != nil || id <= 0 {
+			return nil, fmt.Errorf("%s: id pin %q is not a positive id", dir, strings.TrimSpace(string(b)))
+		}
+		if other, dup := seen[int32(id)]; dup {
+			return nil, fmt.Errorf("%s: id pin %d collides with %s", dir, id, other)
+		}
+		seen[int32(id)] = dir
+		pinned[dir] = int32(id)
+	}
+	return pinned, nil
+}
+
+func pinOSDID(dir string, id int32) error {
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+	return os.WriteFile(filepath.Join(dir, "id"), []byte(strconv.Itoa(int(id))+"\n"), 0o644)
+}
+
+// firstFreeOSDID returns the lowest positive id absent from used.
+func firstFreeOSDID(used map[int32]bool) int32 {
+	for id := int32(1); ; id++ {
+		if !used[id] {
+			return id
+		}
+	}
+}
+
+// parseOSDSpec parses an -osd/-data-dir entry. A bare path (no '@')
+// is a -data-dir entry: the OSD id is auto-assigned (id = -1, pinned
+// in <dir>/osd.id by the caller). The full form is
+// "id@data-dir[@host:port[@ctrl-host:ctrl-port]]" (default
+// 127.0.0.1:0, no control plane). The 4th segment is the optional
+// control-plane listen address: pings/StatFS probes dial it instead of
+// the data address, so a saturated data network cannot make the
+// cluster consider this OSD dead.
 func parseOSDSpec(spec string) (id int32, dataDir, addr, ctrlAddr string, err error) {
+	if !strings.Contains(spec, "@") {
+		if spec == "" {
+			return 0, "", "", "", fmt.Errorf("empty data dir")
+		}
+		return -1, spec, "127.0.0.1:0", "", nil
+	}
 	parts := strings.Split(spec, "@")
 	if len(parts) < 2 {
 		return 0, "", "", "", fmt.Errorf(`expected "id@data-dir[@host:port[@ctrl-host:ctrl-port]]"`)

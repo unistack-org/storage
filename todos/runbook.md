@@ -11,9 +11,11 @@ background-recovery — работает. Ниже — рабочие опера
 
 ```
 # нода A (10.0.0.1) и нода B (10.0.0.2), третья нода-свидетель (10.0.0.3):
+# (в простой одно-сетевой конфигурации вместо -osd id@dir@addr достаточно
+#  -data-dir /mnt/nvme1/osd0: id назначаем автоматически, адрес 127.0.0.1)
 unistord -meta-dir /var/lib/unistord/meta \
   -osd 0@/mnt/nvme1/osd0@10.0.0.1:7000 -osd 1@/mnt/nvme2/osd1@10.0.0.1:7001 \
-  -crushmap /etc/unistord/crush.map -epoch 1 \
+  -crushmap /etc/unistord/crush.map \
   -replicas 2 -min-size 1 -pg-num 64 \
   -raft 10.0.0.1:9401 -raft-peers 10.0.0.1:9401,10.0.0.2:9401,10.0.0.3:9401 \
   -raft-proxy 10.0.0.1:9501 -raft-proxy-peers 10.0.0.1:9501,10.0.0.2:9501,10.0.0.3:9501 \
