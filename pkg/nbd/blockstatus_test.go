@@ -9,23 +9,76 @@ import (
 	"crypto/x509/pkix"
 	"encoding/binary"
 	"encoding/pem"
+	"io"
 	"math/big"
 	"net"
 	"os"
 	"path/filepath"
 	"runtime"
+	"sync"
 	"testing"
 	"time"
 )
 
 // fakeStatusBackend is a RAM backend with a programmed allocation map
 // (region-granular) so block-status tests are deterministic on every
-// platform (darwin cannot probe real holes reliably).
+// platform (darwin cannot probe real holes reliably). Unlike memBackend
+// (which discards writes) it stores data, so write-then-read works.
 type fakeStatusBackend struct {
-	memBackend
+	size      uint64
 	region    uint64 // bytes per region
 	allocated []bool
+
+	mu    sync.Mutex
+	pages map[uint64][]byte // 4096-byte pages, lazily allocated
 }
+
+const fakeStatusPage = 4096
+
+func (f *fakeStatusBackend) Size() uint64 { return f.size }
+
+func (f *fakeStatusBackend) ReadAt(p []byte, off int64) (int, error) {
+	if off >= int64(f.size) {
+		return 0, io.EOF
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for done := 0; done < len(p); {
+		o := uint64(off) + uint64(done)
+		page := o / fakeStatusPage
+		data := f.pages[page]
+		if data == nil {
+			data = make([]byte, fakeStatusPage)
+			f.pages[page] = data
+		}
+		done += copy(p[done:], data[o%fakeStatusPage:])
+	}
+	return len(p), nil
+}
+
+func (f *fakeStatusBackend) WriteAt(p []byte, off int64) (int, error) {
+	if off >= int64(f.size) {
+		return 0, io.EOF
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for done := 0; done < len(p); {
+		o := uint64(off) + uint64(done)
+		page := o / fakeStatusPage
+		data := f.pages[page]
+		if data == nil {
+			data = make([]byte, fakeStatusPage)
+			f.pages[page] = data
+		}
+		done += copy(data[o%fakeStatusPage:], p[done:])
+	}
+	return len(p), nil
+}
+
+func (f *fakeStatusBackend) Flush() error                          { return nil }
+func (f *fakeStatusBackend) Trim(int64, uint32) error              { return nil }
+func (f *fakeStatusBackend) WriteZeroes(int64, uint32, bool) error { return nil }
+func (f *fakeStatusBackend) Close() error                          { return nil }
 
 func (f *fakeStatusBackend) BlockStatus(off int64, length uint32) ([]Extent, error) {
 	var ext []Extent
@@ -57,7 +110,7 @@ func (f *fakeStatusBackend) BlockStatus(off int64, length uint32) ([]Extent, err
 }
 
 func newFakeStatus(size, region uint64) *fakeStatusBackend {
-	return &fakeStatusBackend{memBackend: memBackend{size: size}, region: region, allocated: make([]bool, size/region)}
+	return &fakeStatusBackend{size: size, region: region, allocated: make([]bool, size/region), pages: map[uint64][]byte{}}
 }
 
 // statusServer starts a server with exports: "vol0" (fake status
