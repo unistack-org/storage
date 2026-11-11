@@ -85,7 +85,13 @@ qemu-img info nbd://127.0.0.1:10809/vol0
 unistorctl pool create ssd -replicas 3 -pg-num 128   # политика пула
 unistorctl vol create -pool ssd vm0 100G             # том наследует пул
 ./unistord ... -create ssd/vm0:100G       # то же при старте (-create shortcut)
+unistorctl export create vm0                          # NBD; -type vduse|vhost-user-blk
 ```
+
+В кластерном режиме `-export` нет: экспорт — объект времени работы
+(`unistorctl export create` / REST `POST /v1/exports`), записи о нём
+хранятся в meta и воспроизводятся после рестарта демона. `-export`
+остаётся только в одтонном режиме (name=path[:size]).
 
 `-data-dir` — простой способ поднять OSD: id назначается автоматически
 (наименьший свободный, закрепляется в `<dir>/id`) и больше не указывается

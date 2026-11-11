@@ -36,6 +36,10 @@ type exportHub struct {
 	vols   map[string]*client.Volume // runtime nbd exports: open volume handles
 	vduse  *vduseManager
 	vub    *vubManager
+
+	// metrics feeds the per-export QoS sustained gauges for runtime
+	// NBD exports; nil when metrics are disabled (nil-safe methods).
+	metrics *clusterMetrics
 }
 
 func newExportHub(cl *client.Cluster, logger *log.Logger, vdm *vduseManager, vm *vubManager) *exportHub {
@@ -47,6 +51,15 @@ func (h *exportHub) setNBD(s *nbd.Server) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.nbdSrv = s
+}
+
+// setMetrics wires the metrics registry so runtime NBD exports keep the
+// per-export QoS sustained gauges alive in cluster mode, where exports
+// are created only at runtime through the admin API.
+func (h *exportHub) setMetrics(m *clusterMetrics) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.metrics = m
 }
 
 // setCluster binds the cluster client (the admin's own handle) so
@@ -108,7 +121,8 @@ func (h *exportHub) addNBD(name string, readOnly bool) (nbd.ExportInfo, bool, er
 	}
 	h.vols[name] = vol
 	h.mu.Unlock()
-	srv.AddExport(&nbd.Export{Name: name, Backend: nbd.NewVolumeBackend(vol), ReadOnly: readOnly})
+	backend := h.metrics.trackExport(name, vol, nbd.NewVolumeBackend(vol))
+	srv.AddExport(&nbd.Export{Name: name, Backend: backend, ReadOnly: readOnly})
 	return nbd.ExportInfo{Name: name, ReadOnly: readOnly, Size: vol.Size()}, true, nil
 }
 
@@ -126,6 +140,7 @@ func (h *exportHub) removeNBD(name string) error {
 	if v, ok := h.vols[name]; ok {
 		delete(h.vols, name)
 		h.mu.Unlock()
+		h.metrics.untrackExport(name)
 		_ = v.Close()
 		return nil
 	}
@@ -177,8 +192,8 @@ func normalizeExportType(typ string) (string, bool) {
 
 // handleAddExport creates a runtime export. The read_only flag is
 // persisted on the volume record (meta is the source of truth), so a
-// daemon restart that re-creates exports from -export specs reproduces
-// the same access mode.
+// daemon restart that replays exports from meta records reproduces the
+// same access mode.
 func (a *adminAPI) handleAddExport(w http.ResponseWriter, r *http.Request) {
 	var req exportRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -388,9 +403,10 @@ func (a *adminAPI) forgetExport(typ, name string) {
 
 // replayExports re-creates the recorded exports after a restart. It is
 // best-effort and idempotent (add* paths return created=false when the
-// export is already live, e.g. from a -export boot spec): NBD waits for
-// the server to listen, VDUSE and VUB run right away. A volume that is
-// gone (deleted while the daemon was down) drops its record.
+// export is already live, e.g. a boot -vduse/-vhost-user-blk device
+// created before replay started): NBD waits for the server to listen,
+// VDUSE and VUB run right away. A volume that is gone (deleted while
+// the daemon was down) drops its record.
 func (a *adminAPI) replayExports(ctx context.Context) {
 	if a.exports == nil || a.ms == nil {
 		return

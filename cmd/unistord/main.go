@@ -7,8 +7,10 @@
 //
 //	unistord -listen :10809 -export vol0=/var/lib/unistord/vol0.img:10G [-readonly vol0] [-trim] [-write-zeroes]
 //	unistord ... -export vol0 -vduse vol0=sds-vol0   # VDUSE virtio-blk device (Linux)
-//	unistord ... -export vol0 -vub vol0=/run/vol0.sock   # vhost-user-blk socket (QEMU/Dragonball)
+//	unistord ... -export vol0 -vhost-user-blk vol0=/run/vol0.sock   # vhost-user-blk socket (QEMU/Dragonball)
 //	unistord ... -meta-dir /var/lib/unistord/meta -data-dir /var/lib/unistord/data1 -data-dir /var/lib/unistord/data2 ...  # cluster mode
+//	unistord ... -meta-dir ... -vhost-user-blk vm0=/run/vm0.sock   # cluster: attach a volume at boot (no -export)
+//	in cluster mode exports are runtime objects: "unistorctl export create" (records live in meta and are replayed on restart)
 //	unistord ... -meta-dir ... -osd 1@/var/lib/unistord/data1@10.0.0.5:10810@10.0.1.5:10811  # full OSD spec: id@dir[@data-addr[@ctrl-addr]]
 //	unistord ... -meta-dir ... -metrics 0.0.0.0:8080  # Prometheus /metrics endpoint
 //
@@ -191,11 +193,11 @@ func main() {
 	rule := flag.String("rule", "", "with -meta-dir: crush rule default for -create (empty = first rule in the map)")
 	var creates exportFlag
 	flag.Var(&creates, "create", "with -meta-dir: create volume name:size (or pool/name:size for pool policy) if absent, repeatable")
-	flag.Var(&exports, "export", "export spec name=path[:size] (file/-store) or name (cluster), repeatable")
+	flag.Var(&exports, "export", "standalone only: export spec name=path[:size] (file/-store), repeatable; in cluster mode (-meta-dir) exports are runtime objects: unistorctl export create")
 	var vduseSpecs exportFlag
-	flag.Var(&vduseSpecs, "vduse", "export a -export as a VDUSE virtio-blk device (Linux): spec export or export=devname, repeatable")
+	flag.Var(&vduseSpecs, "vduse", "expose an export (standalone) or a cluster volume (-meta-dir) as a VDUSE virtio-blk device (Linux): spec name or name=devname, repeatable")
 	var vubSpecs exportFlag
-	flag.Var(&vubSpecs, "vhost-user-blk", "export a -export as a vhost-user-blk unix socket (QEMU/Dragonball): spec export or export=socket[:ro], repeatable")
+	flag.Var(&vubSpecs, "vhost-user-blk", "expose an export (standalone) or a cluster volume (-meta-dir) as a vhost-user-blk unix socket (QEMU/Dragonball): spec name or name=socket[:ro], repeatable")
 	flag.Var(&vubSpecs, "vub", "deprecated alias of -vhost-user-blk, repeatable")
 	vubQueues := flag.Int("vub-queues", 1, "vhost-user-blk request queues per export (num-queues)")
 	vubWorkers := flag.Int("vub-workers", 4, "vhost-user-blk concurrent in-flight requests per queue")
@@ -204,7 +206,7 @@ func main() {
 	pprofAddr := flag.String("pprof", "", "serve net/http/pprof on this address (e.g. :6061; empty = disabled)")
 	readWorkers := flag.Int("read-workers", 0, "max concurrent in-flight requests per NBD connection in structured-reply mode (0 = default 32)")
 	var qosSpecs qosFlag
-	flag.Var(&qosSpecs, "qos", "per-export limits name=riops:rbps:wiops:wbps (bandwidth accepts K/M/G/T, 0/empty = unlimited), repeatable; applies to -export exports and cluster exports")
+	flag.Var(&qosSpecs, "qos", "standalone only: per-export limits name=riops:rbps:wiops:wbps (bandwidth accepts K/M/G/T, 0/empty = unlimited), repeatable; in cluster mode QoS rides on the volume (qos-class), in standalone it wraps -export exports")
 	var qosClasses qosFlag
 	flag.Var(&qosClasses, "qos-class", "with -meta-dir: register a QoS class name=riops:rbps:wiops:wbps in meta (volumes reference it via QoSTemplate), repeatable")
 	osdQoS := flag.String("osd-qos", "", "with -meta-dir: aggregate limits per in-process OSD riops:rbps:wiops:wbps (the per-disk ceiling shared by all volumes on it; 0/empty = unlimited)")
@@ -215,7 +217,7 @@ func main() {
 	fsyncBatch := flag.Duration("fsync-batch", 0, "with -commit none: coalesce Sync() calls that land within this window (e.g. 2ms) into one fsync pass (0 = fsync disk on every sync request)")
 	intentLog := flag.Bool("intent", false, "with -commit none|flush|sync (OSD and -store exports): keep a write intent log (vitastor-ideas §2.1) — every write is announced before its data and verified at reopen, so a power loss produces a loud damage report (status warnings, unistor_osd_intent mismatches) instead of silent corruption. Ignored in -commit journal mode (the WAL already rebuilds objects)")
 	vacuumInterval := flag.Int("vacuum-interval", 0, "with -meta-dir: seconds between background vacuums that unlink deleted volumes' objects from the OSDs (0 = off; the admin API and unistorctl vacuum run are the manual triggers)")
-	raftAddr := flag.String("raft", "", "with -meta-dir: replicate meta over raft on this bind address (host:port). Reads always work; writes need a quorum, without one the meta is read-only (503 on the admin API). A node with -raft but no -osd/-export is a storage-less witness voter")
+	raftAddr := flag.String("raft", "", "with -meta-dir: replicate meta over raft on this bind address (host:port). Reads always work; writes need a quorum, without one the meta is read-only (503 on the admin API). A node with -raft but no -osd is a storage-less witness voter")
 	raftPeers := flag.String("raft-peers", "", "with -raft: FULL voter set as comma-separated host:port (including this node), e.g. 10.0.0.1:9401,10.0.0.2:9401,10.0.0.3:9401")
 	raftDir := flag.String("raft-dir", "", "with -raft: raft data directory (default: <meta-dir>/raft)")
 	raftProxy := flag.String("raft-proxy", "", "with -raft: serve write forwarding on this host:port, so writes that reach a follower are relayed to the leader (recommended; use the storage net)")
@@ -469,10 +471,14 @@ func main() {
 			}
 		}
 
-		// Witness: raft voter without storage. No OSDs, no exports:
-		// the process keeps the quorum (and can serve the read-only
-		// admin/status surface) and hosts no data.
-		witness := len(osdSpecs) == 0 && len(exports) == 0 && raftSt != nil
+		if len(exports) > 0 {
+			logger.Fatalf("-export is a standalone flag: in cluster mode exports are runtime objects, create them with \"unistorctl export create\"")
+		}
+
+		// Witness: raft voter without storage. The process keeps the
+		// quorum (and can serve the read-only admin/status surface)
+		// and hosts no data.
+		witness := len(osdSpecs) == 0 && raftSt != nil
 		var es []*nbd.Export
 		disks := newDiskRegistry()
 		// One metrics registry per process. The standalone endpoint
@@ -484,6 +490,7 @@ func main() {
 			mreg = newClusterMetrics()
 		}
 		var hub *exportHub
+		var admin *adminAPI
 		var vdm *vduseManager
 		var vubm *vubManager
 		if *metricsAddr != "" {
@@ -511,7 +518,7 @@ func main() {
 			// (which needs a quorum), and the operator needs the status
 			// and write endpoints available throughout.
 			hub = newExportHub(nil, logger, vdm, vubm)
-			admin, err := newAdminServer(ms, *httpAddr, logger, raftSt, disks, tlsAdmin, tlsClient, *adminToken, hub)
+			admin, err = newAdminServer(ms, *httpAddr, logger, raftSt, disks, tlsAdmin, tlsClient, *adminToken, hub)
 			if err != nil {
 				logger.Fatalf("admin http: %v", err)
 			}
@@ -526,19 +533,15 @@ func main() {
 			admin.importHTTP = &http.Client{Transport: guard.importTransport(), CheckRedirect: guard.checkRedirect, Timeout: 0}
 			admin.importMaxSize = int64(maxSize)
 			hub.setCluster(admin.cluster())
+			hub.setMetrics(mreg)
 			// Recovery runs started over the admin API feed the metrics
 			// registry (nil-safe); the admin itself never serves them.
 			admin.recoveryRecord = mreg.recoveryRecorder()
 			go admin.serve(ctx)
-			// Restart survival: re-create runtime exports recorded in
-			// meta (each add path is idempotent against -export boot
-			// specs) and resume ingest jobs this daemon owned.
-			go admin.replayExports(ctx)
 			go admin.resumeJobs(ctx)
 		}
 		if !witness {
-			var err error
-			es, err = clusterExports(ctx, clusterParams{
+			if err := clusterBoot(ctx, clusterParams{
 				store:      ms,
 				metaDir:    clusterPath,
 				osds:       osdSpecs,
@@ -549,8 +552,6 @@ func main() {
 				minSize:    *minSize,
 				rule:       *rule,
 				creates:    creates,
-				exports:    exports,
-				qosMap:     qosMap,
 				qosClasses: qosClasses,
 				osdQoS:     *osdQoS,
 				commit:     commitMode,
@@ -561,26 +562,40 @@ func main() {
 				disks:      disks,
 				metrics:    mreg,
 				logger:     logger,
-			})
-			if err != nil {
+			}); err != nil {
 				logger.Fatalf("cluster: %v", err)
 			}
 		} else {
-			logger.Printf("witness mode: raft voter, no OSDs and no exports")
-		}
-		if witness {
-			if len(vduseSpecs) > 0 {
-				logger.Fatalf("witness mode has no exports to expose via -vduse")
-			}
-			if len(vubSpecs) > 0 {
-				logger.Fatalf("witness mode has no exports to expose via -vub")
+			logger.Printf("witness mode: raft voter, no OSDs")
+			if len(vduseSpecs) > 0 || len(vubSpecs) > 0 {
+				logger.Fatalf("witness mode hosts no storage: nothing to expose via -vduse/-vhost-user-blk")
 			}
 			<-ctx.Done()
 			logger.Printf("bye")
 			return
 		}
+		// Boot devices: each -vduse / -vhost-user-blk spec names a
+		// cluster volume (exports are runtime objects, so there is no
+		// boot export list to resolve against). Devices created here
+		// are also recorded in meta, so a restart replays them exactly
+		// like admin-API exports.
+		bootCl := client.NewCluster(ms)
+		bootCl.SetPoolLimit(256)
+		if tlsClient != nil {
+			bootCl.SetTLS(tlsClient)
+		}
+		defer bootCl.Close()
+		if vdm != nil {
+			vdm.setContext(ctx)
+		}
+		if vubm != nil {
+			vubm.setContext(ctx)
+		}
 		if len(vduseSpecs) > 0 {
-			if err := vdm.start(ctx, es, vduseSpecs); err != nil {
+			if err := bootClusterDevices(ctx, ms, "vduse", vduseSpecs, qosMap, logger, func(volume, name, _ string, readOnly bool) (bool, error) {
+				created, err := vdm.add(volume, name, bootCl, meta.VolumeSpec{}, readOnly)
+				return created, err
+			}); err != nil {
 				logger.Fatalf("vduse: %v", err)
 			}
 			go func() {
@@ -589,13 +604,29 @@ func main() {
 			}()
 		}
 		if len(vubSpecs) > 0 {
-			if err := vubm.start(ctx, es, vubSpecs); err != nil {
+			if err := bootClusterDevices(ctx, ms, "vhost-user-blk", vubSpecs, qosMap, logger, func(volume, name, socket string, readOnly bool) (bool, error) {
+				v, err := vubm.openVolume(volume, bootCl)
+				if err != nil {
+					return false, err
+				}
+				size := v.Size()
+				err = vubm.create(vubm.shutdownContext(), name, volume, socket, nbd.NewVolumeBackend(v), size, readOnly || v.Spec().ReadOnly)
+				return err == nil, err
+			}); err != nil {
 				logger.Fatalf("vub: %v", err)
 			}
 			go func() {
 				<-ctx.Done()
 				vubm.closeAll()
 			}()
+		}
+		// Restart survival: re-create the runtime exports recorded in
+		// meta (each add path is idempotent) and resume ingest jobs this
+		// daemon owned. Replay starts AFTER the boot devices: boot specs
+		// may pin a custom socket, and add() keyed by name is a no-op on
+		// the device boot already created.
+		if admin != nil {
+			go admin.replayExports(ctx)
 		}
 		serve(ctx, logger, *listen, hub, nbd.ServerOptions{
 			MaxConnections:    *maxConns,
@@ -752,28 +783,24 @@ type clusterParams struct {
 	minSize    int
 	rule       string
 	creates    []string
-	exports    []string
-	qosMap     map[string]string // export name -> rates spec
-	qosClasses []string          // -qos-class name=rates registrations
-	osdQoS     string            // per-OSD aggregate rates spec ("" = none)
-	commit     store.CommitMode  // OSD commit mode
-	fsyncBatch time.Duration     // OSD fsync coalescing window
-	intentLog  bool              // write intent log (ideas §2.1)
-	tlsServer  *tls.Config       // mutual TLS for the OSD data plane (nil = plain)
-	tlsClient  *tls.Config       // client side for cluster pools (nil = plain)
-	disks      *diskRegistry     // hosted OSDs publish disk stats here (admin status)
-	metrics    *clusterMetrics   // prometheus registry (nil = metrics disabled)
+	qosClasses []string         // -qos-class name=rates registrations
+	osdQoS     string           // per-OSD aggregate rates spec ("" = none)
+	commit     store.CommitMode // OSD commit mode
+	fsyncBatch time.Duration    // OSD fsync coalescing window
+	intentLog  bool             // write intent log (ideas §2.1)
+	tlsServer  *tls.Config      // mutual TLS for the OSD data plane (nil = plain)
+	tlsClient  *tls.Config      // client side for cluster pools (nil = plain)
+	disks      *diskRegistry    // hosted OSDs publish disk stats here (admin status)
+	metrics    *clusterMetrics  // prometheus registry (nil = metrics disabled)
 	logger     *log.Logger
 }
 
-// clusterExports brings up a single-process (or multi-process, shared
+// clusterBoot brings up a single-process (or multi-process, shared
 // meta directory) cluster: host the requested in-process OSDs, publish
-// the crush map, create the requested volumes and open every -export
-// name as a clustered volume backend.
-func clusterExports(ctx context.Context, p clusterParams) ([]*nbd.Export, error) {
-	if len(p.exports) == 0 {
-		return nil, fmt.Errorf("at least one -export name is required")
-	}
+// the crush map and create the requested volumes. Exports are not part
+// of the boot: they are runtime objects (admin API / unistorctl) that
+// every node replays from meta.
+func clusterBoot(ctx context.Context, p clusterParams) error {
 	ms := p.store
 	var err error
 	cl := client.NewCluster(ms)
@@ -815,18 +842,18 @@ func clusterExports(ctx context.Context, p clusterParams) ([]*nbd.Export, error)
 	for _, spec := range p.qosClasses {
 		name, rates, err := parseQoSNamed(spec)
 		if err != nil {
-			return nil, fmt.Errorf("-qos-class %q: %w", spec, err)
+			return fmt.Errorf("-qos-class %q: %w", spec, err)
 		}
 		riops, rbps, wiops, wbps, err := parseQoSRates(rates)
 		if err != nil {
-			return nil, fmt.Errorf("-qos-class %q: %w", spec, err)
+			return fmt.Errorf("-qos-class %q: %w", spec, err)
 		}
 		if err := writeMeta("qos class "+name, func() error {
 			return cl.PutQoSClass(ctx, meta.QoSClassRecord{
 				Name: name, ReadIOPS: riops, ReadBPS: rbps, WriteIOPS: wiops, WriteBPS: wbps,
 			})
 		}); err != nil {
-			return nil, err
+			return err
 		}
 		p.logger.Printf("qos class %q: r=%d/%s w=%d/%s", name, riops, humanSize(rbps), wiops, humanSize(wbps))
 	}
@@ -837,7 +864,7 @@ func clusterExports(ctx context.Context, p clusterParams) ([]*nbd.Export, error)
 	if p.osdQoS != "" {
 		aggSpec, err = parseQoSRatesStruct(p.osdQoS)
 		if err != nil {
-			return nil, fmt.Errorf("-osd-qos %q: %w", p.osdQoS, err)
+			return fmt.Errorf("-osd-qos %q: %w", p.osdQoS, err)
 		}
 	}
 
@@ -851,7 +878,7 @@ func clusterExports(ctx context.Context, p clusterParams) ([]*nbd.Export, error)
 	for _, spec := range p.osds {
 		id, dataDir, addr, ctrlAddr, err := parseOSDSpec(spec)
 		if err != nil {
-			return nil, fmt.Errorf("-osd %q: %w", spec, err)
+			return fmt.Errorf("-osd %q: %w", spec, err)
 		}
 		d, err := osd.New(osd.Options{
 			ID:         id,
@@ -868,7 +895,7 @@ func clusterExports(ctx context.Context, p clusterParams) ([]*nbd.Export, error)
 			Logf:       func(f string, a ...any) { p.logger.Printf("osd %d: %s", id, fmt.Sprintf(f, a...)) },
 		})
 		if err != nil {
-			return nil, fmt.Errorf("osd %d: %w", id, err)
+			return fmt.Errorf("osd %d: %w", id, err)
 		}
 		h := &hosted{id: id, d: d, done: make(chan error, 1)}
 		go func() { h.done <- d.Run(ctx) }()
@@ -904,7 +931,7 @@ func clusterExports(ctx context.Context, p clusterParams) ([]*nbd.Export, error)
 		return nil
 	}
 	if err := waitRegistered(); err != nil {
-		return nil, err
+		return err
 	}
 
 	// Local-direct transport: this process hosts OSDs and acts as their
@@ -954,7 +981,7 @@ func clusterExports(ctx context.Context, p clusterParams) ([]*nbd.Export, error)
 	if p.crushmap != "" {
 		src, err := os.ReadFile(p.crushmap)
 		if err != nil {
-			return nil, fmt.Errorf("crushmap: %w", err)
+			return fmt.Errorf("crushmap: %w", err)
 		}
 		rec, err := meta.LatestMap(ctx, ms)
 		have := err == nil
@@ -970,7 +997,7 @@ func clusterExports(ctx context.Context, p clusterParams) ([]*nbd.Export, error)
 			if err := writeMeta(fmt.Sprintf("crushmap epoch %d", pubEpoch), func() error {
 				return cl.MapEpoch(ctx, pubEpoch, src)
 			}); err != nil && !errors.Is(err, meta.ErrConflict) {
-				return nil, fmt.Errorf("publish map epoch %d: %w", pubEpoch, err)
+				return fmt.Errorf("publish map epoch %d: %w", pubEpoch, err)
 			}
 			p.logger.Printf("published crushmap epoch %d (%d bytes)", pubEpoch, len(src))
 		} else if pubEpoch != 0 {
@@ -980,17 +1007,17 @@ func clusterExports(ctx context.Context, p clusterParams) ([]*nbd.Export, error)
 
 	// Placement options from flags, clamped by the map's own buckets.
 	if _, err := cl.Refresh(ctx); err != nil {
-		return nil, fmt.Errorf("placement: %w", err)
+		return fmt.Errorf("placement: %w", err)
 	}
 
 	for _, spec := range p.creates {
 		pool, name, sizeStr, perr := parseCreateSpec(spec)
 		if perr != nil {
-			return nil, fmt.Errorf("-create %q: %w", spec, perr)
+			return fmt.Errorf("-create %q: %w", spec, perr)
 		}
 		size, err := sizeSuffix(sizeStr)
 		if err != nil {
-			return nil, fmt.Errorf("-create %q: %w", spec, err)
+			return fmt.Errorf("-create %q: %w", spec, err)
 		}
 		if _, err := meta.GetVolume(ctx, ms, name); err == nil {
 			continue // already exists
@@ -1025,7 +1052,7 @@ func clusterExports(ctx context.Context, p clusterParams) ([]*nbd.Export, error)
 			}
 			return cerr
 		}); err != nil {
-			return nil, fmt.Errorf("create volume %q: %w", name, err)
+			return fmt.Errorf("create volume %q: %w", name, err)
 		}
 		poolTag := ""
 		if vspec.Pool != "" {
@@ -1034,37 +1061,55 @@ func clusterExports(ctx context.Context, p clusterParams) ([]*nbd.Export, error)
 		p.logger.Printf("created volume %q (%s, r=%d, min_size=%d, pg=%d)%s", name, humanSize(size), vspec.Replicas, vspec.MinSize, vspec.PGNum, poolTag)
 	}
 
-	var es []*nbd.Export
-	for _, name := range p.exports {
-		volName, _, _ := strings.Cut(name, "=") // tolerate name=... form
-		vol, err := cl.OpenVolume(ctx, volName)
-		if err != nil {
-			return nil, err
-		}
-		var backend nbd.Backend = nbd.NewVolumeBackend(vol)
-		// -qos overrides the volume's registered limits for this
-		// process (the operator's local decision; meta stays the
-		// source of truth for other clients).
-		if rates, ok := p.qosMap[volName]; ok {
-			r, err := parseQoSRatesStruct(rates)
-			if err != nil {
-				return nil, fmt.Errorf("-qos %q: %w", volName, err)
+	return nil
+}
+
+// bootClusterDevices wires boot -vduse / -vhost-user-blk specs in
+// cluster mode: every spec names a cluster volume, and open (the
+// manager path) creates the device through the cluster client. Each
+// freshly created device is recorded in meta exactly like an
+// admin-API export, so "export ls" lists it and restart replay keeps
+// it alive (the replay add is an idempotent no-op for a device the
+// boot path re-created, so a custom socket from the spec survives).
+// A -qos entry for a boot volume is a standalone mechanism: cluster
+// QoS rides on the volume (qos-class), so it is only reported.
+func bootClusterDevices(ctx context.Context, ms meta.Store, typ string, specs []string, qosMap map[string]string, logger *log.Logger, open func(volume, name, socket string, readOnly bool) (bool, error)) error {
+	for _, spec := range specs {
+		var volume, name, socket string
+		var readOnly bool
+		switch typ {
+		case "vduse":
+			volume, name = parseVDUSESpec(spec)
+			if err := validateDevName(name); err != nil {
+				return fmt.Errorf("-vduse %q: %w", spec, err)
 			}
-			vol.SetQoS(meta.VolumeSpec{
-				ReadIOPS: r.readIOPS, ReadBPS: r.readBPS,
-				WriteIOPS: r.writeIOPS, WriteBPS: r.writeBPS,
-			})
-			p.logger.Printf("export %q: qos r=%d/%s w=%d/%s", volName, r.readIOPS, humanSize(r.readBPS), r.writeIOPS, humanSize(r.writeBPS))
+		case "vhost-user-blk":
+			volume, socket, readOnly = parseVUBSpec(spec)
+			name = volume
+			if err := validateVUBSocket(socket); err != nil {
+				return fmt.Errorf("-vhost-user-blk %q: %w", spec, err)
+			}
+		default:
+			return fmt.Errorf("boot devices: unsupported export type %q", typ)
 		}
-		// QoS sustained/limit gauges + per-op counters need the export.
-		backend = p.metrics.trackExport(volName, vol, backend)
-		// The read-only flag lives on the volume record (the admin API
-		// persists it), so a restart reproduces the same access mode.
-		ro := vol.Spec().ReadOnly
-		p.logger.Printf("export %q -> cluster volume %q (%s, ro=%v)", volName, volName, humanSize(vol.Size()), ro)
-		es = append(es, &nbd.Export{Name: volName, Backend: backend, ReadOnly: ro})
+		if _, ok := qosMap[volume]; ok {
+			logger.Printf("%s %q: -qos %s=... has no effect in cluster mode: QoS rides on the volume (qos-class)", typ, volume, volume)
+		}
+		created, err := open(volume, name, socket, readOnly)
+		if err != nil {
+			return fmt.Errorf("%s %q: %w", typ, spec, err)
+		}
+		if !created {
+			continue
+		}
+		if _, err := meta.PutExportRecord(ctx, ms, meta.ExportRecord{
+			Type: typ, Name: name, Volume: volume, ReadOnly: readOnly,
+			CreatedAt: time.Now().Unix(),
+		}); err != nil && !meta.IsReadOnly(err) {
+			logger.Printf("%s: persist boot device %q: %v", typ, name, err)
+		}
 	}
-	return es, nil
+	return nil
 }
 
 // pinnedOSDIDs reads <dir>/id pins for -data-dir entries. A missing

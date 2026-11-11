@@ -118,6 +118,19 @@ func (m *vubManager) add(volume, name string, cl *client.Cluster, spec meta.Volu
 	return vubDeviceInfo{Name: name, Socket: sock, Volume: volume, ReadOnly: readOnly, Size: size}, true, nil
 }
 
+// openVolume resolves placement and opens a cluster volume handle for
+// a boot -vhost-user-blk spec (the manager path that honours a custom
+// socket from the spec; add() always derives the default socket).
+func (m *vubManager) openVolume(volume string, cl *client.Cluster) (*client.Volume, error) {
+	if cl == nil {
+		return nil, fmt.Errorf("runtime vhost-user-blk exports need cluster mode (-meta-dir)")
+	}
+	if _, err := cl.Refresh(context.Background()); err != nil {
+		return nil, fmt.Errorf("placement: %w", err)
+	}
+	return cl.OpenVolume(context.Background(), volume)
+}
+
 // remove closes one exporter (and removes its socket).
 func (m *vubManager) remove(name string) error {
 	m.mu.Lock()

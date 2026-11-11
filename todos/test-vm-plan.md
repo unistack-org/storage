@@ -37,8 +37,8 @@
 > владельца — raft сразу; финальная реализация — ядро etcd-io/raft,
 > вариант (e), по решению владельца).** `pkg/meta/raftstore.go` поверх
 > `go.etcd.io/raft/v3` (библиотека, NOT внешний etcd-сервер): флаги
-> `-raft/-raft-dir/-raft-peers`, свидетель = узел `-raft` без `-osd`/
-> `-export` (третья слабая машина даёт кворум); та же `meta.Store`
+> `-raft/-raft-dir/-raft-peers`, свидетель = узел `-raft` без `-osd`
+> (третья слабая машина даёт кворум); та же `meta.Store`
 > (CAS/Watch) поверх FSM-snapshot. При потере кворума — **только чтение**
 > (записи 503 «no quorum»; операторский HTTP живёт: статус, чтение томов,
 > экспорт). Запись, пришедшая не лидеру, форвардится лидеру
@@ -93,7 +93,8 @@
 Есть (проверено в этом плане, не «на глаз»):
 
 - Полноценный clustered-путь: `unistord -meta-dir <meta-каталог> -osd id@dir@addr
-  -crushmap -epoch -create имя:размер -export имя=том` — 3 OSD в процессе,
+  -crushmap -epoch -create имя:размер`, экспорт — `unistorctl export create имя`
+  — 3 OSD в процессе,
   CRUSH-размещение, кворум, epoch-fencing, thin-чтение нулями, trim,
   hard-семантика (деградация = пауза, а не ошибка), `out_time` + пробер.
 - Экспорт в гостя: NBD (полный: flush/trim/write-zeroes, structured replies)
@@ -215,8 +216,8 @@ sparse-образ с дырами, `-` = stdout), `qos ls/put/rm` (классы)
 ### M1.1 `unistord` (один процесс на ноду)
 
 Уже умеет всё данные-ное: `-osd id@dir[@addr]` (повторяемо → 2 NVMe на ноду =
-2 OSD в процессе), `-meta-dir`, `-crushmap -epoch`, `-create`, `-export`,
-NBD/VDUSE, `-pprof`. Добавить:
+2 OSD в процессе), `-meta-dir`, `-crushmap -epoch`, `-create`,
+экспорт через `unistorctl export create`, NBD/VDUSE, `-pprof`. Добавить:
 
 - [x] `-http 127.0.0.1:8443` — служебный HTTP (**это не «ещё один бинарник»**,
       а интерфейс демона): `/healthz`, `/v1/status`, `/v1/osds`,

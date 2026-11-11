@@ -220,8 +220,11 @@ type clusterMetrics struct {
 	recoveryCopies meter.Counter
 	recoveryBytes  meter.Counter
 
-	// tracked exports: name -> volume handle, for the sustained-rate gauges
-	exports map[string]*client.Volume
+	// tracked exports: name -> volume handle, for the sustained-rate gauges.
+	// exportsMu guards the map: runtime exports are added/removed by admin
+	// handlers while scrapes read it.
+	exports   map[string]*client.Volume
+	exportsMu sync.Mutex
 
 	// collectMu serialises snapshot refreshes: with both -http and
 	// -metrics enabled, two handlers scrape one meter.
@@ -337,14 +340,27 @@ func (m *clusterMetrics) trackExport(name string, vol *client.Volume, b nbd.Back
 	if m == nil {
 		return b
 	}
+	m.exportsMu.Lock()
 	if m.exports == nil {
 		m.exports = map[string]*client.Volume{}
 	}
 	m.exports[name] = vol
+	m.exportsMu.Unlock()
 	if _, ok := b.(nbd.StatusReporter); ok {
 		return &metricsStatus{metricsBackend{b: b, m: m, name: name}}
 	}
 	return &metricsBackend{b: b, m: m, name: name}
+}
+
+// untrackExport drops a volume from the per-export sustained gauges
+// (called when an export is removed). Nil-safe.
+func (m *clusterMetrics) untrackExport(name string) {
+	if m == nil {
+		return
+	}
+	m.exportsMu.Lock()
+	delete(m.exports, name)
+	m.exportsMu.Unlock()
 }
 
 // metricsStatus mirrors the wrapped backend's StatusReporter capability
@@ -628,6 +644,7 @@ func (m *clusterMetrics) collect(ctx context.Context, s metricsSource) {
 
 	// QoS sustained rates from the limiter of every volume opened by
 	// this process (the exports it serves).
+	m.exportsMu.Lock()
 	for name, vol := range m.exports {
 		riops, rbps, wiops, wbps := vol.QoSSustained()
 		m.exportSustained.set(float64(riops), name, "read_iops")
@@ -635,6 +652,7 @@ func (m *clusterMetrics) collect(ctx context.Context, s metricsSource) {
 		m.exportSustained.set(float64(wiops), name, "write_iops")
 		m.exportSustained.set(float64(wbps), name, "write_bps")
 	}
+	m.exportsMu.Unlock()
 
 	m.gCluster.set(healthy, "healthy")
 }

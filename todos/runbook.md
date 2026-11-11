@@ -22,7 +22,7 @@ unistord -meta-dir /var/lib/unistord/meta \
   -http 0.0.0.0:8443 -metrics 0.0.0.0:8080 -vacuum-interval 300
 ```
 
-Третья нода — свидетель без дисков: тот же `-raft`, без `-osd`/`-export`.
+Третья нода — свидетель без дисков: тот же `-raft`, без `-osd`.
 Она даёт кворум meta (2 из 3) и поэтому кластер **переживает смерть
 любой из двух storage-нод**: контроль пишет, вторая нода обслуживает I/O.
 Без свидетеля (2 voters) потеря ноды = meta только на чтение.
@@ -122,7 +122,7 @@ curl -T disk.raw 'http://10.0.0.1:8443/v1/volumes/vm-042/import'
 #curl -X POST .../import -d '{"url":"http://files/disk.raw","sha256_url":"http://files/SHA256SUMS"}'
 # алгоритмы: md5 / sha256 / sha512, у каждого своё поле и поле *_url:
 # curl -X POST .../import -d '{"url":"http://files/disk.raw","md5_url":"http://files/MD5SUMS"}'
-unistord -meta-dir ... -export vm-042 -vduse vm-042=sds-vm042   # гость видит sds-vm042
+unistorctl export create vm-042 -type vduse -devname sds-vm042   # гость видит sds-vm042
 ```
 
 Импорт возможен только в уже существующий том (404, если его нет):
