@@ -1171,7 +1171,13 @@ func (s *RaftStore) handleReady(rd raft.Ready) {
 		default:
 			s.applyCommitted(e)
 		}
+		// applyEntry takes s.mu internally, so the advance is its own
+		// critical section: waitApplied (client goroutines) reads
+		// s.applied under RLock and the race detector flags an
+		// unguarded write here.
+		s.mu.Lock()
 		s.applied = e.GetIndex()
+		s.mu.Unlock()
 	}
 	if len(rd.CommittedEntries) > 0 {
 		s.notifyApplied()
