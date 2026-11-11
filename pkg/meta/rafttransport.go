@@ -133,7 +133,12 @@ func newTCPTransport(id uint64, bindAddr string, peers map[uint64]string, tlsCfg
 }
 
 // tlsClientConn upgrades an established TCP connection to TLS, using the
-// peer address host as the SNI/verification name.
+// peer address host as the SNI/verification name. RaftConfig.TLS is a
+// mutual-TLS server config (Certificates + ClientCAs); when dialed as a
+// client it has no RootCAs, so the CA pool used to verify peers falls
+// back to ClientCAs — in a mutual cluster that is exactly the CA that
+// signed every peer certificate (without this, Go would verify peers
+// against the system root pool and reject the cluster's own CA).
 func tlsClientConn(c net.Conn, addr string, cfg *tls.Config) (net.Conn, error) {
 	host, _, err := net.SplitHostPort(addr)
 	if err != nil {
@@ -142,6 +147,9 @@ func tlsClientConn(c net.Conn, addr string, cfg *tls.Config) (net.Conn, error) {
 	sc := cfg.Clone()
 	if sc.ServerName == "" {
 		sc.ServerName = host
+	}
+	if sc.RootCAs == nil && sc.ClientCAs != nil {
+		sc.RootCAs = sc.ClientCAs
 	}
 	tc := tls.Client(c, sc)
 	_ = tc.SetDeadline(time.Now().Add(raftDialTO))
