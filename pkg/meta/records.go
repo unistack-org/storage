@@ -28,12 +28,29 @@ const AllocOIDs = "oids"
 
 // OSDInfo is one OSD's registration.
 type OSDInfo struct {
-	ID       int32   `json:"id"`
-	Addr     string  `json:"addr"`      // host:port of the sdsnet server
+	ID   int32  `json:"id"`
+	Addr string `json:"addr"` // host:port of the sdsnet server (data plane)
+	// CtrlAddr is the optional second sdsnet listen address carrying
+	// control traffic (pings, StatFS, health probes). Empty means the
+	// OSD has no separate control plane and control dials Addr. Keeping
+	// probes off the data network lets cluster health survive a fully
+	// saturated storage network.
+	CtrlAddr string  `json:"ctrl_addr,omitempty"`
 	UUID     string  `json:"uuid"`      // stable per-device identity
 	DataPath string  `json:"data_path"` // human info only
 	Weight   float64 `json:"weight"`    // crush weight, 0 = out
 	BootedAt int64   `json:"booted_at"`
+}
+
+// ControlAddr returns the address control-plane probes (ping, StatFS)
+// should dial: the dedicated CtrlAddr when the OSD registered one,
+// otherwise the data address (a single-plane OSD, and every OSD
+// registered before the split existed).
+func (o OSDInfo) ControlAddr() string {
+	if o.CtrlAddr != "" {
+		return o.CtrlAddr
+	}
+	return o.Addr
 }
 
 // VolumeSpec describes a volume (thin-provisioned object-backed image).

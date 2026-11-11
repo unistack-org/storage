@@ -746,7 +746,7 @@ func clusterExports(ctx context.Context, p clusterParams) ([]*nbd.Export, error)
 		}
 	}
 
-	// Host in-process OSDs: id@data-dir[@host:port].
+	// Host in-process OSDs: id@data-dir[@host:port[@ctrl-host:ctrl-port]].
 	type hosted struct {
 		id   int32
 		d    *osd.Daemon
@@ -754,13 +754,14 @@ func clusterExports(ctx context.Context, p clusterParams) ([]*nbd.Export, error)
 	}
 	var running []*hosted
 	for _, spec := range p.osds {
-		id, dataDir, addr, err := parseOSDSpec(spec)
+		id, dataDir, addr, ctrlAddr, err := parseOSDSpec(spec)
 		if err != nil {
 			return nil, fmt.Errorf("-osd %q: %w", spec, err)
 		}
 		d, err := osd.New(osd.Options{
 			ID:         id,
 			Addr:       addr,
+			CtrlAddr:   ctrlAddr,
 			DataDir:    dataDir,
 			Meta:       ms,
 			Aggregate:  aggSpec.pair(),
@@ -930,21 +931,31 @@ func clusterExports(ctx context.Context, p clusterParams) ([]*nbd.Export, error)
 	return es, nil
 }
 
-// parseOSDSpec parses "id@data-dir[@host:port]" (default 127.0.0.1:0).
-func parseOSDSpec(spec string) (id int32, dataDir, addr string, err error) {
+// parseOSDSpec parses "id@data-dir[@host:port[@ctrl-host:ctrl-port]]"
+// (default 127.0.0.1:0, no control plane). The 4th segment is the
+// optional control-plane listen address: pings/StatFS probes dial it
+// instead of the data address, so a saturated data network cannot make
+// the cluster consider this OSD dead.
+func parseOSDSpec(spec string) (id int32, dataDir, addr, ctrlAddr string, err error) {
 	parts := strings.Split(spec, "@")
 	if len(parts) < 2 {
-		return 0, "", "", fmt.Errorf(`expected "id@data-dir[@host:port]"`)
+		return 0, "", "", "", fmt.Errorf(`expected "id@data-dir[@host:port[@ctrl-host:ctrl-port]]"`)
 	}
 	n, err := strconv.ParseInt(parts[0], 10, 32)
 	if err != nil {
-		return 0, "", "", fmt.Errorf("bad id %q", parts[0])
+		return 0, "", "", "", fmt.Errorf("bad id %q", parts[0])
 	}
 	addr = "127.0.0.1:0"
 	if len(parts) >= 3 {
 		addr = parts[2]
 	}
-	return int32(n), parts[1], addr, nil
+	if len(parts) >= 4 {
+		ctrlAddr = parts[3]
+	}
+	if len(parts) > 4 {
+		return 0, "", "", "", fmt.Errorf("too many @ segments")
+	}
+	return int32(n), parts[1], addr, ctrlAddr, nil
 }
 
 // newBackend builds the export backend: a plain sparse file (MVP

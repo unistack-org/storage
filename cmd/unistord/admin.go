@@ -358,16 +358,17 @@ func (a *adminAPI) handleStatus(w http.ResponseWriter, r *http.Request) {
 		warnings = append(warnings, fmt.Sprintf("meta: OSD registry unreadable, liveness unknown: %v", metaErr))
 	}
 	type osdView struct {
-		ID      int32   `json:"id"`
-		Addr    string  `json:"addr"`
-		Weight  float64 `json:"weight"`
-		Live    bool    `json:"live"`
-		Evicted bool    `json:"evicted"`
+		ID       int32   `json:"id"`
+		Addr     string  `json:"addr"`
+		CtrlAddr string  `json:"ctrl_addr,omitempty"`
+		Weight   float64 `json:"weight"`
+		Live     bool    `json:"live"`
+		Evicted  bool    `json:"evicted"`
 	}
 	views := make([]osdView, 0, len(infos))
 	liveCount := 0
 	for _, info := range infos {
-		v := osdView{ID: info.ID, Addr: info.Addr, Weight: info.Weight,
+		v := osdView{ID: info.ID, Addr: info.Addr, CtrlAddr: info.CtrlAddr, Weight: info.Weight,
 			Live: probes[info.ID] == nil, Evicted: info.Weight <= 0}
 		if v.Live {
 			liveCount++

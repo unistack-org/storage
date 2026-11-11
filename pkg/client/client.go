@@ -339,7 +339,7 @@ func (c *Cluster) probeOnce(stop <-chan struct{}) {
 	}
 	addr := map[int32]string{}
 	for _, o := range osds {
-		addr[o.ID] = o.Addr
+		addr[o.ID] = o.ControlAddr()
 	}
 	for _, it := range todo {
 		select {
@@ -541,7 +541,7 @@ func (c *Cluster) ProbeOSDs(ctx context.Context, timeout time.Duration) (infos [
 	}
 	probes = make(map[int32]error, len(infos))
 	for _, info := range infos {
-		pp := sdsnet.NewPool(info.Addr, "vol")
+		pp := sdsnet.NewPool(info.ControlAddr(), "vol")
 		pctx, cancel := context.WithTimeout(ctx, timeout)
 		err := pp.Ping(pctx)
 		cancel()
@@ -572,7 +572,7 @@ func (c *Cluster) ProbeOSDsDisk(ctx context.Context, timeout time.Duration) (inf
 	probes = make(map[int32]error, len(infos))
 	disk = make(map[int32]DiskUsage, len(infos))
 	for _, info := range infos {
-		pp := sdsnet.NewPool(info.Addr, "vol")
+		pp := sdsnet.NewPool(info.ControlAddr(), "vol")
 		pctx, cancel := context.WithTimeout(ctx, timeout)
 		pingErr := pp.Ping(pctx)
 		probes[info.ID] = pingErr

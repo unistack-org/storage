@@ -36,6 +36,12 @@ type Options struct {
 	// Addr is the listen address ("host:port"). Port 0 is allowed;
 	// Addr() reports the resolved one.
 	Addr string
+	// CtrlAddr, when set, is a second listen address served by the
+	// same sdsnet server for control traffic (pings, StatFS): operators
+	// bind it to a management NIC so cluster health survives a
+	// saturated data network. Port 0 is allowed; CtrlAddr() reports the
+	// resolved one. Empty = single plane (control shares Addr).
+	CtrlAddr string
 	// DataDir holds the object store (one directory per OSD).
 	DataDir string
 	// Meta is the cluster metadata store.
@@ -80,6 +86,7 @@ type Daemon struct {
 	opts Options
 	srv  *sdsnet.Server
 	addr string       // resolved listen address (set by Run)
+	ctrl string       // resolved control listen address (set by Run, "" = single plane)
 	st   *store.Store // object store (set by Run)
 
 	mu       sync.Mutex
@@ -133,8 +140,23 @@ func (d *Daemon) Run(ctx context.Context) error {
 	defer probe.Close()
 	addr := probe.Addr().String()
 
+	// Optional control-plane listener: the same sdsnet.Server serves it,
+	// so ping/StatFS answered there are identical to the data plane —
+	// only the network path differs.
+	var ctrlLn net.Listener
+	ctrlAddr := ""
+	if d.opts.CtrlAddr != "" {
+		ctrlLn, err = net.Listen("tcp", d.opts.CtrlAddr)
+		if err != nil {
+			return fmt.Errorf("osd: ctrl listen: %w", err)
+		}
+		defer ctrlLn.Close()
+		ctrlAddr = ctrlLn.Addr().String()
+	}
+
 	d.mu.Lock()
 	d.addr = addr
+	d.ctrl = ctrlAddr
 	d.st = st
 	d.mu.Unlock()
 
@@ -188,8 +210,12 @@ func (d *Daemon) Run(ctx context.Context) error {
 	}
 	defer mapW.Stop()
 
-	serveErr := make(chan error, 1)
+	// Buffer for every listener's Serve error (data + optional ctrl).
+	serveErr := make(chan error, 2)
 	go func() { serveErr <- srv.ServeListener(probe) }()
+	if ctrlLn != nil {
+		go func() { serveErr <- srv.ServeListener(ctrlLn) }()
+	}
 
 	if err := d.applyLatestEpoch(ctx); err != nil {
 		d.opts.Logf("osd: initial epoch: %v", err)
@@ -254,11 +280,13 @@ func (d *Daemon) register() error {
 	if addr == "" {
 		addr = d.opts.Addr
 	}
+	ctrl := d.ctrl
 	uuid := d.uuid
 	d.mu.Unlock()
 	info := meta.OSDInfo{
 		ID:       d.opts.ID,
 		Addr:     addr,
+		CtrlAddr: ctrl,
 		UUID:     uuid,
 		DataPath: d.opts.DataDir,
 		Weight:   1,
@@ -312,6 +340,17 @@ func (d *Daemon) Addr() string {
 		return d.addr
 	}
 	return d.opts.Addr
+}
+
+// CtrlAddr returns the resolved control-plane listen address ("" when
+// the OSD runs a single plane; valid once Run is serving).
+func (d *Daemon) CtrlAddr() string {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.ctrl != "" {
+		return d.ctrl
+	}
+	return d.opts.CtrlAddr
 }
 
 // Fence returns the daemon's current epoch fence (0 = fencing off).
