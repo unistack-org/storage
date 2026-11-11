@@ -123,12 +123,18 @@ func jobView(rec meta.ImportJobRecord) importView {
 // the connection); sha256 is verified over the streamed bytes. Size is
 // the expected source length: when set, an early EOF is a failure (a
 // truncated fetch must never be reported as a completed import).
+//
+// sha256 and sha256_url are alternatives: the second points at a
+// checksum file the daemon fetches and parses before the transfer
+// starts (a control plane that only knows "the mirror publishes
+// SHA256SUMS next to the image" does not have to read it itself).
 type importRequest struct {
-	URL    string `json:"url"`
-	Offset int64  `json:"offset"`
-	SHA256 string `json:"sha256"`
-	Size   int64  `json:"size"`
-	Async  *bool  `json:"async"`
+	URL       string `json:"url"`
+	Offset    int64  `json:"offset"`
+	SHA256    string `json:"sha256"`
+	SHA256URL string `json:"sha256_url"`
+	Size      int64  `json:"size"`
+	Async     *bool  `json:"async"`
 }
 
 type jobRegistry struct {
@@ -196,9 +202,22 @@ func (a *adminAPI) startImport(w http.ResponseWriter, r *http.Request, name stri
 		jsonError(w, http.StatusBadRequest, "bad offset/size")
 		return
 	}
+	if req.SHA256 != "" && req.SHA256URL != "" {
+		jsonError(w, http.StatusBadRequest, "sha256 and sha256_url are alternatives: set one")
+		return
+	}
 	if req.SHA256 != "" {
 		if _, derr := hex.DecodeString(req.SHA256); derr != nil {
 			jsonError(w, http.StatusBadRequest, "sha256 must be hex")
+			return
+		}
+	}
+	if req.SHA256URL != "" {
+		// Validated with the same rules as the image URL: the daemon
+		// is about to fetch this address on the caller's behalf.
+		cu, cerr := url.Parse(req.SHA256URL)
+		if cerr != nil || (cu.Scheme != "http" && cu.Scheme != "https") || cu.Host == "" {
+			jsonError(w, http.StatusBadRequest, "sha256_url must be http(s)")
 			return
 		}
 	}
@@ -218,6 +237,19 @@ func (a *adminAPI) startImport(w http.ResponseWriter, r *http.Request, name stri
 		jsonError(w, http.StatusConflict,
 			"volume %q is read-only (an export set it): clear the flag via PUT /v1/volumes/%s/flags first", name, name)
 		return
+	}
+	// The digest must be in hand before a byte is written: an import
+	// that cannot be verified must fail up front, not report a
+	// completed transfer nobody checked. Resolving it here also means
+	// a boot resume needs no checksum fetch (the job record already
+	// carries the plain digest).
+	if req.SHA256 == "" && req.SHA256URL != "" {
+		sum, cerr := a.fetchChecksum(r.Context(), req.SHA256URL, checksumSubject(req.URL))
+		if cerr != nil {
+			jsonError(w, http.StatusBadGateway, "%v", cerr)
+			return
+		}
+		req.SHA256 = sum
 	}
 	async := req.Async == nil || *req.Async
 	// Deliberately not openAdmin: an import must not saturate the OSDs,
@@ -265,7 +297,7 @@ func (a *adminAPI) startImport(w http.ResponseWriter, r *http.Request, name stri
 	job := &importJob{rec: meta.ImportJobRecord{
 		ID: uuid.NewString(), Volume: name, Type: "import_url",
 		State: string(jobRunning), URL: req.URL, Offset: req.Offset,
-		Size: req.Size, SHA256: req.SHA256,
+		Size: req.Size, SHA256: req.SHA256, SHA256URL: req.SHA256URL,
 		Owner: a.owner(), CreatedAt: time.Now().Unix(),
 	}, done: make(chan struct{})}
 	now := time.Now().Unix()
@@ -380,6 +412,161 @@ func (a *adminAPI) runIngest(job *importJob, volume *client.Volume, seedWritten 
 		a.logger.Printf("admin: import job %s: release lock: %v", final.ID, rerr)
 	}
 	a.logger.Printf("admin: import job %s (%s) finished: state=%s written=%d err=%v", final.ID, name, state, written, err)
+}
+
+// checksumMaxBytes bounds a checksum-file fetch. A digest listing is a
+// few dozen bytes per image; anything past this is not a checksum file
+// (and the cap keeps a misdirected URL from streaming the ISO twice).
+const checksumMaxBytes = 64 << 10
+
+// fetchChecksum downloads a checksum file and extracts the digest of
+// the image it describes, so a caller can point an import at
+// ".../SHA256SUMS" instead of reading the digest itself.
+//
+// The fetch goes through the same guarded client as the image (the
+// SSRF policy and the redirect rules apply to it identically) and the
+// result is validated as a sha256 hex digest: a checksum that cannot
+// be fetched or parsed is a hard error, never a silent skip — an
+// unverified import must not be reported as verified.
+func (a *adminAPI) fetchChecksum(ctx context.Context, rawurl, image string) (string, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawurl, nil)
+	if err != nil {
+		return "", fmt.Errorf("bad sha256_url: %w", err)
+	}
+	resp, err := a.importHTTP.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("fetch sha256_url: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("fetch sha256_url: %s", resp.Status)
+	}
+	// Read one byte past the cap so an oversized body is rejected
+	// rather than silently truncated (a digest cut in half would fail
+	// the verify and blame the image).
+	buf, err := io.ReadAll(io.LimitReader(resp.Body, checksumMaxBytes+1))
+	if err != nil {
+		return "", fmt.Errorf("read sha256_url: %w", err)
+	}
+	if len(buf) > checksumMaxBytes {
+		return "", fmt.Errorf("sha256_url: body over %d bytes: not a checksum file", checksumMaxBytes)
+	}
+	sum, err := parseChecksum(string(buf), image)
+	if err != nil {
+		return "", fmt.Errorf("sha256_url: %w", err)
+	}
+	return sum, nil
+}
+
+// checksumSubject reduces a path to the file name a checksum listing
+// uses for the image (the last URL path segment, minus the coreutils
+// binary-mode star), so listing entries and the image URL can be
+// compared by name.
+func checksumSubject(p string) string {
+	if u, err := url.Parse(p); err == nil {
+		p = u.Path
+	}
+	p = strings.TrimSuffix(p, "/")
+	if i := strings.LastIndexByte(p, '/'); i >= 0 {
+		p = p[i+1:]
+	}
+	p = strings.TrimPrefix(p, "*")
+	if q, err := url.PathUnescape(p); err == nil {
+		return q
+	}
+	return p
+}
+
+// parseChecksum pulls the sha256 digest of image out of the formats
+// publishers actually ship: a bare digest, the coreutils "hash  name"
+// pair (two spaces, or one space in the binary "hash *name" mode), the
+// "<alg>:<hash>" form, and the "SHA256(name)= hash" form.
+//
+// A listing that names its files is resolved by the image's name, so a
+// digest meant for some other file in the directory is never applied
+// to this import; a listing that cannot be resolved to exactly one
+// digest for the image is an error (importing on a digest the file
+// does not attest would be an unverified import wearing a checkmark).
+func parseChecksum(body, image string) (string, error) {
+	type entry struct {
+		digest, name string
+	}
+	var entries []entry
+	for _, line := range strings.Split(body, "\n") {
+		fields := strings.Fields(strings.TrimSpace(line))
+		if len(fields) == 0 {
+			continue
+		}
+		var h, name string
+		switch {
+		case len(fields) == 1:
+			// A bare digest: the listing describes the image itself.
+			h = strings.TrimPrefix(fields[0], "sha256:")
+		case isSHA256Hex(fields[0]):
+			// coreutils "hash  name" (text mode) and "hash *name"
+			// (binary mode): the digest leads, the rest is the name.
+			h, name = fields[0], strings.Join(fields[1:], " ")
+		default:
+			// "SHA256(name)= hash" and friends: the digest is last.
+			h = fields[len(fields)-1]
+			name = strings.Join(fields[:len(fields)-1], " ")
+			if i, j := strings.IndexByte(name, '('), strings.LastIndexByte(name, ')'); i >= 0 && j > i {
+				name = name[i+1 : j]
+			}
+		}
+		if !isSHA256Hex(h) {
+			continue
+		}
+		entries = append(entries, entry{digest: strings.ToLower(h), name: name})
+	}
+	if len(entries) == 0 {
+		return "", fmt.Errorf("no sha256 digest in %q", firstLine(body))
+	}
+	// A named listing is resolved by the file name: only the lines that
+	// name this image count, so a digest meant for another file in the
+	// directory can never be applied to this import. A bare-digest
+	// listing (no names at all) describes the image itself.
+	var picked, bare []entry
+	for _, e := range entries {
+		switch {
+		case e.name == "":
+			// A bare digest describes the image itself.
+			bare = append(bare, e)
+		case image != "" && checksumSubject(e.name) == image:
+			picked = append(picked, e)
+		}
+	}
+	if len(picked) == 0 {
+		if len(bare) == 0 {
+			return "", fmt.Errorf("checksum file has no line for %q", image)
+		}
+		picked = bare
+	}
+	digest := picked[0].digest
+	for _, e := range picked {
+		if e.digest != digest {
+			return "", fmt.Errorf("checksum file has several digests for %q", image)
+		}
+	}
+	return digest, nil
+}
+
+func isSHA256Hex(s string) bool {
+	if len(s) != 64 {
+		return false
+	}
+	_, err := hex.DecodeString(s)
+	return err == nil
+}
+
+func firstLine(s string) string {
+	if i := strings.IndexByte(s, '\n'); i >= 0 {
+		s = s[:i]
+	}
+	if len(s) > 80 {
+		s = s[:80] + "..."
+	}
+	return s
 }
 
 // probeSource asks the origin for the source's size and Range support
