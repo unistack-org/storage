@@ -431,31 +431,41 @@ func TestVolumeVacuumLive(t *testing.T) {
 	// preserves the apparent size), the data object is untouched.
 	// Where punching is real (Linux), the punched file's allocated
 	// bytes drop to 0; the honest metric is st_blocks, not the size.
-	for id := 0; id < 3; id++ {
-		fi, err := os.Stat(objPath(c.dir, id, oid1))
-		if err != nil {
-			t.Fatalf("punched obj on osd %d: %v", id, err)
-		}
-		if fi.Size() != int64(object.Size) {
-			t.Fatalf("punched obj on osd %d: size %d, want %d (KEEP_SIZE punch)", id, fi.Size(), object.Size)
-		}
-		if punchSupported {
-			if a := testAllocated(fi); a != 0 {
-				t.Fatalf("punched obj on osd %d: allocated %d, want 0 (hole punched)", id, a)
+	// The journal applier punches asynchronously, so poll for it.
+	punchDeadline := time.Now().Add(10 * time.Second)
+	for {
+		punched := true
+		for id := 0; id < 3; id++ {
+			fi, err := os.Stat(objPath(c.dir, id, oid1))
+			if err != nil {
+				t.Fatalf("punched obj on osd %d: %v", id, err)
+			}
+			if fi.Size() != int64(object.Size) {
+				t.Fatalf("punched obj on osd %d: size %d, want %d (KEEP_SIZE punch)", id, fi.Size(), object.Size)
+			}
+			if punchSupported && testAllocated(fi) != 0 {
+				punched = false
+			}
+			fi, err = os.Stat(objPath(c.dir, id, oid0))
+			if err != nil {
+				t.Fatalf("data obj on osd %d: %v", id, err)
+			}
+			if fi.Size() != int64(object.Size) {
+				t.Fatalf("data obj on osd %d: size %d, want %d", id, fi.Size(), object.Size)
+			}
+			if punchSupported {
+				if a := testAllocated(fi); a == 0 {
+					t.Fatalf("data obj on osd %d: allocated 0, want >0 (not punched)", id)
+				}
 			}
 		}
-		fi, err = os.Stat(objPath(c.dir, id, oid0))
-		if err != nil {
-			t.Fatalf("data obj on osd %d: %v", id, err)
+		if punched || !punchSupported {
+			break
 		}
-		if fi.Size() != int64(object.Size) {
-			t.Fatalf("data obj on osd %d: size %d, want %d", id, fi.Size(), object.Size)
+		if time.Now().After(punchDeadline) {
+			t.Fatal("live vacuum did not punch obj on every osd (journal applier)")
 		}
-		if punchSupported {
-			if a := testAllocated(fi); a == 0 {
-				t.Fatalf("data obj on osd %d: allocated 0, want >0 (not punched)", id)
-			}
-		}
+		time.Sleep(20 * time.Millisecond)
 	}
 
 	got := make([]byte, object.Size)
