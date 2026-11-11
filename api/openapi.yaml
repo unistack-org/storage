@@ -527,9 +527,10 @@ paths:
       tags: [pools]
       summary: Create a pool
       description: >
-        Omitted placement fields are filled from the cluster defaults
-        (the daemon's -replicas/-pg-num/-rule). Overwriting an existing
-        pool is refused: delete and re-create to change a policy.
+        Omitted placement fields are filled from the compiled cluster
+        snapshot (built-in defaults on a daemon started without
+        -replicas/-pg-num/-rule). Overwriting an existing pool is
+        refused: delete and re-create to change a policy.
       requestBody:
         required: true
         content:

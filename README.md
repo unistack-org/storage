@@ -75,3 +75,15 @@ GOWORK=off go build -o unistord ./cmd/unistord
 qemu-img info nbd://127.0.0.1:10809/vol0
 ```
 
+Кластер без placement-флагов демона (политика размещения живёт в пулах):
+
+```sh
+./unistord -meta-dir /var/lib/unistord/meta -osd 1@/var/lib/unistord/data1 ... &
+unistorctl pool create ssd -replicas 3 -pg-num 128   # политика пула
+unistorctl vol create -pool ssd vm0 100G             # том наследует пул
+./unistord ... -create ssd/vm0:100G       # то же при старте (-create shortcut)
+```
+
+`-replicas/-pg-num/-min-size/-rule` демона — только дефолты для `-create`
+(0/пусто = из snapshot кластера); пулам и `vol create -pool` они не нужны.
+

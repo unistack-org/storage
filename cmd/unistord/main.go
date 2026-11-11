@@ -10,6 +10,11 @@
 //	unistord ... -export vol0 -vub vol0=/run/vol0.sock   # vhost-user-blk socket (QEMU/Dragonball)
 //	unistord ... -meta-dir /var/lib/unistord/meta -osd 1@/var/lib/unistord/osd1 ...  # cluster mode
 //	unistord ... -meta-dir ... -metrics 0.0.0.0:8080  # Prometheus /metrics endpoint
+//
+// Cluster placement policy lives in pools (unistorctl pool create), not
+// in daemon flags: start without -replicas/-pg-num/-rule and create
+// volumes with "vol create -pool <pool>" (or -create pool/name:size).
+// The placement flags remain as per-boot defaults for -create only.
 package main
 
 import (
@@ -175,12 +180,12 @@ func main() {
 	flag.Var(&osds, "osd", "with -meta-dir: start an in-process OSD as id@data-dir[@host:port[@ctrl-host:ctrl-port]], repeatable")
 	crushPath := flag.String("crushmap", "", "with -meta-dir: crushmap file (text/json/binary) to publish")
 	epoch := flag.Uint("epoch", 1, "with -meta-dir: epoch to publish -crushmap under (must be unique)")
-	pgNum := flag.Int("pg-num", 64, "with -meta-dir: cluster pg_num for the placement table")
-	replicas := flag.Int("replicas", 3, "with -meta-dir: replicas per object")
-	minSize := flag.Int("min-size", 0, "with -meta-dir: write quorum width (0 = replicas/2+1); below it writes fail fast (degraded volume)")
-	rule := flag.String("rule", "", "with -meta-dir: crush rule name (default: first rule in the map)")
+	pgNum := flag.Int("pg-num", 0, "with -meta-dir: placement default for -create only (0 = cluster snapshot; pools carry their own pg_num)")
+	replicas := flag.Int("replicas", 0, "with -meta-dir: placement default for -create only (0 = cluster snapshot; pools carry their own replicas)")
+	minSize := flag.Int("min-size", 0, "with -meta-dir: write quorum width for -create (0 = replicas/2+1); below it writes fail fast (degraded volume)")
+	rule := flag.String("rule", "", "with -meta-dir: crush rule default for -create (empty = first rule in the map)")
 	var creates exportFlag
-	flag.Var(&creates, "create", "with -meta-dir: create volume name:size if absent, repeatable")
+	flag.Var(&creates, "create", "with -meta-dir: create volume name:size (or pool/name:size for pool policy) if absent, repeatable")
 	flag.Var(&exports, "export", "export spec name=path[:size] (file/-store) or name (cluster), repeatable")
 	var vduseSpecs exportFlag
 	flag.Var(&vduseSpecs, "vduse", "export a -export as a VDUSE virtio-blk device (Linux): spec export or export=devname, repeatable")
@@ -669,6 +674,21 @@ func serve(ctx context.Context, logger *log.Logger, listen string, hub *exportHu
 	logger.Printf("bye")
 }
 
+// parseCreateSpec splits a -create spec: "name:size" or "pool/name:size".
+func parseCreateSpec(spec string) (pool, name, sizeStr string, err error) {
+	left, size, cut := strings.Cut(spec, ":")
+	if !cut || size == "" {
+		return "", "", "", fmt.Errorf("expected [pool/]name:size")
+	}
+	if pName, vol, hasPool := strings.Cut(left, "/"); hasPool {
+		pool, left = pName, vol
+	}
+	if left == "" {
+		return "", "", "", fmt.Errorf("expected [pool/]name:size")
+	}
+	return pool, left, size, nil
+}
+
 type clusterParams struct {
 	store      meta.Store // shared meta store (dir-backed or raft), opened by the caller
 	metaDir    string     // for logs only
@@ -899,9 +919,9 @@ func clusterExports(ctx context.Context, p clusterParams) ([]*nbd.Export, error)
 	}
 
 	for _, spec := range p.creates {
-		name, sizeStr, ok := strings.Cut(spec, ":")
-		if !ok {
-			return nil, fmt.Errorf("-create %q: expected name:size", spec)
+		pool, name, sizeStr, perr := parseCreateSpec(spec)
+		if perr != nil {
+			return nil, fmt.Errorf("-create %q: %w", spec, perr)
 		}
 		size, err := sizeSuffix(sizeStr)
 		if err != nil {
@@ -910,15 +930,43 @@ func clusterExports(ctx context.Context, p clusterParams) ([]*nbd.Export, error)
 		if _, err := meta.GetVolume(ctx, ms, name); err == nil {
 			continue // already exists
 		}
-		var spec meta.VolumeSpec
+		// The flag values are 0/"" sentinels when unset: without a pool
+		// the compiled cluster snapshot fills them (built-in defaults
+		// when the daemon booted flagless); with a pool the pool record
+		// does, and the flags win over the pool.
+		var vspec meta.VolumeSpec
 		if err := writeMeta("create volume "+name, func() error {
 			var cerr error
-			spec, cerr = cl.CreateVolume(ctx, name, size, 0, p.replicas, p.minSize, p.pgNum, p.rule)
+			if pool == "" && (p.replicas == 0 || p.pgNum == 0) {
+				// Flagless start: take the placement defaults from the
+				// compiled cluster snapshot (built-in defaults when the
+				// daemon booted without -replicas/-pg-num).
+				if snap, serr := cl.Refresh(ctx); serr == nil {
+					if p.replicas == 0 {
+						p.replicas = snap.Replicas
+					}
+					if p.pgNum == 0 {
+						p.pgNum = int(snap.PGNum)
+					}
+					if p.rule == "" {
+						p.rule = snap.Rule
+					}
+				}
+			}
+			if pool != "" {
+				vspec, cerr = cl.CreateVolumeInPool(ctx, pool, name, size, 0, p.replicas, p.minSize, p.pgNum, p.rule)
+			} else {
+				vspec, cerr = cl.CreateVolume(ctx, name, size, 0, p.replicas, p.minSize, p.pgNum, p.rule)
+			}
 			return cerr
 		}); err != nil {
 			return nil, fmt.Errorf("create volume %q: %w", name, err)
 		}
-		p.logger.Printf("created volume %q (%s, r=%d, min_size=%d, pg=%d)", name, humanSize(size), p.replicas, spec.MinSize, p.pgNum)
+		poolTag := ""
+		if vspec.Pool != "" {
+			poolTag = " pool=" + vspec.Pool
+		}
+		p.logger.Printf("created volume %q (%s, r=%d, min_size=%d, pg=%d)%s", name, humanSize(size), vspec.Replicas, vspec.MinSize, vspec.PGNum, poolTag)
 	}
 
 	var es []*nbd.Export

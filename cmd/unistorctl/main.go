@@ -186,7 +186,9 @@ func volCmd(ctx context.Context, cl *client.Cluster, ms meta.Store, args []strin
 			spec, err = cl.CreateVolumeInPool(ctx, *pool, fs.Arg(0), size, quota, *replicas, *minSize, *pgNum, *rule)
 		} else {
 			// No pool: omitted placement flags come from the compiled
-			// cluster defaults (the daemon's -replicas/-pg-num/-rule).
+			// cluster snapshot (built-in defaults on a daemon started
+			// without -replicas/-pg-num; the daemon flags only steer
+			// its own -create shortcut).
 			if *replicas == 0 || *pgNum == 0 || *rule == "" {
 				if snap, rerr := cl.Refresh(ctx); rerr == nil {
 					if *replicas == 0 {
