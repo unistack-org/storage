@@ -125,6 +125,13 @@ func TestHugeMapCompile(t *testing.T) {
 // beat it. We assert observed chi2 <= floor*1.5 + 100 (generous systematic
 // margin) and log max per-device capacity deviation.
 func TestHugeBalance(t *testing.T) {
+	// 100k devices x up to 1M pgs is a statistical measurement, not a
+	// unit check: a single pg1024k subtest alone runs ~10 min under
+	// -race, past the CI package timeout. TestHugeMapCompile keeps the
+	// compile path under the race detector.
+	if testing.Short() {
+		t.Skip("skipping 100k-device balance measurement in short mode")
+	}
 	src := map100k()
 	reg := regHuge(hugeDevices)
 	ws := hugeWeights(hugeDevices)

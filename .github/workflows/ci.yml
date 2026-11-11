@@ -29,7 +29,11 @@ jobs:
       - name: vet
         run: go vet ./...
       - name: test (race)
-        run: go test -race -count=1 ./...
+        # -short skips the 100k-device CRUSH balance measurement, which
+        # alone runs ~10 min under -race (past go test's 10m default);
+        # TestHugeMapCompile keeps the compile path under the detector.
+        # The timeout bump is headroom for the rest of the race suite.
+        run: go test -race -short -count=1 -timeout 15m ./...
       - name: zero-alloc NBD data path gate (Phase 4)
         run: go test -run TestNBDZeroAllocGate -count=1 -v ./pkg/nbd/
       - name: zero-alloc cluster protocol gate (Phase 5)
