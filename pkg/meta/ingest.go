@@ -54,14 +54,26 @@ type ImportJobRecord struct {
 	// Size is the expected total bytes of this ingest (0 = unknown).
 	// Completion is only reported when Written reaches Size.
 	Size int64 `json:"size,omitempty"`
-	// SHA256 is the hex checksum of the source bytes, verified over
+	// Digest is the hex checksum of the source bytes, verified over
 	// exactly the bytes written (on resume: recomputed by re-reading
-	// the volume range). When the caller passed a checksum file, the
-	// daemon resolves it to this digest before the first byte is
-	// written, so a resume needs no second fetch.
-	SHA256 string `json:"sha256,omitempty"`
-	// SHA256URL records that the digest came from a checksum file, so
+	// the volume range). DigestAlgo names the algorithm it is
+	// expressed in; the empty algo means sha256, the only algorithm
+	// the record carried before md5/sha512 existed. When the caller
+	// passed a checksum file, the daemon resolves it to this digest
+	// before the first byte is written, so a resume needs no second
+	// fetch.
+	Digest string `json:"digest,omitempty"`
+	// DigestAlgo is "md5", "sha256" or "sha512" ("" = sha256).
+	DigestAlgo string `json:"digest_algo,omitempty"`
+	// DigestURL records that the digest came from a checksum file, so
 	// the job view can show where the digest came from.
+	DigestURL string `json:"digest_url,omitempty"`
+	// SHA256/SHA256URL are the pre-md5/sha512 spellings of the same
+	// pair, kept so a record persisted by an older daemon (and an
+	// older daemon reading a fresh record's sha256 copy) verifies the
+	// same digest. A record written by current code fills both
+	// spellings when the algorithm is sha256.
+	SHA256    string `json:"sha256,omitempty"`
 	SHA256URL string `json:"sha256_url,omitempty"`
 	// Written is the bytes landed since Offset.
 	Written int64 `json:"written"`
@@ -84,6 +96,43 @@ func (j *ImportJobRecord) Total() int64 {
 		return j.Size
 	}
 	return 0
+}
+
+// SetDigest records the verification digest, filling the sha256 twin
+// for sha256 imports so an older daemon reading this record verifies
+// the same bytes.
+func (j *ImportJobRecord) SetDigest(algo, hexsum, srcURL string) {
+	j.Digest, j.DigestAlgo, j.DigestURL = hexsum, algo, srcURL
+	if algo == "" || algo == "sha256" {
+		j.DigestAlgo = "sha256"
+		j.SHA256, j.SHA256URL = hexsum, srcURL
+	} else {
+		j.SHA256, j.SHA256URL = "", ""
+	}
+}
+
+// DigestSpec resolves the record's digest and algorithm: the empty
+// algo is sha256 (the only algorithm records carried before the
+// generalisation), and a record with only the legacy sha256 spelling
+// resolves through it.
+func (j *ImportJobRecord) DigestSpec() (algo, hexsum string) {
+	algo, hexsum = j.DigestAlgo, j.Digest
+	if hexsum == "" {
+		algo, hexsum = j.DigestAlgo, j.SHA256
+	}
+	if algo == "" {
+		algo = "sha256"
+	}
+	return algo, hexsum
+}
+
+// DigestSourceURL reports the checksum-file URL the digest came from,
+// through either spelling.
+func (j *ImportJobRecord) DigestSourceURL() string {
+	if j.DigestURL != "" {
+		return j.DigestURL
+	}
+	return j.SHA256URL
 }
 
 func importJobKey(id string) string { return id }

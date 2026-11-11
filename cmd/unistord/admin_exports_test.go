@@ -3,7 +3,9 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/md5"
 	"crypto/sha256"
+	"crypto/sha512"
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
@@ -438,6 +440,10 @@ func TestImportChecksumFile(t *testing.T) {
 	hexsum := hex.EncodeToString(sum[:])
 	osum := sha256.Sum256([]byte("other image"))
 	other := hex.EncodeToString(osum[:])
+	msum := md5.Sum(payload)
+	md5sum := hex.EncodeToString(msum[:])
+	gsum := sha512.Sum512(payload)
+	sha512sum := hex.EncodeToString(gsum[:])
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/img.iso", func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write(payload) })
@@ -451,6 +457,8 @@ func TestImportChecksumFile(t *testing.T) {
 	mux.HandleFunc("/prefixed", serve("sha256:"+hexsum+"\n"))
 	mux.HandleFunc("/gostyle", serve("SHA256(img.iso)= "+hexsum+"\n"))
 	mux.HandleFunc("/named-multi", serve(other+"  a.iso\n"+hexsum+"  img.iso\n"))
+	mux.HandleFunc("/md5sums", serve(md5sum+"  img.iso\n"))
+	mux.HandleFunc("/sha512sums", serve(sha512sum+"  img.iso\n"))
 	// Unusable listings: the digest is not the image's, is not the
 	// image's line, is ambiguous, or is not a digest at all.
 	mux.HandleFunc("/wrong-file", serve(hexsum+"  other.iso\n"))
@@ -463,28 +471,30 @@ func TestImportChecksumFile(t *testing.T) {
 	src := httptest.NewServer(mux)
 	defer src.Close()
 
-	for _, tc := range []struct{ path, want string }{
-		{"/sums", ""}, {"/binary", ""}, {"/bare", ""}, {"/prefixed", ""},
-		{"/gostyle", ""}, {"/named-multi", ""},
-		{"/wrong-file", `no line for "img.iso"`},
-		{"/bare-multi", "several digests"},
-		{"/conflict", "several digests"},
-		{"/garbage", "no sha256 digest"},
-		{"/huge", "over"},
+	for _, tc := range []struct{ body, path, want string }{
+		{"sha256_url", "/sums", ""}, {"sha256_url", "/binary", ""}, {"sha256_url", "/bare", ""},
+		{"sha256_url", "/prefixed", ""}, {"sha256_url", "/gostyle", ""}, {"sha256_url", "/named-multi", ""},
+		{"sha256_url", "/wrong-file", `no line for "img.iso"`},
+		{"sha256_url", "/bare-multi", "several digests"},
+		{"sha256_url", "/conflict", "several digests"},
+		{"sha256_url", "/garbage", "no sha256 digest"},
+		{"md5_url", "/sums", "no md5 digest"}, // a sha256 file cannot answer an md5 import
+		{"sha512_url", "/md5sums", "no sha512 digest"},
+		{"sha256_url", "/huge", "over"},
 	} {
 		code, msg := rawAdmin(t, h, http.MethodPost, "/v1/volumes/chk/import",
-			fmt.Sprintf(`{"url":%q,"sha256_url":%q}`, src.URL+"/img.iso", src.URL+tc.path))
+			fmt.Sprintf(`{"url":%q,%q:%q}`, src.URL+"/img.iso", tc.body, src.URL+tc.path))
 		if tc.want == "" {
 			if code != http.StatusAccepted {
-				t.Fatalf("%s: import: %d %s", tc.path, code, msg)
+				t.Fatalf("%s %s: import: %d %s", tc.body, tc.path, code, msg)
 			}
 			continue
 		}
 		if code != http.StatusBadGateway {
-			t.Fatalf("%s: unusable checksum: %d %s, want 502", tc.path, code, msg)
+			t.Fatalf("%s %s: unusable checksum: %d %s, want 502", tc.body, tc.path, code, msg)
 		}
 		if !strings.Contains(msg, tc.want) {
-			t.Fatalf("%s: error %q must mention %q", tc.path, msg, tc.want)
+			t.Fatalf("%s %s: error %q must mention %q", tc.body, tc.path, msg, tc.want)
 		}
 	}
 
@@ -545,6 +555,41 @@ func TestImportChecksumFile(t *testing.T) {
 	if code != http.StatusOK || resp["written"] != float64(len(payload)) {
 		t.Fatalf("sync import with a checksum file: %d %+v", code, resp)
 	}
+
+	// md5 and sha512 verify the same way, inline and by checksum file.
+	for _, tc := range []struct{ field, want string }{
+		{"md5", md5sum}, {"sha512", sha512sum},
+	} {
+		code, resp = doAdminBody(t, h, http.MethodPost, "/v1/volumes/chk/import",
+			fmt.Sprintf(`{"url":%q,%q:%q,"offset":%d,"async":false}`,
+				src.URL+"/img.iso", tc.field, tc.want, 4<<20))
+		if code != http.StatusOK || resp["written"] != float64(len(payload)) {
+			t.Fatalf("sync import with inline %s: %d %+v", tc.field, code, resp)
+		}
+	}
+	for _, tc := range []struct{ field, path string }{
+		{"md5_url", "/md5sums"}, {"sha512_url", "/sha512sums"},
+	} {
+		code, resp = doAdminBody(t, h, http.MethodPost, "/v1/volumes/chk/import",
+			fmt.Sprintf(`{"url":%q,%q:%q,"offset":%d,"async":false}`,
+				src.URL+"/img.iso", tc.field, src.URL+tc.path, 4<<20))
+		if code != http.StatusOK || resp["written"] != float64(len(payload)) {
+			t.Fatalf("sync import with %s: %d %+v", tc.field, code, resp)
+		}
+	}
+
+	// The algorithms are alternatives: one import verifies one digest,
+	// so any two digest fields in one request is a 400.
+	for _, body := range []string{
+		fmt.Sprintf(`{"url":%q,"sha256":%q,"md5":%q}`, src.URL+"/img.iso", hexsum, md5sum),
+		fmt.Sprintf(`{"url":%q,"md5":%q,"md5_url":%q}`, src.URL+"/img.iso", md5sum, src.URL+"/md5sums"),
+		fmt.Sprintf(`{"url":%q,"sha512_url":%q,"md5_url":%q}`, src.URL+"/img.iso", src.URL+"/sha512sums", src.URL+"/md5sums"),
+	} {
+		code, _ := doAdminBody(t, h, http.MethodPost, "/v1/volumes/chk/import", body)
+		if code != http.StatusBadRequest {
+			t.Fatalf("digest request %s: %d, want 400", body, code)
+		}
+	}
 }
 
 // TestImportChecksumFileGuarded proves the checksum fetch is served by
@@ -588,8 +633,11 @@ func TestImportChecksumFileGuarded(t *testing.T) {
 func TestParseChecksum(t *testing.T) {
 	const digest = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 	const other = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+	const md5sum = "0123456789abcdef0123456789abcdef"
+	const md5other = "ffffffffffffffffffffffffffffffff"
+	const sha512sum = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 	for _, tc := range []struct {
-		name, body, image, want, fail string
+		name, algo, body, image, want, fail string
 	}{
 		{name: "bare", body: digest + "\n", image: "img.iso", want: digest},
 		{name: "upper", body: strings.ToUpper(digest) + "\n", image: "img.iso", want: digest},
@@ -610,16 +658,33 @@ func TestParseChecksum(t *testing.T) {
 		{name: "named-ambiguous", body: digest + "  img.iso\n" + other + "  img.iso\n", image: "img.iso", fail: "several digests"},
 		{name: "mixed-forms", body: digest + "\n" + digest + "  img.iso\n", image: "img.iso", want: digest},
 		{name: "bare-ignores-other-names", body: digest + "\n" + other + "  other.iso\n", image: "img.iso", want: digest},
+		// The digest a listing carries must be of the requested
+		// algorithm: an md5 file never satisfies a sha256 import.
+		{name: "md5-listing-sha256-import", body: md5sum + "  img.iso\n", image: "img.iso", fail: "no sha256 digest"},
+		{name: "md5-bare", algo: "md5", body: md5sum + "\n", image: "img.iso", want: md5sum},
+		{name: "md5-prefixed", algo: "md5", body: "MD5:" + strings.ToUpper(md5sum), image: "img.iso", want: md5sum},
+		{name: "md5-coreutils", algo: "md5", body: md5sum + "  img.iso\n", image: "img.iso", want: md5sum},
+		{name: "md5-gostyle", algo: "md5", body: "MD5(img.iso)= " + md5sum + "\n", image: "img.iso", want: md5sum},
+		{name: "md5-multi", algo: "md5", body: md5other + "  a.iso\n" + md5sum + "  img.iso\n", image: "img.iso", want: md5sum},
+		{name: "md5-wrong-len", algo: "md5", body: digest + "  img.iso\n", image: "img.iso", fail: "no md5 digest"},
+		{name: "sha512-bare", algo: "sha512", body: sha512sum + "\n", image: "img.iso", want: sha512sum},
+		{name: "sha512-prefixed", algo: "sha512", body: "sha512:" + sha512sum, image: "img.iso", want: sha512sum},
+		{name: "sha512-coreutils", algo: "sha512", body: sha512sum + " *img.iso\n", image: "img.iso", want: sha512sum},
+		{name: "sha512-gostyle", algo: "sha512", body: "SHA512(img.iso)= " + sha512sum + "\n", image: "img.iso", want: sha512sum},
 	} {
-		got, err := parseChecksum(tc.body, tc.image)
+		algo := tc.algo
+		if algo == "" {
+			algo = "sha256"
+		}
+		got, fail := parseChecksum(tc.body, algo, tc.image)
 		if tc.fail != "" {
-			if err == nil || !strings.Contains(err.Error(), tc.fail) {
-				t.Errorf("%s: got %q, %v; want error mentioning %q", tc.name, got, err, tc.fail)
+			if fail == "" || !strings.Contains(fail, tc.fail) {
+				t.Errorf("%s: got %q, %q; want error mentioning %q", tc.name, got, fail, tc.fail)
 			}
 			continue
 		}
-		if err != nil {
-			t.Errorf("%s: %v", tc.name, err)
+		if fail != "" {
+			t.Errorf("%s: %v", tc.name, fail)
 			continue
 		}
 		if got != tc.want {

@@ -22,6 +22,7 @@ security:
 tags:
   - name: meta
   - name: volumes
+  - name: pools
   - name: snapshots
   - name: data
   - name: exports
@@ -355,7 +356,9 @@ paths:
       description: >
         The volume must already exist (it is created by
         POST /v1/volumes) — an import always lands in a named volume,
-        there is no way to import into nothing. The target's digest is
+        there is no way to import into nothing. Exactly one digest
+        (md5, sha256 or sha512 — inline value or checksum-file URL)
+        is verified over the streamed bytes. The target's digest is
         resolved before the first byte is written, so a checksum that
         cannot be fetched fails the request outright (502) instead of
         leaving a half-written volume.
@@ -371,6 +374,10 @@ paths:
                 offset: {type: integer, minimum: 0, default: 0}
                 sha256: {type: string, description: "expected digest, verified over the streamed bytes; mutually exclusive with sha256_url"}
                 sha256_url: {type: string, description: "http(s) URL of a checksum FILE (sha256sum style, single digest, `sha256:<hex>`, or a multi-file listing — the line is picked by the image file name); the daemon fetches and resolves it before writing. Mutually exclusive with sha256"}
+                md5: {type: string, description: "expected md5 digest; same rules as sha256"}
+                md5_url: {type: string, description: "http(s) URL of an md5 checksum file; same rules as sha256_url"}
+                sha512: {type: string, description: "expected sha512 digest; same rules as sha256"}
+                sha512_url: {type: string, description: "http(s) URL of a sha512 checksum file; same rules as sha256_url"}
                 async: {type: boolean, description: "default true; false blocks until done"}
       responses:
         "202":
@@ -501,6 +508,70 @@ paths:
         "404": {$ref: "#/components/responses/NotFound"}
         "409":
           description: export is in use
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Error"}
+  /v1/pools:
+    get:
+      tags: [pools]
+      summary: Cluster pools (shared placement policy namespaces)
+      responses:
+        "200":
+          description: pool list
+          content:
+            application/json:
+              schema:
+                type: array
+                items: {$ref: "#/components/schemas/Pool"}
+    post:
+      tags: [pools]
+      summary: Create a pool
+      description: >
+        Omitted placement fields are filled from the cluster defaults
+        (the daemon's -replicas/-pg-num/-rule). Overwriting an existing
+        pool is refused: delete and re-create to change a policy.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/Pool"}
+      responses:
+        "201":
+          description: created pool (with resolved defaults)
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Pool"}
+        "400": {$ref: "#/components/responses/BadRequest"}
+        "409":
+          description: pool exists
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Error"}
+  /v1/pools/{name}:
+    parameters:
+      - name: name
+        in: path
+        required: true
+        schema: {type: string}
+    get:
+      tags: [pools]
+      summary: One pool
+      responses:
+        "200":
+          description: pool record
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Pool"}
+        "404": {$ref: "#/components/responses/NotFound"}
+    delete:
+      tags: [pools]
+      summary: Delete a pool
+      description: refused (409) while volumes still reference the pool
+      responses:
+        "204": {description: deleted}
+        "404": {$ref: "#/components/responses/NotFound"}
+        "409":
+          description: volumes still reference the pool
           content:
             application/json:
               schema: {$ref: "#/components/schemas/Error"}
@@ -707,6 +778,7 @@ components:
         min_size: {type: integer}
         rule: {type: string}
         qos_template: {type: string}
+        pool: {type: string, description: "pool the volume was created in (placement provenance)"}
         snapshots:
           type: array
           description: frozen generations the live volume reads through
@@ -744,6 +816,17 @@ components:
         min_size: {type: integer, description: "write quorum (replicas-1 default)"}
         pg_num: {type: integer, description: "power of two"}
         rule: {type: string, description: "crush rule name, default data"}
+        pool: {type: string, description: "create the volume in this pool: omitted placement fields come from the pool, an explicit value wins"}
+    Pool:
+      type: object
+      required: [name]
+      properties:
+        name: {type: string, maxLength: 64, pattern: "[a-zA-Z0-9_.-]+"}
+        replicas: {type: integer, description: "0 = cluster default"}
+        min_size: {type: integer, description: "write quorum, 0 = replicas/2+1"}
+        pg_num: {type: integer, description: "power of two, 0 = cluster default; may not exceed it"}
+        rule: {type: string, description: "crush rule name, empty = cluster default"}
+        qos_template: {type: string, description: "QoS class applied to volumes created in this pool"}
     SnapshotInfo:
       type: object
       properties:
@@ -783,8 +866,11 @@ components:
         written: {type: integer, format: int64}
         offset: {type: integer, format: int64}
         size: {type: integer, format: int64, description: "expected total bytes (0 = unknown)"}
-        sha256: {type: string, description: "digest being verified (resolved when a checksum file was given)"}
+        sha256: {type: string, description: "sha256 digest being verified (legacy field, set for sha256 imports; see digest/digest_algo)"}
         sha256_url: {type: string, description: "checksum file the digest was resolved from, when one was given"}
+        digest: {type: string, description: "digest being verified (resolved when a checksum file was given)"}
+        digest_algo: {type: string, enum: [md5, sha256, sha512], description: "algorithm of digest (empty means sha256 on records written before the field existed)"}
+        digest_url: {type: string, description: "checksum file the digest was resolved from, when one was given"}
         total: {type: integer, format: int64, description: "bytes the progress is measured against"}
         percent: {type: number, format: double}
         error: {type: string}

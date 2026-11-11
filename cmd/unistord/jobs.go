@@ -14,7 +14,9 @@ package main
 
 import (
 	"context"
+	"crypto/md5"
 	"crypto/sha256"
+	"crypto/sha512"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -118,23 +120,143 @@ func jobView(rec meta.ImportJobRecord) importView {
 	return v
 }
 
+// digestSpec is one checksum verification: the algorithm and the hex
+// digest the streamed bytes must hash to. An import carries at most
+// one of them (md5, sha256 or sha512) — a mirror that publishes one
+// algorithm should not have to translate it into another.
+type digestSpec struct {
+	algo string // "md5" | "sha256" | "sha512"
+	hex  string // lowercase hex digest
+}
+
+// algoMD5/algoSHA256/algoSHA512 are the digest algorithms an import can
+// verify against.
+const (
+	algoMD5    = "md5"
+	algoSHA256 = "sha256"
+	algoSHA512 = "sha512"
+)
+
+// digestAlgo reports the hex length of a supported algorithm, and
+// whether it is one at all.
+func digestAlgo(algo string) (int, bool) {
+	switch algo {
+	case algoMD5:
+		return md5.Size * 2, true
+	case algoSHA256:
+		return sha256.Size * 2, true
+	case algoSHA512:
+		return sha512.Size * 2, true
+	}
+	return 0, false
+}
+
+// newHasher returns a fresh hasher for the digest's algorithm.
+func (d digestSpec) newHasher() hash.Hash { return newHasherFor(d.algo) }
+
+// newHasherFor returns a fresh hasher for a supported algorithm
+// (anything unknown hashes as sha256, the historical default).
+func newHasherFor(algo string) hash.Hash {
+	switch algo {
+	case algoMD5:
+		return md5.New()
+	case algoSHA512:
+		return sha512.New()
+	}
+	return sha256.New()
+}
+
+// check compares the finished sum against the wanted digest.
+func (d digestSpec) check(sum []byte) error {
+	got := hex.EncodeToString(sum)
+	if got != d.hex {
+		return fmt.Errorf("%s mismatch: got %s, want %s", d.algo, got, d.hex)
+	}
+	return nil
+}
+
 // importRequest is the POST .../import body. Async defaults to true
 // when the client asks for a checksum (a multi-GB ISO must not hold
-// the connection); sha256 is verified over the streamed bytes. Size is
-// the expected source length: when set, an early EOF is a failure (a
-// truncated fetch must never be reported as a completed import).
+// the connection); the digest is verified over the streamed bytes.
+// Size is the expected source length: when set, an early EOF is a
+// failure (a truncated fetch must never be reported as a completed
+// import).
 //
-// sha256 and sha256_url are alternatives: the second points at a
-// checksum file the daemon fetches and parses before the transfer
-// starts (a control plane that only knows "the mirror publishes
-// SHA256SUMS next to the image" does not have to read it itself).
+// The digest fields are md5/sha256/sha512, each with a _url twin that
+// points at a checksum file the daemon fetches and parses before the
+// transfer starts (a control plane that only knows "the mirror
+// publishes SHA256SUMS next to the image" does not have to read it
+// itself). A value and its _url are alternatives, and so are the three
+// algorithms: an import verifies against exactly one digest.
 type importRequest struct {
-	URL       string `json:"url"`
-	Offset    int64  `json:"offset"`
+	URL    string `json:"url"`
+	Offset int64  `json:"offset"`
+	Size   int64  `json:"size"`
+	Async  *bool  `json:"async"`
+
 	SHA256    string `json:"sha256"`
 	SHA256URL string `json:"sha256_url"`
-	Size      int64  `json:"size"`
-	Async     *bool  `json:"async"`
+	MD5       string `json:"md5"`
+	MD5URL    string `json:"md5_url"`
+	SHA512    string `json:"sha512"`
+	SHA512URL string `json:"sha512_url"`
+}
+
+// pickDigest validates the request's digest fields and picks the one
+// verification this import runs: value and _url twins are alternatives
+// (the _url form is fetched and parsed before the transfer starts) and
+// the three algorithms are alternatives to each other, so at most one
+// digest is in play. The returned message (non-empty) is the 400
+// reason. A plain digest is validated as hex of its algorithm's
+// length; a _url with the same field set is rejected before anything
+// is fetched.
+func pickDigest(req importRequest) (algo, digest, digestURL, bad string) {
+	type field struct {
+		algo, val, u string
+	}
+	fields := []field{
+		{algoMD5, req.MD5, req.MD5URL},
+		{algoSHA256, req.SHA256, req.SHA256URL},
+		{algoSHA512, req.SHA512, req.SHA512URL},
+	}
+	var chosen field
+	seen := 0
+	for _, f := range fields {
+		if f.val == "" && f.u == "" {
+			continue
+		}
+		if f.val != "" && f.u != "" {
+			return "", "", "", fmt.Sprintf("%s and %s_url are alternatives: set one", f.algo, f.algo)
+		}
+		seen++
+		chosen = f
+	}
+	if seen > 1 {
+		return "", "", "", "md5, sha256 and sha512 are alternatives: an import verifies one digest"
+	}
+	if seen == 0 {
+		return "", "", "", ""
+	}
+	if chosen.u != "" {
+		// Validated with the same rules as the image URL: the daemon
+		// is about to fetch this address on the caller's behalf.
+		cu, cerr := url.Parse(chosen.u)
+		if cerr != nil || (cu.Scheme != "http" && cu.Scheme != "https") || cu.Host == "" {
+			return "", "", "", chosen.algo + "_url must be http(s)"
+		}
+		return chosen.algo, "", chosen.u, ""
+	}
+	n, ok := digestAlgo(chosen.algo)
+	if !ok {
+		return "", "", "", "unknown digest algorithm"
+	}
+	if len(chosen.val) != n {
+		return "", "", "", fmt.Sprintf("%s must be %d hex chars", chosen.algo, n)
+	}
+	if _, derr := hex.DecodeString(chosen.val); derr != nil {
+		return "", "", "", chosen.algo + " must be hex"
+	}
+	return chosen.algo, strings.ToLower(chosen.val), "", ""
 }
 
 type jobRegistry struct {
@@ -202,24 +324,10 @@ func (a *adminAPI) startImport(w http.ResponseWriter, r *http.Request, name stri
 		jsonError(w, http.StatusBadRequest, "bad offset/size")
 		return
 	}
-	if req.SHA256 != "" && req.SHA256URL != "" {
-		jsonError(w, http.StatusBadRequest, "sha256 and sha256_url are alternatives: set one")
+	algo, digest, digestURL, derr := pickDigest(req)
+	if derr != "" {
+		jsonError(w, http.StatusBadRequest, "%s", derr)
 		return
-	}
-	if req.SHA256 != "" {
-		if _, derr := hex.DecodeString(req.SHA256); derr != nil {
-			jsonError(w, http.StatusBadRequest, "sha256 must be hex")
-			return
-		}
-	}
-	if req.SHA256URL != "" {
-		// Validated with the same rules as the image URL: the daemon
-		// is about to fetch this address on the caller's behalf.
-		cu, cerr := url.Parse(req.SHA256URL)
-		if cerr != nil || (cu.Scheme != "http" && cu.Scheme != "https") || cu.Host == "" {
-			jsonError(w, http.StatusBadRequest, "sha256_url must be http(s)")
-			return
-		}
 	}
 	spec, err := meta.GetVolume(r.Context(), a.ms, name)
 	if err != nil {
@@ -243,13 +351,13 @@ func (a *adminAPI) startImport(w http.ResponseWriter, r *http.Request, name stri
 	// completed transfer nobody checked. Resolving it here also means
 	// a boot resume needs no checksum fetch (the job record already
 	// carries the plain digest).
-	if req.SHA256 == "" && req.SHA256URL != "" {
-		sum, cerr := a.fetchChecksum(r.Context(), req.SHA256URL, checksumSubject(req.URL))
-		if cerr != nil {
-			jsonError(w, http.StatusBadGateway, "%v", cerr)
+	if digest == "" && digestURL != "" {
+		sum, cerr := a.fetchChecksum(r.Context(), digestURL, algo, checksumSubject(req.URL))
+		if cerr != "" {
+			jsonError(w, http.StatusBadGateway, "%s", cerr)
 			return
 		}
-		req.SHA256 = sum
+		digest = sum
 	}
 	async := req.Async == nil || *req.Async
 	// Deliberately not openAdmin: an import must not saturate the OSDs,
@@ -283,7 +391,7 @@ func (a *adminAPI) startImport(w http.ResponseWriter, r *http.Request, name stri
 	if !async {
 		defer volume.Close()
 		var written int64
-		_, err := a.ingestURL(r.Context(), volume, req.URL, req.Offset, req.Size, req.SHA256, nil, &written)
+		_, err := a.ingestURL(r.Context(), volume, req.URL, req.Offset, req.Size, digestSpec{algo: algo, hex: digest}, nil, &written)
 		if err != nil {
 			jsonError(w, http.StatusBadGateway, "import: %v", err)
 			return
@@ -297,9 +405,11 @@ func (a *adminAPI) startImport(w http.ResponseWriter, r *http.Request, name stri
 	job := &importJob{rec: meta.ImportJobRecord{
 		ID: uuid.NewString(), Volume: name, Type: "import_url",
 		State: string(jobRunning), URL: req.URL, Offset: req.Offset,
-		Size: req.Size, SHA256: req.SHA256, SHA256URL: req.SHA256URL,
-		Owner: a.owner(), CreatedAt: time.Now().Unix(),
+		Size: req.Size, Owner: a.owner(), CreatedAt: time.Now().Unix(),
 	}, done: make(chan struct{})}
+	if digest != "" {
+		job.rec.SetDigest(algo, digest, digestURL)
+	}
 	now := time.Now().Unix()
 	acquired, cur, err := meta.AcquireImportLock(r.Context(), a.ms, name,
 		meta.ImportLock{JobID: job.rec.ID, Owner: job.rec.Owner, Heartbeat: now})
@@ -387,7 +497,8 @@ func (a *adminAPI) runIngest(job *importJob, volume *client.Volume, seedWritten 
 	a.logger.Printf("admin: import job %s (%s) started at offset %d", job.id(), name, job.snapshot().Offset)
 	rec := job.snapshot()
 	written := seedWritten
-	_, err := a.ingestURL(ctx, volume, rec.URL, rec.Offset, rec.Size, rec.SHA256, job.setWritten, &written)
+	algo, hexsum := rec.DigestSpec()
+	_, err := a.ingestURL(ctx, volume, rec.URL, rec.Offset, rec.Size, digestSpec{algo: algo, hex: hexsum}, job.setWritten, &written)
 	close(stop)
 	hbDone.Wait()
 
@@ -421,41 +532,43 @@ const checksumMaxBytes = 64 << 10
 
 // fetchChecksum downloads a checksum file and extracts the digest of
 // the image it describes, so a caller can point an import at
-// ".../SHA256SUMS" instead of reading the digest itself.
+// ".../SHA256SUMS" instead of reading the digest itself. The algo
+// (md5/sha256/sha512) picks which digests in the file count.
 //
 // The fetch goes through the same guarded client as the image (the
 // SSRF policy and the redirect rules apply to it identically) and the
-// result is validated as a sha256 hex digest: a checksum that cannot
-// be fetched or parsed is a hard error, never a silent skip — an
-// unverified import must not be reported as verified.
-func (a *adminAPI) fetchChecksum(ctx context.Context, rawurl, image string) (string, error) {
+// result is validated as a hex digest of that algorithm: a checksum
+// that cannot be fetched or parsed is a hard error, never a silent
+// skip — an unverified import must not be reported as verified. The
+// returned message (non-empty) is the reason for the 502.
+func (a *adminAPI) fetchChecksum(ctx context.Context, rawurl, algo, image string) (string, string) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawurl, nil)
 	if err != nil {
-		return "", fmt.Errorf("bad sha256_url: %w", err)
+		return "", "bad " + algo + "_url: " + err.Error()
 	}
 	resp, err := a.importHTTP.Do(req)
 	if err != nil {
-		return "", fmt.Errorf("fetch sha256_url: %w", err)
+		return "", "fetch " + algo + "_url: " + err.Error()
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("fetch sha256_url: %s", resp.Status)
+		return "", "fetch " + algo + "_url: " + resp.Status
 	}
 	// Read one byte past the cap so an oversized body is rejected
 	// rather than silently truncated (a digest cut in half would fail
 	// the verify and blame the image).
 	buf, err := io.ReadAll(io.LimitReader(resp.Body, checksumMaxBytes+1))
 	if err != nil {
-		return "", fmt.Errorf("read sha256_url: %w", err)
+		return "", "read " + algo + "_url: " + err.Error()
 	}
 	if len(buf) > checksumMaxBytes {
-		return "", fmt.Errorf("sha256_url: body over %d bytes: not a checksum file", checksumMaxBytes)
+		return "", fmt.Sprintf("%s_url: body over %d bytes: not a checksum file", algo, checksumMaxBytes)
 	}
-	sum, err := parseChecksum(string(buf), image)
-	if err != nil {
-		return "", fmt.Errorf("sha256_url: %w", err)
+	sum, perr := parseChecksum(string(buf), algo, image)
+	if perr != "" {
+		return "", algo + "_url: " + perr
 	}
-	return sum, nil
+	return sum, ""
 }
 
 // checksumSubject reduces a path to the file name a checksum listing
@@ -477,17 +590,22 @@ func checksumSubject(p string) string {
 	return p
 }
 
-// parseChecksum pulls the sha256 digest of image out of the formats
-// publishers actually ship: a bare digest, the coreutils "hash  name"
-// pair (two spaces, or one space in the binary "hash *name" mode), the
-// "<alg>:<hash>" form, and the "SHA256(name)= hash" form.
+// parseChecksum pulls the digest of image (in the named algorithm) out
+// of the formats publishers actually ship: a bare digest, the coreutils
+// "hash  name" pair (two spaces, or one space in the binary "hash
+// *name" mode), the "<alg>:<hash>" form, and the "SHA256(name)= hash"
+// form.
 //
 // A listing that names its files is resolved by the image's name, so a
 // digest meant for some other file in the directory is never applied
 // to this import; a listing that cannot be resolved to exactly one
 // digest for the image is an error (importing on a digest the file
 // does not attest would be an unverified import wearing a checkmark).
-func parseChecksum(body, image string) (string, error) {
+func parseChecksum(body, algo, image string) (string, string) {
+	n, ok := digestAlgo(algo)
+	if !ok {
+		return "", "unknown digest algorithm " + algo
+	}
 	type entry struct {
 		digest, name string
 	}
@@ -500,27 +618,28 @@ func parseChecksum(body, image string) (string, error) {
 		var h, name string
 		switch {
 		case len(fields) == 1:
-			// A bare digest: the listing describes the image itself.
-			h = strings.TrimPrefix(fields[0], "sha256:")
-		case isSHA256Hex(fields[0]):
+			// A bare digest, with an optional "algo:" prefix. The
+			// listing describes the image itself.
+			h = stripAlgoPrefix(fields[0])
+		case isDigestHex(fields[0], n):
 			// coreutils "hash  name" (text mode) and "hash *name"
 			// (binary mode): the digest leads, the rest is the name.
 			h, name = fields[0], strings.Join(fields[1:], " ")
 		default:
 			// "SHA256(name)= hash" and friends: the digest is last.
-			h = fields[len(fields)-1]
+			h = stripAlgoPrefix(fields[len(fields)-1])
 			name = strings.Join(fields[:len(fields)-1], " ")
 			if i, j := strings.IndexByte(name, '('), strings.LastIndexByte(name, ')'); i >= 0 && j > i {
 				name = name[i+1 : j]
 			}
 		}
-		if !isSHA256Hex(h) {
+		if !isDigestHex(h, n) {
 			continue
 		}
 		entries = append(entries, entry{digest: strings.ToLower(h), name: name})
 	}
 	if len(entries) == 0 {
-		return "", fmt.Errorf("no sha256 digest in %q", firstLine(body))
+		return "", fmt.Sprintf("no %s digest in %q", algo, firstLine(body))
 	}
 	// A named listing is resolved by the file name: only the lines that
 	// name this image count, so a digest meant for another file in the
@@ -538,21 +657,32 @@ func parseChecksum(body, image string) (string, error) {
 	}
 	if len(picked) == 0 {
 		if len(bare) == 0 {
-			return "", fmt.Errorf("checksum file has no line for %q", image)
+			return "", fmt.Sprintf("checksum file has no line for %q", image)
 		}
 		picked = bare
 	}
 	digest := picked[0].digest
 	for _, e := range picked {
 		if e.digest != digest {
-			return "", fmt.Errorf("checksum file has several digests for %q", image)
+			return "", fmt.Sprintf("checksum file has several digests for %q", image)
 		}
 	}
-	return digest, nil
+	return digest, ""
 }
 
-func isSHA256Hex(s string) bool {
-	if len(s) != 64 {
+// stripAlgoPrefix drops a leading "<algo>:" from a token (the
+// "sha256:<hex>" spelling of a bare digest).
+func stripAlgoPrefix(s string) string {
+	if i := strings.IndexByte(s, ':'); i > 0 {
+		if _, ok := digestAlgo(strings.ToLower(s[:i])); ok {
+			return s[i+1:]
+		}
+	}
+	return s
+}
+
+func isDigestHex(s string, n int) bool {
+	if len(s) != n {
 		return false
 	}
 	_, err := hex.DecodeString(s)
@@ -722,7 +852,7 @@ func firstNonEmpty(a, b string) string {
 // ---------- resilient URL ingest ----------
 
 // ingestURL fetches the URL and streams it into the volume, verifying
-// the optional sha256 over exactly the bytes written. Progress lands
+// the optional digest over exactly the bytes written. Progress lands
 // in progress (when set) and written mirrors the landed total, so the
 // heartbeat can persist it.
 //
@@ -739,10 +869,8 @@ func firstNonEmpty(a, b string) string {
 // rebuilt by re-reading the already-written volume range, so
 // verification covers the whole image, not just the tail.
 func (a *adminAPI) ingestURL(ctx context.Context, v *client.Volume, rawurl string,
-	offset, wantSize int64, want string, progress func(int64), written *int64) (int64, error) {
-	if want != "" {
-		want = strings.ToLower(want)
-	}
+	offset, wantSize int64, want digestSpec, progress func(int64), written *int64) (int64, error) {
+	want.hex = strings.ToLower(want.hex)
 	attempt := 0
 	var seed hash.Hash
 	for {
@@ -766,10 +894,10 @@ func (a *adminAPI) ingestURL(ctx context.Context, v *client.Volume, rawurl strin
 			return *written, ctx.Err()
 		case <-time.After(pause):
 		}
-		if want != "" {
-			h, rerr := a.hashVolumeRange(ctx, v, offset, *written)
+		if want.hex != "" {
+			h, rerr := a.hashVolumeRange(ctx, v, want.algo, offset, *written)
 			if rerr != nil {
-				return *written, fmt.Errorf("rebuild sha256 after resume: %v (re-issue the import to redo it from scratch)", rerr)
+				return *written, fmt.Errorf("rebuild %s after resume: %v (re-issue the import to redo it from scratch)", want.algo, rerr)
 			}
 			seed = h
 		}
@@ -777,10 +905,11 @@ func (a *adminAPI) ingestURL(ctx context.Context, v *client.Volume, rawurl strin
 }
 
 // hashVolumeRange reads [off, off+n) from the volume and returns a
-// sha256 state that has already consumed those bytes, so a resumed
-// ingest verifies the digest over the whole image.
-func (a *adminAPI) hashVolumeRange(ctx context.Context, v *client.Volume, off, n int64) (hash.Hash, error) {
-	h := sha256.New()
+// hasher state (in the given algorithm) that has already consumed
+// those bytes, so a resumed ingest verifies the digest over the whole
+// image.
+func (a *adminAPI) hashVolumeRange(ctx context.Context, v *client.Volume, algo string, off, n int64) (hash.Hash, error) {
+	h := newHasherFor(algo)
 	buf := make([]byte, importChunk)
 	var done int64
 	for done < n {
@@ -813,7 +942,7 @@ func (a *adminAPI) hashVolumeRange(ctx context.Context, v *client.Volume, off, n
 // (0 = unknown); seed is the hash state rebuilt after a resume (nil
 // when the stream starts from the beginning of the image).
 func (a *adminAPI) fetchInto(ctx context.Context, v *client.Volume, rawurl string,
-	base, resume, wantSize int64, want string, seed hash.Hash, progress func(int64), written *int64) error {
+	base, resume, wantSize int64, want digestSpec, seed hash.Hash, progress func(int64), written *int64) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawurl, nil)
 	if err != nil {
 		return fmt.Errorf("bad url: %w", err)
@@ -847,10 +976,10 @@ func (a *adminAPI) fetchInto(ctx context.Context, v *client.Volume, rawurl strin
 		}
 	}
 	var h hash.Hash
-	if want != "" {
+	if want.hex != "" {
 		h = seed
 		if h == nil {
-			h = sha256.New()
+			h = want.newHasher()
 		}
 	}
 	var hashOut io.Writer
@@ -860,11 +989,8 @@ func (a *adminAPI) fetchInto(ctx context.Context, v *client.Volume, rawurl strin
 	if err := streamImport(ctx, v, resp.Body, resume, wantSize, hashOut, progress, written, a.importMaxSize); err != nil {
 		return err
 	}
-	if want != "" {
-		sum := hex.EncodeToString(h.Sum(nil))
-		if sum != want {
-			return fmt.Errorf("sha256 mismatch: got %s, want %s", sum, want)
-		}
+	if want.hex != "" {
+		return want.check(h.Sum(nil))
 	}
 	return nil
 }
