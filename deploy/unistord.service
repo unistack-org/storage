@@ -7,7 +7,7 @@
 #
 # Конфиг демона — переменная окружения UNISTORD_ARGS в
 # /etc/unistord/unistord.env (EnvironmentFile), например:
-#   UNISTORD_ARGS=-cluster /var/lib/unistord/meta -osd 1@/var/lib/unistord/osd1 \
+#   UNISTORD_ARGS=-meta-dir /var/lib/unistord/meta -osd 1@/var/lib/unistord/osd1 \
 #     -http 10.0.0.10:8443 -admin-token <токен клетки> -metrics 0.0.0.0:8080
 # (токен в EnvironmentFile с правами 0600)
 #
@@ -28,6 +28,16 @@ ExecStart=/usr/local/bin/unistord ${UNISTORD_ARGS}
 EnvironmentFile=-/etc/unistord/unistord.env
 Restart=always
 RestartSec=1
+
+# Модули ядра для экспорта. systemd выполняет ExecStartPre от root до
+# основного процесса, поэтому непривилегированному демону не нужны права на
+# modprobe (NoNewPrivileges остаётся). `-` = ошибка не валит юнит: модуль
+# может быть встроен в ядро (built-in), тогда modprobe его не находит.
+# Статическая загрузка на boot — modules-load.d/unistord.conf (надёжнее:
+# работает и когда юнит стартует не через systemd, и до первой записи в
+# /var/lib/unistord). Не добавлять ProtectKernelModules=yes — он блокирует
+# загрузку модулей.
+ExecStartPre=-/usr/sbin/modprobe -q vduse virtio_vdpa vdpa nbd
 
 # The daemon must create and attach VDUSE devices.
 DeviceAllow=/dev/vduse/control rw

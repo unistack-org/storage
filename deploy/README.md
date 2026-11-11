@@ -8,6 +8,8 @@
   `DeviceAllow`. Демон защищён от падения на гостевых memory-fault (см. ниже),
   так что перезапуск — это лечение внешних причин (OOM, systemd-рестарт,
   upgrade), а не защита от собственных багов.
+- `modules-load.d/unistord.conf` — автозагрузка ядерных модулей
+  (`vduse`, `vdpa`, `virtio_vdpa`, `nbd`) на boot. См. «Модули ядра» ниже.
 
 ## Реконнект VDUSE (что гарантировано)
 
@@ -64,6 +66,7 @@ GOWORK=off GOOS=linux GOARCH=amd64 CGO_ENABLED=0 \
 
 Требования хоста: ядро с `CONFIG_VDUSE` (`modprobe vduse virtio_vdpa vdpa`),
 `/dev/vduse` доступен рантайму (юнит выдаёт права через `DeviceAllow`).
+Автозагрузка модулей — в разделе «Модули ядра» ниже.
 
 Подключение тома как диска QEMU (после `POST /v1/exports` с `type=vduse`):
 
@@ -78,3 +81,48 @@ qemu-system-x86_64 ... \
 
 (создание vDPA-устройства и mknod делает `storageagent` клетки; блок приведён
 для ручного воспроизведения).
+
+## Модули ядра
+
+Демон — непривилегированный процесс: `NoNewPrivileges=yes` +
+`ProtectSystem=strict` в `unistord.service`, так что `modprobe` из него
+невозможен **по замыслу** и добавлять ему привилегии нельзя. Загрузку модулей
+делает systemd от root, двумя взаимодополняющими путями:
+
+1. **Статически на boot** — `modules-load.d/unistord.conf` (этот каталог):
+
+   ```sh
+   install -Dm644 deploy/modules-load.d/unistord.conf \
+     /usr/lib/modules-load.d/unistord.conf
+   systemctl restart systemd-modules-load.service
+   lsmod | grep -E 'vduse|vdpa'
+   ```
+
+   `systemd-modules-load.service` отрабатывает на раннем boot, до
+   `unistord.service`, и это единственный путь, который работает, когда
+   демон запущен не через systemd (ручной запуск, контейнер с общим ядром).
+   Директивы `ModulesLoad=` в `[Service]` в systemd **нет** — механизма
+   «загрузи модуль по списку из юнита» не существует; он ровно такой: файл в
+   `modules-load.d`.
+
+2. **Перед стартом юнита** — `ExecStartPre=-/usr/sbin/modprobe -q ...` прямо
+   в `unistord.service`: systemd исполняет его от root до основного процесса,
+   префикс `-` означает, что отсутствие модуля (например, он встроен в ядро)
+   не валит юнит.
+
+Плюс автоматика ядра, на которую можно опираться:
+
+- `open("/dev/vduse/control")` — modalias-автозагрузка уже тянет `vduse`,
+  если модуль установлен и udev работает;
+- `vdpa dev add ... mgmtdev vduse` тянет `virtio_vdpa`.
+
+Нечего грузить, если модули собраны в ядро (`CONFIG_VDUSE=y`): `modprobe -q`
+молча ничего не делает, `DeviceAllow` в юните при этом обязателен — он даёт
+доступ к чардевам, а не загружает модули.
+
+**Не** надо добавлять `ProtectKernelModules=yes` в юнит: он блокирует
+загрузку модулей из процесса, и `ExecStartPre` перестанет работать.
+
+Диагностика: если `/dev/vduse/control` нет, демон отвечает точной подсказкой
+(`vduse: /dev/vduse/control is missing: the vduse kernel module is not loaded
+- run modprobe vduse ...`), а не общим `open: no such file or directory`.
