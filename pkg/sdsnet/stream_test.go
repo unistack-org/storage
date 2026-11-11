@@ -297,7 +297,16 @@ func TestStreamServerGone(t *testing.T) {
 	case <-deadline:
 		t.Fatal("futures never resolved after transport loss")
 	}
-	// Give the reader a moment to mark the stream dead.
+	// A pipelined reader only observes transport loss when it is next
+	// scheduled to read: if every reply drained before the close, the
+	// reader sits idle on the sent channel and the dead socket is
+	// never touched. Probe the stream with one op so an idle stream
+	// detects the transport loss, then wait for the dead mark.
+	probeCtx, probeCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	if pf, perr := s.Submit(probeCtx, &StreamOp{Op: OpSync, OID: 0xFFFF}); perr == nil {
+		_, _ = pf.Wait()
+	}
+	probeCancel()
 	for i := 0; i < 100 && !s.Dead(); i++ {
 		time.Sleep(10 * time.Millisecond)
 	}
