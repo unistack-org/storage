@@ -11,7 +11,7 @@ require (
 	go.etcd.io/raft/v3 v3.7.0
 	go.unistack.org/micro-meter-victoriametrics/v5 v5.0.2
 	go.unistack.org/micro/v5 v5.0.4
-	golang.org/x/sys v0.48.0
+	golang.org/x/sys v0.50.0
 	google.golang.org/protobuf v1.36.12
 	sigs.k8s.io/yaml v1.4.0
 )
