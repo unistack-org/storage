@@ -1,7 +1,8 @@
 // Package iouring is the async I/O ring for the data path.
 //
-// On Linux it wraps io_uring (IORING_SETUP_SQPOLL, registered files and
-// buffers). On other platforms it degrades to a worker pool executing
+// On Linux it wraps io_uring (plain submit-on-enter, no SQPOLL, so the
+// producer may reset an unconsumed SQ tail). On other platforms it
+// degrades to a worker pool executing
 // pread/pwrite — the API is identical so the data-path code is portable.
 //
 // Contract for all implementations:

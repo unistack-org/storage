@@ -264,9 +264,9 @@ func (r *uring) submitOp(op Op, batch *[]uint32) {
 // ringSubmit fills one op and appends its slot to batch (producerMu
 // held). It reports whether the op is resolved: false means the SQ was
 // full (the slot was never taken, so the caller must free SQ entries and
-// retry), true means the op is queued (slot appended) or was failed here
-// (no free slot). On a non-true return no slot is taken, so the batch
-// owner stays the single owner of every handed-out slot.
+// retry), true means the op is queued (slot appended). On a false return
+// no slot is taken, so the batch owner stays the single owner of every
+// handed-out slot.
 func (r *uring) ringSubmit(op Op, batch *[]uint32) bool {
 	r.producerMu.Lock()
 	defer r.producerMu.Unlock()
@@ -274,42 +274,34 @@ func (r *uring) ringSubmit(op Op, batch *[]uint32) bool {
 	if tail-atomic.LoadUint32(r.sqHead) >= r.sqEntries {
 		return false // SQ full: caller flushes the batch and retries
 	}
-	select {
-	case slot := <-r.ids:
-		idx := tail & atomic.LoadUint32(r.sqMask)
-		opCode := uint8(opRead)
-		if op.Write {
-			opCode = opWrite
-		}
-		// Publish the slot contents before the SQE: once sqTail is
-		// advanced the kernel may complete it instantly, and the
-		// completion loop must see this op (not a zeroed slot).
-		r.slotsMu.Lock()
-		r.slots[slot] = op
-		r.slotsMu.Unlock()
-		r.fillSqe(idx, opCode, op.Fd, op.Buf, op.Off, uint64(slot))
-		atomic.StoreUint32(r.sqTail, tail+1)
-		*batch = append(*batch, slot)
-		return true
-	default:
-		// Defensive: ids capacity equals sqEntries, so this is
-		// unreachable while the SQ-full check gates publishing. The op
-		// was counted outstanding at Submit and the kernel will never
-		// see it: undo the count.
-		r.outstanding.Add(-1)
-		op.Done0(errors.New("iouring: no free slots"))
-		return true // resolved with an error: nothing to retry
+	// A slot is returned to ids only when its op completes (CQE drained)
+	// or is reclaimed, so a full ids pool means every slot is in flight.
+	// Blocking here is the data path's flow control: completions refill
+	// ids without producerMu, so this cannot wedge the completion loop.
+	slot := <-r.ids
+	idx := tail & atomic.LoadUint32(r.sqMask)
+	opCode := uint8(opRead)
+	if op.Write {
+		opCode = opWrite
 	}
+	// Publish the slot contents before the SQE: once sqTail is
+	// advanced the kernel may complete it instantly, and the
+	// completion loop must see this op (not a zeroed slot).
+	r.slotsMu.Lock()
+	r.slots[slot] = op
+	r.slotsMu.Unlock()
+	r.fillSqe(idx, opCode, op.Fd, op.Buf, op.Off, uint64(slot))
+	atomic.StoreUint32(r.sqTail, tail+1)
+	*batch = append(*batch, slot)
+	return true
 }
 
-// kick wakes the kernel with the batch; SQEs the kernel did not consume
-// (EINTR partial, refused batch) get an immediate error callback. Those
-// slots were never visible to the kernel, so the completion loop cannot
-// complete them: reclaiming them here is race-free.
-// kick hands the batch's SQEs to the kernel. Ops are counted as
-// outstanding at Submit-enqueue; completions (CQE) and reclaiming
-// un-kernelled SQEs here are the only decrements, so re-submitting
-// the same SQEs (backpressure re-kick) must not touch the counter.
+// kick hands the batch's SQEs to the kernel. The batch is exactly the
+// unpublished SQ region (all fills and kicks serialise on producerMu,
+// and unconsumed SQEs are pruned below), so the consumed count is the
+// sqHead delta: authoritative even when wake() flushed SQEs early.
+// Ops are counted outstanding at Submit-enqueue; CQEs and reclaiming
+// kernel-unreferenced SQEs here are the only decrements.
 // SQEs the kernel did not consume (EINTR partial, refused enter) get
 // an immediate error callback: the kernel never referenced those
 // slots, so the completion loop cannot complete them and reclaiming
@@ -319,23 +311,34 @@ func (r *uring) kick(n int, batch []uint32) {
 		return
 	}
 	r.producerMu.Lock()
-	consumed, err := uringEnter(uintptr(r.ringFd), uint32(n), 0, false)
-	r.producerMu.Unlock()
-	if err == nil && consumed >= n {
-		return
+	headBefore := atomic.LoadUint32(r.sqHead)
+	_, err := uringEnter(uintptr(r.ringFd), uint32(n), 0, false)
+	consumed := int(atomic.LoadUint32(r.sqHead) - headBefore)
+	if consumed < 0 || consumed > n {
+		consumed = 0 // cannot happen without SQPOLL; be safe
 	}
-	if consumed < 0 {
-		consumed = 0
-	}
-	if err != nil && !errors.Is(err, syscall.EINTR) {
-		// The kernel refused the enter and consumed nothing: every
-		// SQE in the batch stays unreferenced by the kernel and must
-		// be reclaimed (a partial consumption always reports EINTR).
-		consumed = 0
+	if consumed < n {
+		// Drop the SQEs the kernel never referenced (see the flush-SQ
+		// idiom in liburing): their slots are reclaimed below, and a
+		// later enter must not submit SQEs whose slots were recycled.
+		atomic.StoreUint32(r.sqTail, atomic.LoadUint32(r.sqHead))
 	}
 	// Reclaimed ops were counted at Submit and the kernel never saw
-	// them: drop their outstanding count so completionLoop can exit.
+	// them: drop their outstanding count. If that empties the ring
+	// during Close, wake the completion loop itself: after this point
+	// no CQE can arrive to wake it, and Close's wake() may have raced
+	// ahead of this reclaim while ops were still counted.
 	r.outstanding.Add(int64(consumed - n))
+	if r.closed.Load() && r.outstanding.Load() <= 0 {
+		r.wakeLocked()
+	}
+	r.producerMu.Unlock()
+	if consumed >= n {
+		return
+	}
+	if err == nil {
+		err = syscall.EINTR // kernel consumed less than asked
+	}
 	for _, slot := range batch[consumed:n] {
 		r.slotsMu.Lock()
 		op := r.slots[slot]
@@ -452,11 +455,24 @@ func (r *uring) Close() error {
 	return err
 }
 
-// wake submits a NOP with wakeSentinel user_data so a completionLoop
-// blocked in enter(GetEvents) wakes, sees closed, and exits.
+// wake unblocks a completionLoop parked in enter(GetEvents).
 func (r *uring) wake() {
 	r.producerMu.Lock()
 	defer r.producerMu.Unlock()
+	r.wakeLocked()
+}
+
+// wakeLocked is wake with producerMu held. Any completion wakes the
+// loop, so a NOP is only needed when nothing is in flight; the NOP is
+// flushed through the SQ first, so a full SQ can never make the fill
+// overwrite an unpublished SQE.
+func (r *uring) wakeLocked() {
+	if head, tail := atomic.LoadUint32(r.sqHead), atomic.LoadUint32(r.sqTail); tail != head {
+		uringEnter(uintptr(r.ringFd), tail-head, 0, false)
+	}
+	if r.outstanding.Load() > 0 {
+		return // an in-flight op's CQE will wake the loop
+	}
 	tail := atomic.LoadUint32(r.sqTail)
 	idx := tail & atomic.LoadUint32(r.sqMask)
 	r.fillSqe(idx, opNop, -1, nil, 0, wakeSentinel)
