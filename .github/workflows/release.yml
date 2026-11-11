@@ -152,7 +152,7 @@ jobs:
         run: ./scripts/gen-release-notes.sh
 
       - name: Upload dist
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: dist
           path: dist
@@ -176,7 +176,7 @@ jobs:
         run: bash scripts/package.sh
 
       - name: Upload packages
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: packages
           path: |
@@ -236,7 +236,7 @@ jobs:
           chown -R "$(id -u):$(id -g)" "$APK_DIR" || true
 
       - name: Upload apks
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: apk
           path: apkout/*.apk
