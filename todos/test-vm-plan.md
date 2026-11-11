@@ -92,7 +92,7 @@
 
 Есть (проверено в этом плане, не «на глаз»):
 
-- Полноценный clustered-путь: `unistord -cluster <meta-каталог> -osd id@dir@addr
+- Полноценный clustered-путь: `unistord -meta-dir <meta-каталог> -osd id@dir@addr
   -crushmap -epoch -create имя:размер -export имя=том` — 3 OSD в процессе,
   CRUSH-размещение, кворум, epoch-fencing, thin-чтение нулями, trim,
   hard-семантика (деградация = пауза, а не ошибка), `out_time` + пробер.
@@ -215,7 +215,7 @@ sparse-образ с дырами, `-` = stdout), `qos ls/put/rm` (классы)
 ### M1.1 `unistord` (один процесс на ноду)
 
 Уже умеет всё данные-ное: `-osd id@dir[@addr]` (повторяемо → 2 NVMe на ноду =
-2 OSD в процессе), `-cluster`, `-crushmap -epoch`, `-create`, `-export`,
+2 OSD в процессе), `-meta-dir`, `-crushmap -epoch`, `-create`, `-export`,
 NBD/VDUSE, `-pprof`. Добавить:
 
 - [x] `-http 127.0.0.1:8443` — служебный HTTP (**это не «ещё один бинарник»**,

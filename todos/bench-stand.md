@@ -493,7 +493,7 @@ AI-нагрузок и MCE-шторма.
 3. Запуск демона из `/mnt/sdsdata/bench`:
    ```
    sudo -n setsid env GOMAXPROCS=8 nohup ~/bench/new-sdsd10 \
-     -cluster meta -osd 0@osd0 -osd 1@osd1 -osd 2@osd2 -crushmap map.txt \
+     -meta-dir meta -osd 0@osd0 -osd 1@osd1 -osd 2@osd2 -crushmap map.txt \
      -epoch 1 -pg-num 64 -replicas 3 -export vol0 -direct -preallocate \
      -listen 127.0.0.1:10809 -pprof 127.0.0.1:6061 \
      -vduse vol0=sds-vol2 >> /mnt/sdsdata/sdsd10.log 2>&1 < /dev/null &

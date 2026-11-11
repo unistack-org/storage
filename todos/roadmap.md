@@ -166,7 +166,7 @@
         класса, warnings на недостижимые max_size/chooseleaf-домены; при живом
         реестре — веса (OSD вне реестра = 0).
 - [x] sds-nbd: бэкенд `VolumeBackend` (том → NBD-экспорт) и режим `sdsd
-      -cluster <meta-каталог>`: OSD в процессе (`-osd id@dir[@addr]`),
+      -meta-dir <meta-каталог>`: OSD в процессе (`-osd id@dir[@addr]`),
       публикация карты (`-crushmap -epoch`), `-create имя:размер`,
       `-export имя` — том как NVMe-диск в госте
   - [x] Смоук: 3 OSD, том 1G rep3 pg64, sdsbench поверх NBD (write 64K ~79 МБ/с,
@@ -251,7 +251,7 @@
       F_RO/F_FLUSH/F_DISCARD/F_ZEROES, GET_VRING_BASE drenит inflight
       (save/restore на тех же fd), reconnect-сессия (reset при дисконнекте).
       `unistord -vub vol0=/run/vol0.sock[:ro]` (-vub-queues/-vub-workers),
-      admin API exports type=vub. Тесты: protocol-фрейминг + fake-QEMU e2e
+      admin API exports type=vhost-user-blk (vub — принятое старое сокращение). Тесты: protocol-фрейминг + fake-QEMU e2e
       (11 тестов, -race, -count=2) — все зелёные на macOS; кросс-сборка linux
       чистая. QSD как мост `--export type=vfio-user` → QEMU
       `-device vfio-user-pci` не требуется (прямой vhost-user-blk).
@@ -494,7 +494,7 @@
 
 ## Фаза 5b — Надёжность, безопасность, наблюдаемость (по урокам Vitastor)
 
-> Статус (2026-11-09): закрыто ядро Ops: HTTP API+OpenAPI, CLI-оболочка, status/healthcheck, метрики, TLS, commit-режимы, SIGTERM-дрейн, онлайн-resize, import/export по HTTP, пообъектный recovery. Открыто: хаос-CI с сидами, каталог багов-инвариантов, Grafana-дашборд, авторегулирование recovery, авто-детект параметров тома.
+> Статус (2026-11-09): закрыто ядро Ops: HTTP API+OpenAPI, CLI-оболочка, status/healthcheck, метрики, TLS, commit-режимы, SIGTERM-дрейн, онлайн-resize, import/export по HTTP, пообъектный recovery; закрыто разделение control/data сетей OSD (2026-11-11). Открыто: хаос-CI с сидами, каталог багов-инвариантов, Grafana-дашборд, авторегулирование recovery, авто-детект параметров тома.
 
 Источник: полный разбор их ченджлогов 0.5.x → 3.2.3 и доклада Highload'2025 —
 `todos/vitastor-ideas.md` (там же нумерация §, релиз-источник каждой позиции и
@@ -542,7 +542,14 @@
       IOPS/BW по операциям (OSD-сервер и экспорты, через hook-колбэки
       `sdsnet.ServerMetrics` — ядро `pkg/` осталось без зависимостей),
       QoS sustained-рейты. Статистика — через count/sum пары
-      (rate/histogram_quantile), не «сумма средних». Осталось: длины
+      (rate/histogram_quantile), не «сумма средних». Реестр —
+      `go.unistack.org/micro-meter-victoriametrics/v5` (реестр официальной
+      библиотеки VictoriaMetrics; единственный путь метрик,
+      `prometheus/client_golang` в демоне нет; upstream v5.0.0 был с
+      нерабочим go.mod — починен (v5.0.1) и выпущен с восстановленным
+      replace форка NickPak/metrics v1.43.1-perf (v5.0.2; replace дублируется
+      в storage/go.mod — replace библиотеки не наследуются потребителями),
+      используется из прокси). Осталось: длины
       очередей, write amplification, сам дашборд Grafana.
       Детали: `vitastor-ideas.md` §6.1–6.2
 - [x] **Graceful SIGINT/SIGTERM** во всех серверах (`sdsd`, `sds-nbd`,
@@ -557,6 +564,15 @@
       Осталось (дорогая часть, по запросу): AES-GCM шифрование заголовков в
       sdsnet, транспортные/дисковые чексуммы xxh3, ACL пользователей,
       AES-256-XTS E2E (Phase 6). Детали: `vitastor-ideas.md` §5
+- [x] **Разделение control/data сетей (2026-11-11)**: у OSD второй слушатель
+      (`-osd id@dir@data@ctrl`, `OSDInfo.CtrlAddr` в регистрации, один
+      sdsnet.Server на оба). Контрольные пробы (пинги prober'а, ProbeOSDs/
+      ProbeOSDsDisk, probe-раунд метрик, `/v1/status`) идут на CtrlAddr с
+      fallback на Addr для старых записей; данные (I/O, placement, vacuum,
+      recovery, replication) — всегда на Addr. Забитая дата-сеть больше не
+      эвиктит живые OSD. Пустой CtrlAddr = одна сеть (совместимость).
+      Тесты: `pkg/client/ctrlplane_test.go` (пробы живые при мёртвом
+      дата-адресе; fallback), `cmd/unistord/osd_spec_test.go`.
 - [x] **Режимы `immediate_commit` (flush/journal/none) + fsync-батчинг** —
       сделано: `-commit none|flush|sync|journal` + `-fsync-batch`
       (`pkg/store`, `unistord`); journal = WAL с ack по fsync журнала,
