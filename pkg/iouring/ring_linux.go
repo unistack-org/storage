@@ -16,9 +16,16 @@ import (
 // carries no x/sys dependency. The first 48 bytes of the SQE layout are a
 // stable kernel ABI: opcode@0, fd@4, off@8, addr@16, len@24, user_data@32.
 const (
-	opNop   = 0
-	opRead  = 22 // IORING_OP_READ (kernel >= 5.6)
-	opWrite = 23 // IORING_OP_WRITE (kernel >= 5.6)
+	opNop        = 0
+	opReadFixed  = 4  // IORING_OP_READ_FIXED (fd in fixed-file table)
+	opWriteFixed = 5  // IORING_OP_WRITE_FIXED
+	opRead       = 22 // IORING_OP_READ (kernel >= 5.6)
+	opWrite      = 23 // IORING_OP_WRITE (kernel >= 5.6)
+
+	iosqeFixedFile = 1 << 0 // SQE flags: fd indexes the fixed-file table
+
+	registerFiles   = 0 // IORING_REGISTER_FILES: int32 fd array
+	registerBuffers = 2 // IORING_REGISTER_BUFFERS: iovec array
 
 	enterGetevents = 1 << 0
 
@@ -77,6 +84,26 @@ type uring struct {
 	filesMu sync.Mutex
 	files   []*os.File // keep registered *os.File alive for the ring's lifetime
 
+	// Fixed-file table (kernel-side, slot-indexed). fileSlots maps an
+	// fd to its slot; fixedFiles is the array handed to
+	// IORING_REGISTER_FILES (-1 = unused slot). Registration replaces
+	// the whole table; the kernel snapshots per-SQE tables for ops
+	// already in flight, so slot reuse under a submitted op is safe,
+	// and UnregisterFile before closing an fd keeps a closed fd from
+	// ever being referenced.
+	fileSlots  map[int32]int
+	fixedFiles []int32
+	// fixedOK is cleared when the kernel refuses fixed files/buffers
+	// (old kernel, locked memory), after which ops use plain opcodes.
+	fixedOK atomic.Bool
+
+	// Registered buffers: each RegisterBuffer appends an iovec to the
+	// kernel table (the kernel pins its pages at registration and
+	// refcounts per-op, so UnregisterBuffer while an op is in flight
+	// is safe). Op.BufIndex is 1-based over this slice.
+	bufMu sync.Mutex
+	bufs  [][]byte
+
 	// work carries ops to submitLoop. Submit sends under submitMu and
 	// Close closes the channel under the same mutex, so a send can
 	// never race the close; submitLoop exits once work is closed and
@@ -127,7 +154,19 @@ func uringEnter(fd uintptr, toSubmit, minComplete uint32, getevents bool) (int, 
 	return int(r1), nil
 }
 
-func New(entries int) (Ring, error) {
+// New creates a ring with the given number of entries.
+func New(entries int) (Ring, error) { return newPinned(entries, nil) }
+
+// NewPinned creates a ring whose internal worker goroutines (the
+// submit/completion loops) run with pin() called on their OS thread
+// before any work: pass a closure invoking CPU affinity pinning (see
+// pkg/cpu) to keep the ring's threads on dedicated cores. A nil pin
+// behaves like New.
+func NewPinned(entries int, pin func()) (Ring, error) {
+	return newPinned(entries, pin)
+}
+
+func newPinned(entries int, pin func()) (Ring, error) {
 	if entries < 8 {
 		entries = 8
 	}
@@ -150,9 +189,22 @@ func New(entries int) (Ring, error) {
 		r.ids <- i
 	}
 	r.work = make(chan Op, p.sqEntries)
+	r.fixedOK.Store(true)
+	r.fileSlots = map[int32]int{}
+	r.bufs = [][]byte{}
 	r.wg.Add(2)
-	go r.submitLoop()
-	go r.completionLoop()
+	go func() {
+		if pin != nil {
+			pin()
+		}
+		r.submitLoop()
+	}()
+	go func() {
+		if pin != nil {
+			pin()
+		}
+		r.completionLoop()
+	}()
 	return r, nil
 }
 
@@ -193,17 +245,28 @@ func mmapRing(fd int, offset, length int) ([]byte, error) {
 }
 
 // fillSqe writes one SQE at index idx. The caller owns slot and op.
-func (r *uring) fillSqe(idx uint32, opCode uint8, fd int32, buf []byte, off int64, userData uint64) {
+// fileSlot >= 0 (fixed-file path): IOSQE_FIXED_FILE with the slot in
+// the fd field. bufIndex >= 0: READ_FIXED/WRITE_FIXED with the kernel's
+// 0-based buf_index at byte 40 (addr/len address bytes inside that
+// registered buffer).
+func (r *uring) fillSqe(idx uint32, opCode uint8, fd int32, fileSlot, bufIndex int, buf []byte, off int64, userData uint64) {
 	p := unsafe.Pointer(uintptr(unsafe.Pointer(&r.sqesMap[0])) + uintptr(idx)*sqeSize)
 	for i := 0; i < sqeSize; i += 8 { // zero: flags/link/etc must be 0
 		*(*uint64)(unsafe.Add(p, i)) = 0
 	}
 	*(*uint8)(unsafe.Add(p, 0)) = opCode
+	if fileSlot >= 0 {
+		*(*uint8)(unsafe.Add(p, 1)) = iosqeFixedFile
+		fd = int32(fileSlot)
+	}
 	*(*int32)(unsafe.Add(p, 4)) = fd
 	if len(buf) > 0 {
 		*(*uint64)(unsafe.Add(p, 8)) = uint64(off)
 		*(*uint64)(unsafe.Add(p, 16)) = uint64(uintptr(unsafe.Pointer(unsafe.SliceData(buf))))
 		*(*uint32)(unsafe.Add(p, 24)) = uint32(len(buf))
+	}
+	if bufIndex >= 0 {
+		*(*uint16)(unsafe.Add(p, 40)) = uint16(bufIndex)
 	}
 	*(*uint64)(unsafe.Add(p, 32)) = userData
 	// Index array: SQE index == ring slot index (fixed identity map).
@@ -284,13 +347,31 @@ func (r *uring) ringSubmit(op Op, batch *[]uint32) bool {
 	if op.Write {
 		opCode = opWrite
 	}
+	fileSlot, bufIndex := -1, -1
+	if r.fixedOK.Load() {
+		if s, ok := r.fileSlots[op.Fd]; ok {
+			fileSlot = s - 1 // kernel table is 0-based
+		}
+		if op.BufIndex >= 1 && op.BufIndex <= len(r.bufs) {
+			bufIndex = op.BufIndex - 1
+		}
+	}
+	if bufIndex >= 0 {
+		// READ_FIXED/WRITE_FIXED: addr/len address the registered
+		// buffer; IOSQE_FIXED_FILE is added when the fd is fixed too.
+		if op.Write {
+			opCode = opWriteFixed
+		} else {
+			opCode = opReadFixed
+		}
+	}
 	// Publish the slot contents before the SQE: once sqTail is
 	// advanced the kernel may complete it instantly, and the
 	// completion loop must see this op (not a zeroed slot).
 	r.slotsMu.Lock()
 	r.slots[slot] = op
 	r.slotsMu.Unlock()
-	r.fillSqe(idx, opCode, op.Fd, op.Buf, op.Off, uint64(slot))
+	r.fillSqe(idx, opCode, op.Fd, fileSlot, bufIndex, op.Buf, op.Off, uint64(slot))
 	atomic.StoreUint32(r.sqTail, tail+1)
 	*batch = append(*batch, slot)
 	return true
@@ -378,6 +459,22 @@ func (r *uring) completionLoop() {
 			var err error
 			if res < 0 {
 				err, n = syscall.Errno(-res), 0
+				// A fixed-file/fixed-buffer SQE refused with EINVAL
+				// (unsupported layout on an unusual kernel): turn the
+				// fast path off permanently and retry as plain I/O so
+				// the data path never surfaces the ABI error.
+				if syscall.Errno(-res) == syscall.EINVAL && r.fixedOK.Load() &&
+					(op.BufIndex >= 1) {
+					r.fixedOK.Store(false)
+					op.BufIndex = 0
+					r.outstanding.Add(1)
+					select {
+					case r.work <- op:
+						continue
+					default:
+						r.outstanding.Add(-1)
+					}
+				}
 			}
 			if op.Done != nil {
 				op.Done(n, err)
@@ -426,11 +523,129 @@ func (r *uring) Submit(ops []Op) error {
 	return nil
 }
 
-// RegisterFile keeps f alive while the ring may use its fd.
+// RegisterFile keeps f alive while the ring may use its fd and adds the
+// fd to the kernel's fixed-file table, so later ops on it are submitted
+// as fixed-file I/O (the kernel skips per-I/O fd get/put).
 func (r *uring) RegisterFile(fd int32, f *os.File) {
 	r.filesMu.Lock()
 	r.files = append(r.files, f)
 	r.filesMu.Unlock()
+
+	r.producerMu.Lock()
+	defer r.producerMu.Unlock()
+	if r.fileSlots[fd] != 0 {
+		return // already registered
+	}
+	slot := len(r.fileSlots) + 1 // 1-based; 0 means "not registered"
+	// Grow the kernel array to slot.
+	for len(r.fixedFiles) < slot {
+		r.fixedFiles = append(r.fixedFiles, -1)
+	}
+	r.fileSlots[fd] = slot
+	r.fixedFiles[slot-1] = fd
+	if err := r.registerSyscall(registerFiles, r.fixedFiles); err != nil {
+		// Fixed files unavailable (old/locked-down kernel): plain
+		// opcodes remain correct, so degrade permanently.
+		r.fixedOK.Store(false)
+		delete(r.fileSlots, fd)
+		r.fixedFiles[slot-1] = -1
+	}
+}
+
+// UnregisterFile drops fd from the fixed-file table. In-flight ops keep
+// the kernel's snapshot of the old table, so closing the fd afterwards
+// is safe.
+func (r *uring) UnregisterFile(fd int32) {
+	r.producerMu.Lock()
+	defer r.producerMu.Unlock()
+	slot, ok := r.fileSlots[fd]
+	if !ok {
+		return
+	}
+	delete(r.fileSlots, fd)
+	r.fixedFiles[slot-1] = -1
+	if err := r.registerSyscall(registerFiles, r.fixedFiles); err != nil {
+		r.fixedOK.Store(false)
+	}
+	// Drop the keep-alive reference only from the kernel side; the
+	// *os.File stays in files[] (Close must not close fds the store
+	// owns; the store closes them itself).
+}
+
+// RegisterBuffer registers data as a fixed buffer and returns its
+// 1-based index for Op.BufIndex. The kernel pins the pages here, so
+// fixed-buffer ops skip per-I/O page pinning. The caller keeps data
+// alive until UnregisterBuffer.
+func (r *uring) RegisterBuffer(data []byte) (int, error) {
+	if len(data) == 0 {
+		return 0, errors.New("iouring: empty buffer")
+	}
+	r.producerMu.Lock()
+	defer r.producerMu.Unlock()
+	r.bufMu.Lock()
+	r.bufs = append(r.bufs, data)
+	all := r.bufs
+	r.bufMu.Unlock()
+	if err := r.registerSyscall(registerBuffers, all); err != nil {
+		r.bufMu.Lock()
+		r.bufs = all[:len(all)-1]
+		r.bufMu.Unlock()
+		r.fixedOK.Store(false)
+		return 0, fmt.Errorf("io_uring_register buffers: %w", err)
+	}
+	return len(all), nil
+}
+
+// UnregisterBuffer drops a registered buffer; ops in flight complete
+// against the kernel's reference.
+func (r *uring) UnregisterBuffer(index int) {
+	r.producerMu.Lock()
+	defer r.producerMu.Unlock()
+	r.bufMu.Lock()
+	if index < 1 || index > len(r.bufs) {
+		r.bufMu.Unlock()
+		return
+	}
+	next := make([][]byte, 0, len(r.bufs)-1)
+	next = append(next, r.bufs[:index-1]...)
+	next = append(next, r.bufs[index:]...)
+	r.bufs = next
+	all := r.bufs
+	r.bufMu.Unlock()
+	if err := r.registerSyscall(registerBuffers, all); err != nil {
+		r.fixedOK.Store(false)
+	}
+}
+
+// registerSyscall replaces the kernel's files/buffers table. Callers
+// hold producerMu (registration serialises with SQE production).
+func (r *uring) registerSyscall(opcode int, arg any) error {
+	var ptr unsafe.Pointer
+	var n uint32
+	switch v := arg.(type) {
+	case []int32:
+		if len(v) == 0 {
+			ptr, n = nil, 0
+		} else {
+			ptr, n = unsafe.Pointer(unsafe.SliceData(v)), uint32(len(v))
+		}
+	case [][]byte:
+		if len(v) == 0 {
+			ptr, n = nil, 0
+		} else {
+			iov := make([]syscall.Iovec, len(v))
+			for i, b := range v {
+				iov[i] = syscall.Iovec{Base: unsafe.SliceData(b), Len: uint64(len(b))}
+			}
+			ptr, n = unsafe.Pointer(unsafe.SliceData(iov)), uint32(len(iov))
+		}
+	}
+	_, _, errno := syscall.Syscall6(sysIoUringRegister, uintptr(r.ringFd),
+		uintptr(opcode), uintptr(ptr), uintptr(n), 0, 0)
+	if errno != 0 {
+		return errno
+	}
+	return nil
 }
 
 func (r *uring) Close() error {
@@ -475,7 +690,7 @@ func (r *uring) wakeLocked() {
 	}
 	tail := atomic.LoadUint32(r.sqTail)
 	idx := tail & atomic.LoadUint32(r.sqMask)
-	r.fillSqe(idx, opNop, -1, nil, 0, wakeSentinel)
+	r.fillSqe(idx, opNop, -1, -1, -1, nil, 0, wakeSentinel)
 	atomic.StoreUint32(r.sqTail, tail+1)
 	uringEnter(uintptr(r.ringFd), 1, 0, false)
 }

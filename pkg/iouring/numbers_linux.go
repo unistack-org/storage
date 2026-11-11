@@ -7,3 +7,6 @@ const (
 	sysIoUringSetup = 425
 	sysIoUringEnter = 426
 )
+
+// io_uring_register syscall number (identical on amd64 and arm64).
+const sysIoUringRegister = 427

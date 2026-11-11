@@ -31,6 +31,12 @@ type Op struct {
 	Off int64
 	// Write selects pwrite (true) or pread (false).
 	Write bool
+	// BufIndex selects a buffer registered with Ring.RegisterBuffer
+	// (> 0): the op is then submitted as READ_FIXED/WRITE_FIXED over
+	// the registered buffer, so the kernel skips per-I/O page pinning
+	// (Buf must alias the registered bytes). 0 = plain buffer (the
+	// zero value keeps plain ops correct).
+	BufIndex int
 	// Done is invoked with the result (bytes transferred, errno/nil).
 	// It runs on a ring worker goroutine and must not block.
 	Done func(n int, err error)
@@ -63,8 +69,24 @@ type Ring interface {
 	Submit(ops []Op) error
 	// RegisterFile associates an open file with the ring so its fd can
 	// be used in Op.Fd (fixed-file registration on Linux; keeping the
-	// *os.File alive elsewhere).
+	// *os.File alive elsewhere). On Linux the fd is added to the
+	// ring's fixed-file table, so later ops on it use fixed-file I/O.
 	RegisterFile(fd int32, f *os.File)
+	// UnregisterFile drops fd from the fixed-file table. Call it before
+	// closing the fd so a slot is never reused under an in-flight op;
+	// ops already in flight complete against the old table. No-op on
+	// the portable implementation.
+	UnregisterFile(fd int32)
+	// RegisterBuffer registers data as a fixed buffer and returns its
+	// index (>= 1) for Op.BufIndex. On Linux the pages are pinned once at
+	// registration; the caller must keep data alive and stable in
+	// placement until UnregisterBuffer. The registered length is
+	// padded to a page boundary, keeping indexes page-aligned. The
+	// portable implementation only assigns an index.
+	RegisterBuffer(data []byte) (int, error)
+	// UnregisterBuffer drops a registered buffer. No-op on the portable
+	// implementation.
+	UnregisterBuffer(index int)
 	// Close stops the ring; all queued callbacks fire with ErrClosed.
 	Close() error
 }
