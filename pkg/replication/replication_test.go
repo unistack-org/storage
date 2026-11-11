@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"net"
 	"os"
 	"sync"
 	"testing"
@@ -109,19 +110,20 @@ func (m *memBackend) Stat(_ context.Context, oid uint64) (uint64, error) {
 	return 0, os.ErrNotExist
 }
 
-// startReplica boots an sdsnet server; returns its address.
+// startReplica boots an sdsnet server; returns its address. The
+// listener is bound here so the address is known synchronously: the
+// old pattern (go Serve(":0") + Addr() poll) raced the Serve goroutine
+// against Close under -race when short-lived servers were recycled.
 func startReplica(t *testing.T) (*sdsnet.Server, Target) {
 	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
 	s := &sdsnet.Server{Backend: newMemBackend(1 << 20)}
-	go func() { _ = s.Serve("127.0.0.1:0") }()
-	deadline := time.Now().Add(2 * time.Second)
-	for s.Addr() == "" && time.Now().Before(deadline) {
-		time.Sleep(time.Millisecond)
-	}
-	if s.Addr() == "" {
-		t.Fatal("replica did not start")
-	}
-	return s, Target{Addr: s.Addr(), Export: "vol0"}
+	t.Cleanup(func() { _ = s.Close() })
+	go func() { _ = s.ServeListener(ln) }()
+	return s, Target{Addr: ln.Addr().String(), Export: "vol0"}
 }
 
 func TestQuorumWriteRF3W2(t *testing.T) {

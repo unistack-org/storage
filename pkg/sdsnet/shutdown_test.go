@@ -57,12 +57,14 @@ func TestShutdownCompletesInFlight(t *testing.T) {
 	case <-time.After(3 * time.Second):
 		t.Fatal("shutdown did not return after drain")
 	}
+	// Serve returns once the listener closes; the send races this check,
+	// so allow a short grace period instead of a non-blocking peek.
 	select {
 	case err := <-serveErr:
 		if err != nil && !errors.Is(err, net.ErrClosed) {
 			t.Fatalf("serve: %v", err)
 		}
-	default:
+	case <-time.After(2 * time.Second):
 		t.Fatal("serve did not return after shutdown")
 	}
 	// New connections after Shutdown must be refused.
