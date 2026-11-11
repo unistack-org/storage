@@ -374,16 +374,22 @@ func (s *DirStore) notify(prefix, key, typ string, rev int64) {
 // Close implements Store.
 func (s *DirStore) Close() error {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	if s.closed {
+		s.mu.Unlock()
 		return nil
 	}
 	s.closed = true
+	ws := make([]*dirWatcher, 0, len(s.watch))
 	for w := range s.watch {
-		// Inline stop: w.Stop() takes s.mu, which this loop holds.
-		// The once guard makes the duplicate Stop a no-op afterwards.
-		w.once.Do(func() { close(w.stop) })
+		ws = append(ws, w)
 	}
 	s.watch = nil
+	s.mu.Unlock()
+	// Stop's once body takes s.mu, so it must run with s.mu released:
+	// running once.Do inline (under the lock) deadlocks against a
+	// concurrent Stop that already holds the once and waits on s.mu.
+	for _, w := range ws {
+		w.Stop()
+	}
 	return nil
 }
