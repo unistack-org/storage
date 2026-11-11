@@ -1,21 +1,22 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"io"
 	"log"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 
-	dto "github.com/prometheus/client_model/go"
 	"github.com/unistack-org/storage/pkg/nbd"
 )
 
-// gatherText scrapes a registry through the handler and returns the
+// gatherText scrapes the meter through the handler and returns the
 // Prometheus text exposition.
 func gatherText(t *testing.T, m *clusterMetrics, s metricsSource) string {
 	t.Helper()
@@ -28,48 +29,60 @@ func gatherText(t *testing.T, m *clusterMetrics, s metricsSource) string {
 }
 
 // metricValue refreshes the snapshot (as a scrape would) and finds a
-// sample of family with exactly the given labels.
+// sample of family whose labels include all of want.
 func metricValue(t *testing.T, m *clusterMetrics, s metricsSource, family string, labels map[string]string) (float64, bool) {
 	t.Helper()
-	m.collect(context.Background(), s)
-	fams, err := m.reg.Gather()
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, f := range fams {
-		if f.GetName() != family {
+	return findSample(gatherText(t, m, s), family, labels)
+}
+
+// findSample scans a Prometheus text exposition for a
+// `family{k="v",...} value` line whose labels include all of want and
+// returns its value. The exporter preserves creation label order (no
+// alphabetical sorting), so label-order-sensitive assertions go through
+// this parser rather than raw substrings.
+func findSample(body, family string, want map[string]string) (float64, bool) {
+	for _, line := range strings.Split(body, "\n") {
+		if line == "" || line[0] == '#' {
 			continue
 		}
-		for _, mm := range f.GetMetric() {
-			if matchLabels(mm, labels) {
-				return metricSample(mm), true
-			}
+		i := strings.IndexAny(line, " {")
+		if i < 0 || line[:i] != family {
+			continue
 		}
+		rest := line[i:]
+		if rest[0] == '{' {
+			rbr := strings.LastIndexByte(rest, '}')
+			if rbr < 0 {
+				continue
+			}
+			got := map[string]string{}
+			for _, kv := range strings.Split(rest[1:rbr], ",") {
+				k, v, _ := strings.Cut(kv, "=\"")
+				got[k] = strings.TrimSuffix(v, `"`)
+			}
+			matched := true
+			for k, v := range want {
+				if got[k] != v {
+					matched = false
+					break
+				}
+			}
+			if !matched {
+				continue
+			}
+			rest = rest[rbr+1:]
+		}
+		fields := strings.Fields(rest)
+		if len(fields) == 0 {
+			continue
+		}
+		v, err := strconv.ParseFloat(fields[0], 64)
+		if err != nil {
+			continue
+		}
+		return v, true
 	}
 	return 0, false
-}
-
-func matchLabels(m *dto.Metric, want map[string]string) bool {
-	got := map[string]string{}
-	for _, lp := range m.GetLabel() {
-		got[lp.GetName()] = lp.GetValue()
-	}
-	for k, v := range want {
-		if got[k] != v {
-			return false
-		}
-	}
-	return true // "want" is a subset of the sample's labels
-}
-
-func metricSample(m *dto.Metric) float64 {
-	if g := m.GetGauge(); g != nil {
-		return g.GetValue()
-	}
-	if c := m.GetCounter(); c != nil {
-		return c.GetValue()
-	}
-	return 0
 }
 
 // TestMetricsEndpoint: a live cluster scraped through the metrics
@@ -87,28 +100,34 @@ func TestMetricsEndpoint(t *testing.T) {
 		`unistor_cluster{name="healthy"} 1`,
 		`unistor_cluster{name="volumes"} 1`,
 		`unistor_cluster{name="map_epoch"} 1`,
-		`name="up",osd="0"} 1`,
-		`unistor_volume{metric="writable",name="vm0"} 1`,
-		`unistor_volume{metric="size_bytes",name="vm0"} 1.34217728e+08`,
-		`unistor_volume{metric="min_size",name="vm0"} 2`,
-		`unistor_volume{metric="live_targets",name="vm0"} 3`,
+		`unistor_volume{name="vm0",metric="writable"} 1`,
+		`unistor_volume{name="vm0",metric="size_bytes"} 134217728`,
+		`unistor_volume{name="vm0",metric="min_size"} 2`,
+		`unistor_volume{name="vm0",metric="live_targets"} 3`,
 		// vitastor-gap families: full PG census, cluster capacity from
 		// the cluster-wide StatFS probe, per-volume raw-to-usable.
-		`unistor_volume{metric="pgs",name="vm0"} 64`,
-		`unistor_volume{metric="pgs_ok",name="vm0"} 64`,
-		`unistor_volume{metric="pgs_degraded",name="vm0"} 0`,
-		`unistor_volume{metric="pgs_down",name="vm0"} 0`,
+		`unistor_volume{name="vm0",metric="pgs"} 64`,
+		`unistor_volume{name="vm0",metric="pgs_ok"} 64`,
+		`unistor_volume{name="vm0",metric="pgs_degraded"} 0`,
+		`unistor_volume{name="vm0",metric="pgs_down"} 0`,
 		`unistor_cluster{name="total_raw_bytes"}`,
 		`unistor_cluster{name="free_raw_bytes"}`,
 		`unistor_cluster{name="used_raw_bytes"}`,
-		`unistor_volume{metric="raw_to_usable_bytes",name="vm0"}`,
-		`unistor_volume{metric="space_efficiency",name="vm0"} 0.3333333333333333`,
-		`unistor_osd_disk_bytes{name="total",osd="0"}`,
-		`unistor_osd_disk_bytes{name="total",osd="2"}`,
+		`unistor_volume{name="vm0",metric="raw_to_usable_bytes"}`,
+		`unistor_volume{name="vm0",metric="space_efficiency"} 0.3333333333333333`,
+		`unistor_osd_disk_bytes{osd="0",name="total"}`,
+		`unistor_osd_disk_bytes{osd="2",name="total"}`,
 	} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("exposition missing %q\n%s", want, body)
 		}
+	}
+
+	if v, ok := findSample(body, "unistor_osd", map[string]string{"osd": "0", "name": "up"}); !ok || v != 1 {
+		t.Fatalf("osd 0 up: %v %v\n%s", v, ok, body)
+	}
+	if !strings.Contains(body, "unistor_osd{osd=\"0\",addr=") {
+		t.Fatalf("exposition missing osd series with addr label\n%s", body)
 	}
 
 	// Kill one OSD: it stays registered (osds=3) but is no longer live.
@@ -238,24 +257,26 @@ func TestRecoveryRecorder(t *testing.T) {
 	}
 	rec(3, 1<<20)
 	rec(1, 4096)
-	fams, err := m.reg.Gather()
-	if err != nil {
+	if got := m.recoveryCopies.Get(); got != 4 {
+		t.Fatalf("unistor_recovery_copies_total = %v, want 4", got)
+	}
+	if got := m.recoveryBytes.Get(); got != 1<<20+4096 {
+		t.Fatalf("unistor_recovery_bytes_total = %v, want %v", got, uint64(1<<20+4096))
+	}
+	// The counters must reach the exposition, too (written straight
+	// through the exporter: no metricsSource, so no snapshot collect).
+	var buf bytes.Buffer
+	if err := m.mtr.Write(&buf); err != nil {
 		t.Fatal(err)
 	}
-	want := map[string]float64{
-		"unistor_recovery_copies_total": 4,
-		"unistor_recovery_bytes_total":  1<<20 + 4096,
-	}
-	for _, f := range fams {
-		if v, ok := want[f.GetName()]; ok {
-			if got := f.GetMetric()[0].GetCounter().GetValue(); got != v {
-				t.Fatalf("%s = %v, want %v", f.GetName(), got, v)
-			}
-			delete(want, f.GetName())
+	body := buf.String()
+	for _, want := range []string{
+		"unistor_recovery_copies_total 4",
+		"unistor_recovery_bytes_total 1052672",
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("exposition missing %q\n%s", want, body)
 		}
-	}
-	if len(want) != 0 {
-		t.Fatalf("missing counter families: %v", want)
 	}
 }
 

@@ -1,13 +1,19 @@
-// Prometheus metrics for unistord (VictoriaMetrics-compatible
-// exposition): GET /metrics on the standalone -metrics address only —
-// the admin REST API (-http) never serves them.
+// Metrics for unistord, exported through the micro-meter
+// VictoriaMetrics exporter (go.unistack.org/micro-meter-victoriametrics/v5):
+// GET /metrics on the standalone -metrics address only — the admin
+// REST API (-http) never serves them. This is the single metrics
+// export path of the daemon: there is no prometheus/client_golang
+// registry and no duplicated exposition anywhere.
 //
-// The mapping mirrors the admin JSON surface (/v1/status) plus the
-// hot-path counters: VictoriaMetrics scrapes the standard Prometheus
-// text format, so this is the "micrometer-style" export for a Go
-// daemon — the registry lives here, in the cmd module, while the core
-// pkg/ modules stay dependency-free and only fire the sdsnet hook
-// callbacks (sdsnet.ServerMetrics) this file adapts into collectors.
+// The meter runs in Prometheus-compat mode
+// (victoriametrics.PrometheusCompat(true)), so latency histograms
+// expose the standard *_bucket{le=...}/_sum/_count triples and
+// VictoriaMetrics scrapes the usual Prometheus text format. The
+// mapping mirrors the admin JSON surface (/v1/status) plus the
+// hot-path counters; the registry lives here, in the cmd module,
+// while the core pkg/ modules stay dependency-free and only fire the
+// sdsnet hook callbacks (sdsnet.ServerMetrics) this file adapts into
+// meter series.
 //
 // Metric families (all prefixed unistor_):
 //
@@ -50,9 +56,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/client_golang/prometheus/collectors"
-	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"github.com/VictoriaMetrics/metrics"
+	victoriametrics "go.unistack.org/micro-meter-victoriametrics/v5"
+	"go.unistack.org/micro/v5/meter"
 
 	"github.com/unistack-org/storage/pkg/client"
 	"github.com/unistack-org/storage/pkg/meta"
@@ -64,168 +70,199 @@ import (
 // opBuckets covers the latency span of the block path: sub-100µs NVMe
 // dispatch through multi-second queue waits, geometric so each bucket
 // doubles the last (histogram_quantile resolution stays even).
-var opBuckets = prometheus.ExponentialBuckets(0.000125, 2, 17) // 0.125ms .. 8.2s
+var opBuckets = metrics.ExponentialBuckets(0.000125, 2, 17) // 0.125ms .. 8.2s
 
-// clusterMetrics owns the process-wide Prometheus registry. A nil
-// *clusterMetrics is valid everywhere (metrics disabled): the daemon
-// runs identically when /metrics is not configured.
+// labelKey joins label values into one cache key; I/O identifiers
+// (ids, ops, addresses) never contain NUL, so the join is injective.
+func labelKey(labels []string) string { return strings.Join(labels, "\x00") }
+
+// pairLabels zips a family's fixed label names with one tuple's values
+// into the flat name1,value1,name2,value2... slice the meter API takes.
+func pairLabels(names, values []string) []string {
+	out := make([]string, 0, 2*len(names))
+	for i, n := range names {
+		out = append(out, n, values[i])
+	}
+	return out
+}
+
+// counterVec is the micro-meter analogue of a labelled counter family:
+// series are get-or-create on the meter, so the vector caches the
+// created counter per label tuple to keep hot-path calls a map hit.
+// Callers pass label VALUES; names are fixed at construction.
+type counterVec struct {
+	m     meter.Meter
+	name  string
+	names []string
+	cache sync.Map // labelKey -> meter.Counter
+}
+
+func newCounterVec(m meter.Meter, name string, names ...string) *counterVec {
+	return &counterVec{m: m, name: name, names: names}
+}
+
+func (c *counterVec) get(values ...string) meter.Counter {
+	key := labelKey(values)
+	if v, ok := c.cache.Load(key); ok {
+		return v.(meter.Counter)
+	}
+	ctr := c.m.Counter(c.name, pairLabels(c.names, values)...)
+	actual, _ := c.cache.LoadOrStore(key, ctr)
+	return actual.(meter.Counter)
+}
+
+// histogramVec caches meter.Histogram series per label tuple; created
+// via HistogramExt with the explicit opBuckets, which in
+// Prometheus-compat mode emits *_bucket{le=...}/_sum/_count.
+type histogramVec struct {
+	m       meter.Meter
+	name    string
+	names   []string
+	buckets []float64
+	cache   sync.Map // labelKey -> meter.Histogram
+}
+
+func newHistogramVec(m meter.Meter, name string, buckets []float64, names ...string) *histogramVec {
+	return &histogramVec{m: m, name: name, names: names, buckets: buckets}
+}
+
+func (h *histogramVec) get(values ...string) meter.Histogram {
+	key := labelKey(values)
+	if v, ok := h.cache.Load(key); ok {
+		return v.(meter.Histogram)
+	}
+	hist := h.m.HistogramExt(h.name, h.buckets, pairLabels(h.names, values)...)
+	actual, _ := h.cache.LoadOrStore(key, hist)
+	return actual.(meter.Histogram)
+}
+
+// gaugeVec caches settable gauges per label tuple. Snapshot families
+// also track their live series so collect() can purge them per scrape
+// (the meter has no per-family Reset: Unregister removes one series).
+type gaugeVec struct {
+	m     meter.Meter
+	name  string
+	names []string
+	mu    sync.Mutex
+	live  map[string][]string // labelKey -> label values (series registered on the meter)
+}
+
+func newGaugeVec(m meter.Meter, name string, names ...string) *gaugeVec {
+	return &gaugeVec{m: m, name: name, names: names}
+}
+
+// gauge returns the (settable) gauge for the label tuple, tracking it
+// as a live series of the family. Callers pass label VALUES.
+func (g *gaugeVec) gauge(values ...string) meter.Gauge {
+	key := labelKey(values)
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.live == nil {
+		g.live = map[string][]string{}
+	}
+	if _, ok := g.live[key]; !ok {
+		g.live[key] = append([]string(nil), values...)
+	}
+	return g.m.Gauge(g.name, nil, pairLabels(g.names, values)...)
+}
+
+func (g *gaugeVec) set(v float64, values ...string) { g.gauge(values...).Set(v) }
+
+// purge unregisters every tracked series of the family (snapshot
+// refresh: values are re-set after the purge, vanished series stay
+// gone).
+func (g *gaugeVec) purge() {
+	g.mu.Lock()
+	live := g.live
+	g.live = nil
+	g.mu.Unlock()
+	for _, values := range live {
+		g.m.Unregister(g.name, pairLabels(g.names, values)...)
+	}
+}
+
+// clusterMetrics owns the process-wide meter. A nil *clusterMetrics is
+// valid everywhere (metrics disabled): the daemon runs identically
+// when /metrics is not configured.
 type clusterMetrics struct {
-	reg *prometheus.Registry
+	mtr meter.Meter
 
 	// Data-plane server counters, filled from sdsnet.ServerMetrics hooks
 	// (one hook set per hosted OSD, id-bound).
-	osdRequests *prometheus.CounterVec
-	osdBytes    *prometheus.CounterVec
-	osdLatency  *prometheus.HistogramVec
-	osdConns    *prometheus.GaugeVec
+	osdRequests *counterVec
+	osdBytes    *counterVec
+	osdLatency  *histogramVec
+	osdConns    *gaugeVec
 
 	// Export (guest NBD/VDUSE) side, filled by the Backend wrapper.
-	exportRequests  *prometheus.CounterVec
-	exportBytes     *prometheus.CounterVec
-	exportLatency   *prometheus.HistogramVec
-	exportSustained *prometheus.GaugeVec // {export,rate}
+	exportRequests  *counterVec
+	exportBytes     *counterVec
+	exportLatency   *histogramVec
+	exportSustained *gaugeVec // {export,rate}
 
 	// Snapshot gauges, refreshed on every scrape by collect().
-	gCluster    *prometheus.GaugeVec // {name}
-	gRaftState  *prometheus.GaugeVec // {state}
-	gRaftMember *prometheus.GaugeVec // {id,addr}
-	gOsd        *prometheus.GaugeVec // {osd,addr,name} name=up|weight
-	gDisk       *prometheus.GaugeVec // {osd,name} name=stored|free|total
-	gWrite      *prometheus.GaugeVec // {osd,name} write-amp counters (local OSDs)
-	gJournal    *prometheus.GaugeVec // {osd,name} journal staging footprint (local journal-mode OSDs)
-	gMeta       *prometheus.GaugeVec // {osd,name} meta index (local OSDs)
-	gIntent     *prometheus.GaugeVec // {osd,name} intent log (local intent-mode OSDs)
-	gPool       *prometheus.GaugeVec // {osd,state}
-	gVolume     *prometheus.GaugeVec // {name} name=writable|degraded|...
-	gQoSLimit   *prometheus.GaugeVec // {export,rate} configured limits
-	gVacuum     *prometheus.GaugeVec // {name} vacuum backlog + autovacuum config
+	gCluster    *gaugeVec // {name}
+	gRaftState  *gaugeVec // {state}
+	gRaftMember *gaugeVec // {id,addr}
+	gOsd        *gaugeVec // {osd,addr,name} name=up|weight
+	gDisk       *gaugeVec // {osd,name} name=stored|free|total
+	gWrite      *gaugeVec // {osd,name} write-amp counters (local OSDs)
+	gJournal    *gaugeVec // {osd,name} journal staging footprint (local journal-mode OSDs)
+	gMeta       *gaugeVec // {osd,name} meta index (local OSDs)
+	gIntent     *gaugeVec // {osd,name} intent log (local intent-mode OSDs)
+	gPool       *gaugeVec // {osd,state}
+	gVolume     *gaugeVec // {name,metric} metric=writable|degraded|...
+	gQoSLimit   *gaugeVec // {export,rate} configured limits
+	gVacuum     *gaugeVec // {name} vacuum backlog + autovacuum config
 
 	// Recovery traffic, filled by the RecoveryOpts.Record hook (runs
 	// started through this process).
-	recoveryCopies prometheus.Counter
-	recoveryBytes  prometheus.Counter
+	recoveryCopies meter.Counter
+	recoveryBytes  meter.Counter
 
 	// tracked exports: name -> volume handle, for the sustained-rate gauges
 	exports map[string]*client.Volume
 
 	// collectMu serialises snapshot refreshes: with both -http and
-	// -metrics enabled, two handlers scrape one registry.
+	// -metrics enabled, two handlers scrape one meter.
 	collectMu sync.Mutex
 }
 
-// newClusterMetrics builds the registry and all collectors. The Go and
-// process collectors ship standard process/go runtime series alongside
-// the unistor_* families.
+// newClusterMetrics builds the meter and all series. The VictoriaMetrics
+// exporter writes the go_* and process_* runtime series alongside the
+// unistor_* families on every scrape (WriteProcessMetrics/WriteFDMetrics).
 func newClusterMetrics() *clusterMetrics {
+	mtr := victoriametrics.NewMeter(victoriametrics.PrometheusCompat(true))
 	m := &clusterMetrics{
-		reg:     prometheus.NewRegistry(),
+		mtr:     mtr,
 		exports: map[string]*client.Volume{},
-	}
-	m.osdRequests = prometheus.NewCounterVec(prometheus.CounterOpts{
-		Name: "unistor_osd_requests_total",
-		Help: "Requests served by each hosted OSD, by op and status.",
-	}, []string{"osd", "op", "status"})
-	m.osdBytes = prometheus.NewCounterVec(prometheus.CounterOpts{
-		Name: "unistor_osd_bytes_total",
-		Help: "Payload bytes moved by each hosted OSD, by op and direction (in = client-to-OSD, out = OSD-to-client).",
-	}, []string{"osd", "op", "direction"})
-	m.osdLatency = prometheus.NewHistogramVec(prometheus.HistogramOpts{
-		Name:    "unistor_osd_request_duration_seconds",
-		Help:    "Time from request header to dispatch completion at each hosted OSD (queue/throttle time included).",
-		Buckets: opBuckets,
-	}, []string{"osd", "op"})
-	m.osdConns = prometheus.NewGaugeVec(prometheus.GaugeOpts{
-		Name: "unistor_osd_connections",
-		Help: "Live client connections per hosted OSD.",
-	}, []string{"osd"})
-	m.exportRequests = prometheus.NewCounterVec(prometheus.CounterOpts{
-		Name: "unistor_export_requests_total",
-		Help: "Guest I/O per export (NBD/VDUSE), by op and error.",
-	}, []string{"export", "op", "error"})
-	m.exportBytes = prometheus.NewCounterVec(prometheus.CounterOpts{
-		Name: "unistor_export_bytes_total",
-		Help: "Guest payload bytes per export, by op and direction (in = write path, out = read path).",
-	}, []string{"export", "op", "direction"})
-	m.exportLatency = prometheus.NewHistogramVec(prometheus.HistogramOpts{
-		Name:    "unistor_export_request_duration_seconds",
-		Help:    "Guest I/O latency per export, by op (QoS queue wait included).",
-		Buckets: opBuckets,
-	}, []string{"export", "op"})
-	m.exportSustained = prometheus.NewGaugeVec(prometheus.GaugeOpts{
-		Name: "unistor_export_qos_sustained",
-		Help: "Sustained (long-window) throughput the volume's QoS limiter admitted, per export and rate (iops/bps).",
-	}, []string{"export", "rate"})
-	m.gCluster = prometheus.NewGaugeVec(prometheus.GaugeOpts{
-		Name: "unistor_cluster",
-		Help: "Cluster-level snapshot at scrape time: osds, osds_live, healthy, volumes, map_epoch, raft_has_leader.",
-	}, []string{"name"})
-	m.gRaftState = prometheus.NewGaugeVec(prometheus.GaugeOpts{
-		Name: "unistor_raft_state",
-		Help: "Meta raft state of this node: the active state is 1, the others 0.",
-	}, []string{"state"})
-	m.gRaftMember = prometheus.NewGaugeVec(prometheus.GaugeOpts{
-		Name: "unistor_raft_member",
-		Help: "Meta raft configuration members known to this node: value 1 = voter, 2 = leader (the leader is also a voter).",
-	}, []string{"id", "addr"})
-	m.gOsd = prometheus.NewGaugeVec(prometheus.GaugeOpts{
-		Name: "unistor_osd",
-		Help: "Per-OSD snapshot at scrape time: up (answers a ping), weight (0 = evicted).",
-	}, []string{"osd", "addr", "name"})
-	m.gDisk = prometheus.NewGaugeVec(prometheus.GaugeOpts{
-		Name: "unistor_osd_disk_bytes",
-		Help: "Disk accounting per OSD (stored/free/total bytes), probed cluster-wide over StatFS; a remote OSD answering an older protocol is omitted.",
-	}, []string{"osd", "name"})
-	m.gWrite = prometheus.NewGaugeVec(prometheus.GaugeOpts{
-		Name: "unistor_osd_write_bytes",
-		Help: "Lifetime write traffic of locally hosted OSDs (client/journal/flatten/fill/punch bytes, journal_syncs count): write amplification = (journal+flatten+fill)/client. Counter semantics: monotonically growing since process start.",
-	}, []string{"osd", "name"})
-	m.gJournal = prometheus.NewGaugeVec(prometheus.GaugeOpts{
-		Name: "unistor_osd_journal",
-		Help: "Journal staging footprint of locally hosted journal-mode OSDs: log_bytes (WAL file size on disk), pending_records (acked, not yet flattened), free_bytes/total_bytes (filesystem the journal grows into). Alert when free_bytes drops toward the journal's growth headroom.",
-	}, []string{"osd", "name"})
-	m.gMeta = prometheus.NewGaugeVec(prometheus.GaugeOpts{
-		Name: "unistor_osd_meta",
-		Help: "In-memory object meta index of locally hosted OSDs: objects (indexed entries), ram_bytes (estimated RAM the index occupies).",
-	}, []string{"osd", "name"})
-	m.gIntent = prometheus.NewGaugeVec(prometheus.GaugeOpts{
-		Name: "unistor_osd_intent",
-		Help: "Write intent log of locally hosted OSDs (only exported when the intent log is on): records (appended), syncs (log fsyncs), checked (open intents verified at recovery), mismatches (acknowledged writes not durable on disk — data damage).",
-	}, []string{"osd", "name"})
-	m.gPool = prometheus.NewGaugeVec(prometheus.GaugeOpts{
-		Name: "unistor_osd_pool_connections",
-		Help: "Connections in this process's client pool per OSD, by state (idle|in_use).",
-	}, []string{"osd", "state"})
-	m.gVolume = prometheus.NewGaugeVec(prometheus.GaugeOpts{
-		Name: "unistor_volume",
-		Help: "Per-volume snapshot: writable, degraded, live_targets, min_size, size_bytes, quota_bytes, usage_bytes.",
-	}, []string{"name", "metric"})
-	m.gQoSLimit = prometheus.NewGaugeVec(prometheus.GaugeOpts{
-		Name: "unistor_export_qos_limit",
-		Help: "Configured QoS limits per export (0 = unlimited), by rate (read_iops|write_iops|read_bps|write_bps).",
-	}, []string{"export", "rate"})
-	m.recoveryCopies = prometheus.NewCounter(prometheus.CounterOpts{
-		Name: "unistor_recovery_copies_total",
-		Help: "Object copies replicated by recovery runs started through this process (admin POST /v1/volumes/{name}/recover).",
-	})
-	m.recoveryBytes = prometheus.NewCounter(prometheus.CounterOpts{
-		Name: "unistor_recovery_bytes_total",
-		Help: "Payload bytes moved by recovery runs started through this process.",
-	})
 
-	m.gVacuum = prometheus.NewGaugeVec(prometheus.GaugeOpts{
-		Name: "unistor_vacuum",
-		Help: "Vacuum backlog and autovacuum configuration: tombstones (pending records), objects (OIDs to unlink per OSD), bytes (garbage occupying disk = objects x 4MiB), oldest_seconds (age of the oldest tombstone), interval_seconds (autovacuum period; 0 = autovacuum off). bytes/oldest_seconds together answer how much work is left until autovacuum cleans the garbage.",
-	}, []string{"name"})
+		osdRequests: newCounterVec(mtr, "unistor_osd_requests_total", "osd", "op", "status"),
+		osdBytes:    newCounterVec(mtr, "unistor_osd_bytes_total", "osd", "op", "direction"),
+		osdLatency:  newHistogramVec(mtr, "unistor_osd_request_duration_seconds", opBuckets, "osd", "op"),
+		osdConns:    newGaugeVec(mtr, "unistor_osd_connections", "osd"),
 
-	for _, c := range []prometheus.Collector{
-		m.osdRequests, m.osdBytes, m.osdLatency, m.osdConns,
-		m.exportRequests, m.exportBytes, m.exportLatency, m.exportSustained,
-		m.gCluster, m.gRaftState, m.gRaftMember, m.gOsd, m.gDisk, m.gWrite, m.gJournal, m.gMeta, m.gIntent, m.gPool, m.gVolume, m.gQoSLimit, m.gVacuum,
-		m.recoveryCopies, m.recoveryBytes,
-		collectors.NewGoCollector(),
-		collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}),
-	} {
-		m.reg.MustRegister(c)
+		exportRequests:  newCounterVec(mtr, "unistor_export_requests_total", "export", "op", "error"),
+		exportBytes:     newCounterVec(mtr, "unistor_export_bytes_total", "export", "op", "direction"),
+		exportLatency:   newHistogramVec(mtr, "unistor_export_request_duration_seconds", opBuckets, "export", "op"),
+		exportSustained: newGaugeVec(mtr, "unistor_export_qos_sustained", "export", "rate"),
+
+		gCluster:    newGaugeVec(mtr, "unistor_cluster", "name"),
+		gRaftState:  newGaugeVec(mtr, "unistor_raft_state", "state"),
+		gRaftMember: newGaugeVec(mtr, "unistor_raft_member", "id", "addr"),
+		gOsd:        newGaugeVec(mtr, "unistor_osd", "osd", "addr", "name"),
+		gDisk:       newGaugeVec(mtr, "unistor_osd_disk_bytes", "osd", "name"),
+		gWrite:      newGaugeVec(mtr, "unistor_osd_write_bytes", "osd", "name"),
+		gJournal:    newGaugeVec(mtr, "unistor_osd_journal", "osd", "name"),
+		gMeta:       newGaugeVec(mtr, "unistor_osd_meta", "osd", "name"),
+		gIntent:     newGaugeVec(mtr, "unistor_osd_intent", "osd", "name"),
+		gPool:       newGaugeVec(mtr, "unistor_osd_pool_connections", "osd", "state"),
+		gVolume:     newGaugeVec(mtr, "unistor_volume", "name", "metric"),
+		gQoSLimit:   newGaugeVec(mtr, "unistor_export_qos_limit", "export", "rate"),
+		gVacuum:     newGaugeVec(mtr, "unistor_vacuum", "name"),
+
+		recoveryCopies: mtr.Counter("unistor_recovery_copies_total"),
+		recoveryBytes:  mtr.Counter("unistor_recovery_bytes_total"),
 	}
 	return m
 }
@@ -269,7 +306,8 @@ func labelStatus(s sdsnet.Status) string {
 
 // osdServerMetrics returns the sdsnet hook set for one hosted OSD; the
 // callbacks fire on the connection goroutines, so they are O(1)
-// increments only (the prometheus vectors are lock-sharded).
+// increments only (the meter series are get-or-create-cached per
+// label tuple).
 func (m *clusterMetrics) osdServerMetrics(id int32) *sdsnet.ServerMetrics {
 	if m == nil {
 		return nil
@@ -278,17 +316,17 @@ func (m *clusterMetrics) osdServerMetrics(id int32) *sdsnet.ServerMetrics {
 	return &sdsnet.ServerMetrics{
 		Request: func(op sdsnet.Op, status sdsnet.Status, bin, bout uint64, dur time.Duration) {
 			opL := op.String()
-			m.osdRequests.WithLabelValues(idL, opL, labelStatus(status)).Inc()
+			m.osdRequests.get(idL, opL, labelStatus(status)).Inc()
 			if bin > 0 {
-				m.osdBytes.WithLabelValues(idL, opL, "in").Add(float64(bin))
+				m.osdBytes.get(idL, opL, "in").Add(int(bin))
 			}
 			if bout > 0 {
-				m.osdBytes.WithLabelValues(idL, opL, "out").Add(float64(bout))
+				m.osdBytes.get(idL, opL, "out").Add(int(bout))
 			}
-			m.osdLatency.WithLabelValues(idL, opL).Observe(dur.Seconds())
+			m.osdLatency.get(idL, opL).Update(dur.Seconds())
 		},
-		ConnAccepted: func() { m.osdConns.WithLabelValues(idL).Inc() },
-		ConnClosed:   func(uint64) { m.osdConns.WithLabelValues(idL).Dec() },
+		ConnAccepted: func() { m.osdConns.gauge(idL).Inc() },
+		ConnClosed:   func(uint64) { m.osdConns.gauge(idL).Dec() },
 	}
 }
 
@@ -338,7 +376,7 @@ func (mb *metricsBackend) count(op string, err error) {
 	if err != nil {
 		e = "true"
 	}
-	mb.m.exportRequests.WithLabelValues(mb.name, op, e).Inc()
+	mb.m.exportRequests.get(mb.name, op, e).Inc()
 }
 
 func (mb *metricsBackend) ReadAt(p []byte, off int64) (int, error) {
@@ -346,9 +384,9 @@ func (mb *metricsBackend) ReadAt(p []byte, off int64) (int, error) {
 	n, err := mb.b.ReadAt(p, off)
 	mb.count("read", err)
 	if n > 0 {
-		mb.m.exportBytes.WithLabelValues(mb.name, "read", "out").Add(float64(n))
+		mb.m.exportBytes.get(mb.name, "read", "out").Add(n)
 	}
-	mb.m.exportLatency.WithLabelValues(mb.name, "read").Observe(time.Since(start).Seconds())
+	mb.m.exportLatency.get(mb.name, "read").Update(time.Since(start).Seconds())
 	return n, err
 }
 
@@ -357,9 +395,9 @@ func (mb *metricsBackend) WriteAt(p []byte, off int64) (int, error) {
 	n, err := mb.b.WriteAt(p, off)
 	mb.count("write", err)
 	if n > 0 {
-		mb.m.exportBytes.WithLabelValues(mb.name, "write", "in").Add(float64(n))
+		mb.m.exportBytes.get(mb.name, "write", "in").Add(n)
 	}
-	mb.m.exportLatency.WithLabelValues(mb.name, "write").Observe(time.Since(start).Seconds())
+	mb.m.exportLatency.get(mb.name, "write").Update(time.Since(start).Seconds())
 	return n, err
 }
 
@@ -367,7 +405,7 @@ func (mb *metricsBackend) Flush() error {
 	start := time.Now()
 	err := mb.b.Flush()
 	mb.count("flush", err)
-	mb.m.exportLatency.WithLabelValues(mb.name, "flush").Observe(time.Since(start).Seconds())
+	mb.m.exportLatency.get(mb.name, "flush").Update(time.Since(start).Seconds())
 	return err
 }
 
@@ -375,7 +413,7 @@ func (mb *metricsBackend) Trim(off int64, length uint32) error {
 	start := time.Now()
 	err := mb.b.Trim(off, length)
 	mb.count("trim", err)
-	mb.m.exportLatency.WithLabelValues(mb.name, "trim").Observe(time.Since(start).Seconds())
+	mb.m.exportLatency.get(mb.name, "trim").Update(time.Since(start).Seconds())
 	return err
 }
 
@@ -384,9 +422,9 @@ func (mb *metricsBackend) WriteZeroes(off int64, length uint32, punchHole bool) 
 	err := mb.b.WriteZeroes(off, length, punchHole)
 	mb.count("write_zeroes", err)
 	if err == nil && length > 0 {
-		mb.m.exportBytes.WithLabelValues(mb.name, "write_zeroes", "in").Add(float64(length))
+		mb.m.exportBytes.get(mb.name, "write_zeroes", "in").Add(int(length))
 	}
-	mb.m.exportLatency.WithLabelValues(mb.name, "write_zeroes").Observe(time.Since(start).Seconds())
+	mb.m.exportLatency.get(mb.name, "write_zeroes").Update(time.Since(start).Seconds())
 	return err
 }
 
@@ -397,28 +435,28 @@ func (mb *metricsBackend) WriteZeroes(off int64, length uint32, punchHole bool) 
 func (m *clusterMetrics) collect(ctx context.Context, s metricsSource) {
 	m.collectMu.Lock()
 	defer m.collectMu.Unlock()
-	// Reset the snapshot families so vanished OSDs/volumes disappear
+	// Purge the snapshot families so vanished OSDs/volumes disappear
 	// between scrapes (counters/histograms keep accumulating).
-	m.gCluster.Reset()
-	m.gRaftState.Reset()
-	m.gRaftMember.Reset()
-	m.gOsd.Reset()
-	m.gDisk.Reset()
-	m.gWrite.Reset()
-	m.gJournal.Reset()
-	m.gMeta.Reset()
-	m.gIntent.Reset()
-	m.gPool.Reset()
-	m.gVolume.Reset()
-	m.gQoSLimit.Reset()
-	m.gVacuum.Reset()
+	m.gCluster.purge()
+	m.gRaftState.purge()
+	m.gRaftMember.purge()
+	m.gOsd.purge()
+	m.gDisk.purge()
+	m.gWrite.purge()
+	m.gJournal.purge()
+	m.gMeta.purge()
+	m.gIntent.purge()
+	m.gPool.purge()
+	m.gVolume.purge()
+	m.gQoSLimit.purge()
+	m.gVacuum.purge()
 
 	vols, err := s.cl.ListVolumes(ctx)
 	if err == nil {
-		m.gCluster.WithLabelValues("volumes").Set(float64(len(vols)))
+		m.gCluster.set(float64(len(vols)), "volumes")
 	}
 	if rec, err := meta.LatestMap(ctx, s.ms); err == nil {
-		m.gCluster.WithLabelValues("map_epoch").Set(float64(rec.Epoch))
+		m.gCluster.set(float64(rec.Epoch), "map_epoch")
 	}
 
 	// healthy mirrors /v1/status: a warning condition zeroes it.
@@ -436,7 +474,7 @@ func (m *clusterMetrics) collect(ctx context.Context, s metricsSource) {
 		healthy = 0
 	} else {
 		live := 0
-		m.gCluster.WithLabelValues("osds").Set(float64(len(infos)))
+		m.gCluster.set(float64(len(infos)), "osds")
 		for _, info := range infos {
 			idL := labelOSD(info.ID)
 			up := probes[info.ID] == nil
@@ -449,8 +487,8 @@ func (m *clusterMetrics) collect(ctx context.Context, s metricsSource) {
 			if info.Weight <= 0 {
 				healthy = 0 // evicted: data needs recovery
 			}
-			m.gOsd.WithLabelValues(idL, info.Addr, "up").Set(b2f(up))
-			m.gOsd.WithLabelValues(idL, info.Addr, "weight").Set(info.Weight)
+			m.gOsd.set(b2f(up), idL, info.Addr, "up")
+			m.gOsd.set(info.Weight, idL, info.Addr, "weight")
 			// StatFS answers arrive for answering OSDs (older servers
 			// omit the op); fall back to in-process figures for a local
 			// OSD whose probe predates StatFS support.
@@ -464,9 +502,9 @@ func (m *clusterMetrics) collect(ctx context.Context, s metricsSource) {
 				}
 			}
 			if ok {
-				m.gDisk.WithLabelValues(idL, "stored").Set(float64(d.Usage))
-				m.gDisk.WithLabelValues(idL, "free").Set(float64(d.Free))
-				m.gDisk.WithLabelValues(idL, "total").Set(float64(d.Total))
+				m.gDisk.set(float64(d.Usage), idL, "stored")
+				m.gDisk.set(float64(d.Free), idL, "free")
+				m.gDisk.set(float64(d.Total), idL, "total")
 				totalRaw += float64(d.Total)
 				freeRaw += float64(d.Free)
 				usedRaw += float64(d.Usage)
@@ -477,42 +515,42 @@ func (m *clusterMetrics) collect(ctx context.Context, s metricsSource) {
 			if s.disks != nil {
 				if ld := s.disks.disk(info.ID); ld != nil {
 					ws := ld.WriteStats()
-					m.gWrite.WithLabelValues(idL, "client").Set(float64(ws.ClientBytes))
-					m.gWrite.WithLabelValues(idL, "journal").Set(float64(ws.JournalBytes))
-					m.gWrite.WithLabelValues(idL, "flatten").Set(float64(ws.FlattenBytes))
-					m.gWrite.WithLabelValues(idL, "fill").Set(float64(ws.FillBytes))
-					m.gWrite.WithLabelValues(idL, "punch").Set(float64(ws.PunchBytes))
-					m.gWrite.WithLabelValues(idL, "journal_syncs").Set(float64(ws.JournalSyncs))
+					m.gWrite.set(float64(ws.ClientBytes), idL, "client")
+					m.gWrite.set(float64(ws.JournalBytes), idL, "journal")
+					m.gWrite.set(float64(ws.FlattenBytes), idL, "flatten")
+					m.gWrite.set(float64(ws.FillBytes), idL, "fill")
+					m.gWrite.set(float64(ws.PunchBytes), idL, "punch")
+					m.gWrite.set(float64(ws.JournalSyncs), idL, "journal_syncs")
 					if lb, pend, jfree, jtotal, jok := ld.JournalStats(); jok {
-						m.gJournal.WithLabelValues(idL, "log_bytes").Set(float64(lb))
-						m.gJournal.WithLabelValues(idL, "pending_records").Set(float64(pend))
-						m.gJournal.WithLabelValues(idL, "free_bytes").Set(float64(jfree))
-						m.gJournal.WithLabelValues(idL, "total_bytes").Set(float64(jtotal))
+						m.gJournal.set(float64(lb), idL, "log_bytes")
+						m.gJournal.set(float64(pend), idL, "pending_records")
+						m.gJournal.set(float64(jfree), idL, "free_bytes")
+						m.gJournal.set(float64(jtotal), idL, "total_bytes")
 					}
 					objs, ram := ld.MetaInfo()
-					m.gMeta.WithLabelValues(idL, "objects").Set(float64(objs))
-					m.gMeta.WithLabelValues(idL, "ram_bytes").Set(float64(ram))
+					m.gMeta.set(float64(objs), idL, "objects")
+					m.gMeta.set(float64(ram), idL, "ram_bytes")
 					if isv, _ := ld.IntentStats(); isv.Records > 0 || isv.Checked > 0 || isv.Mismatches > 0 {
-						m.gIntent.WithLabelValues(idL, "records").Set(float64(isv.Records))
-						m.gIntent.WithLabelValues(idL, "syncs").Set(float64(isv.Syncs))
-						m.gIntent.WithLabelValues(idL, "checked").Set(float64(isv.Checked))
-						m.gIntent.WithLabelValues(idL, "mismatches").Set(float64(isv.Mismatches))
+						m.gIntent.set(float64(isv.Records), idL, "records")
+						m.gIntent.set(float64(isv.Syncs), idL, "syncs")
+						m.gIntent.set(float64(isv.Checked), idL, "checked")
+						m.gIntent.set(float64(isv.Mismatches), idL, "mismatches")
 					}
 				}
 			}
 		}
-		m.gCluster.WithLabelValues("osds_live").Set(float64(live))
+		m.gCluster.set(float64(live), "osds_live")
 		if rawReported > 0 {
-			m.gCluster.WithLabelValues("total_raw_bytes").Set(totalRaw)
-			m.gCluster.WithLabelValues("free_raw_bytes").Set(freeRaw)
-			m.gCluster.WithLabelValues("used_raw_bytes").Set(usedRaw)
+			m.gCluster.set(totalRaw, "total_raw_bytes")
+			m.gCluster.set(freeRaw, "free_raw_bytes")
+			m.gCluster.set(usedRaw, "used_raw_bytes")
 		}
 	}
 
 	if s.raft != nil {
 		state := s.raft.RaftState()
-		m.gRaftState.WithLabelValues(strings.ToLower(state)).Set(1)
-		m.gCluster.WithLabelValues("raft_has_leader").Set(b2f(state == "Leader" || state == "Follower"))
+		m.gRaftState.set(1, strings.ToLower(state))
+		m.gCluster.set(b2f(state == "Leader" || state == "Follower"), "raft_has_leader")
 		if state != "Leader" && state != "Follower" {
 			healthy = 0 // control plane has no quorum
 		}
@@ -521,7 +559,7 @@ func (m *clusterMetrics) collect(ctx context.Context, s metricsSource) {
 			if mem.Leader {
 				v = 2
 			}
-			m.gRaftMember.WithLabelValues(strconv.FormatUint(mem.ID, 10), mem.Addr).Set(v)
+			m.gRaftMember.set(v, strconv.FormatUint(mem.ID, 10), mem.Addr)
 		}
 	}
 
@@ -533,43 +571,43 @@ func (m *clusterMetrics) collect(ctx context.Context, s metricsSource) {
 	vb, vbErr := s.cl.VacuumBacklog(vctx)
 	vcancel()
 	if vbErr == nil {
-		m.gVacuum.WithLabelValues("tombstones").Set(float64(vb.Tombstones))
-		m.gVacuum.WithLabelValues("objects").Set(float64(vb.Objects))
-		m.gVacuum.WithLabelValues("bytes").Set(float64(vb.Bytes))
-		m.gVacuum.WithLabelValues("oldest_seconds").Set(vb.Oldest)
-		m.gVacuum.WithLabelValues("interval_seconds").Set(float64(s.vacuumInterval))
+		m.gVacuum.set(float64(vb.Tombstones), "tombstones")
+		m.gVacuum.set(float64(vb.Objects), "objects")
+		m.gVacuum.set(float64(vb.Bytes), "bytes")
+		m.gVacuum.set(vb.Oldest, "oldest_seconds")
+		m.gVacuum.set(float64(s.vacuumInterval), "interval_seconds")
 	}
 
 	for id, st := range s.cl.PoolStats() {
 		idL := labelOSD(id)
-		m.gPool.WithLabelValues(idL, "idle").Set(float64(st[0]))
-		m.gPool.WithLabelValues(idL, "in_use").Set(float64(st[1]))
+		m.gPool.set(float64(st[0]), idL, "idle")
+		m.gPool.set(float64(st[1]), idL, "in_use")
 	}
 
 	for _, spec := range vols {
 		name := spec.Name
 		h, err := s.cl.VolumeHealth(ctx, spec)
 		if err == nil {
-			m.gVolume.WithLabelValues(name, "live_targets").Set(float64(h.LiveTargets))
-			m.gVolume.WithLabelValues(name, "min_size").Set(float64(h.MinSize))
-			m.gVolume.WithLabelValues(name, "writable").Set(b2f(h.Writable))
-			m.gVolume.WithLabelValues(name, "degraded").Set(b2f(!h.Writable))
+			m.gVolume.set(float64(h.LiveTargets), name, "live_targets")
+			m.gVolume.set(float64(h.MinSize), name, "min_size")
+			m.gVolume.set(b2f(h.Writable), name, "writable")
+			m.gVolume.set(b2f(!h.Writable), name, "degraded")
 			// PG census (mirrors vitastor_pg_count): every PG is ok
 			// (full replicas), degraded (min_size..replicas-1) or down
 			// (below min_size).
-			m.gVolume.WithLabelValues(name, "pgs").Set(float64(h.PGs))
-			m.gVolume.WithLabelValues(name, "pgs_ok").Set(float64(h.PGsOK))
-			m.gVolume.WithLabelValues(name, "pgs_degraded").Set(float64(h.PGsDegraded))
-			m.gVolume.WithLabelValues(name, "pgs_down").Set(float64(h.PGsDown))
+			m.gVolume.set(float64(h.PGs), name, "pgs")
+			m.gVolume.set(float64(h.PGsOK), name, "pgs_ok")
+			m.gVolume.set(float64(h.PGsDegraded), name, "pgs_degraded")
+			m.gVolume.set(float64(h.PGsDown), name, "pgs_down")
 			if !h.Writable {
 				healthy = 0
 			}
 		}
-		m.gVolume.WithLabelValues(name, "size_bytes").Set(float64(spec.Size))
-		m.gVolume.WithLabelValues(name, "quota_bytes").Set(float64(spec.Quota))
+		m.gVolume.set(float64(spec.Size), name, "size_bytes")
+		m.gVolume.set(float64(spec.Quota), name, "quota_bytes")
 		nits := (spec.Size + object.Mask) >> object.SizeShift
 		if usage, err := s.volumeUsage(ctx, name, int(nits)); err == nil {
-			m.gVolume.WithLabelValues(name, "usage_bytes").Set(float64(usage))
+			m.gVolume.set(float64(usage), name, "usage_bytes")
 		}
 		// Usable capacity the probed raw total affords at this volume's
 		// replica count (vitastor_pool_raw_to_usable); space efficiency
@@ -579,26 +617,26 @@ func (m *clusterMetrics) collect(ctx context.Context, s metricsSource) {
 			rep = 1
 		}
 		if rawReported > 0 {
-			m.gVolume.WithLabelValues(name, "raw_to_usable_bytes").Set(totalRaw / rep)
-			m.gVolume.WithLabelValues(name, "space_efficiency").Set(1 / rep)
+			m.gVolume.set(totalRaw/rep, name, "raw_to_usable_bytes")
+			m.gVolume.set(1/rep, name, "space_efficiency")
 		}
-		m.gQoSLimit.WithLabelValues(name, "read_iops").Set(float64(spec.ReadIOPS))
-		m.gQoSLimit.WithLabelValues(name, "write_iops").Set(float64(spec.WriteIOPS))
-		m.gQoSLimit.WithLabelValues(name, "read_bps").Set(float64(spec.ReadBPS))
-		m.gQoSLimit.WithLabelValues(name, "write_bps").Set(float64(spec.WriteBPS))
+		m.gQoSLimit.set(float64(spec.ReadIOPS), name, "read_iops")
+		m.gQoSLimit.set(float64(spec.WriteIOPS), name, "write_iops")
+		m.gQoSLimit.set(float64(spec.ReadBPS), name, "read_bps")
+		m.gQoSLimit.set(float64(spec.WriteBPS), name, "write_bps")
 	}
 
 	// QoS sustained rates from the limiter of every volume opened by
 	// this process (the exports it serves).
 	for name, vol := range m.exports {
 		riops, rbps, wiops, wbps := vol.QoSSustained()
-		m.exportSustained.WithLabelValues(name, "read_iops").Set(float64(riops))
-		m.exportSustained.WithLabelValues(name, "read_bps").Set(float64(rbps))
-		m.exportSustained.WithLabelValues(name, "write_iops").Set(float64(wiops))
-		m.exportSustained.WithLabelValues(name, "write_bps").Set(float64(wbps))
+		m.exportSustained.set(float64(riops), name, "read_iops")
+		m.exportSustained.set(float64(rbps), name, "read_bps")
+		m.exportSustained.set(float64(wiops), name, "write_iops")
+		m.exportSustained.set(float64(wbps), name, "write_bps")
 	}
 
-	m.gCluster.WithLabelValues("healthy").Set(healthy)
+	m.gCluster.set(healthy, "healthy")
 }
 
 // b2f renders a bool as the 1/0 gauge value.
@@ -624,22 +662,26 @@ func (m *clusterMetrics) recoveryRecorder() func(copies int, bytes uint64) {
 		return nil
 	}
 	return func(copies int, bytes uint64) {
-		m.recoveryCopies.Add(float64(copies))
-		m.recoveryBytes.Add(float64(bytes))
+		m.recoveryCopies.Add(copies)
+		m.recoveryBytes.Add(int(bytes))
 	}
 }
 
 // handler serves GET /metrics: refresh snapshots, then write the
-// standard Prometheus text exposition (VictoriaMetrics scrape target).
+// standard Prometheus text exposition through the micro-meter
+// VictoriaMetrics exporter (the VictoriaMetrics scrape target), plus
+// the go_*/process_* runtime series.
 func (m *clusterMetrics) handler(s metricsSource) http.HandlerFunc {
-	gather := promhttp.HandlerFor(m.reg, promhttp.HandlerOpts{})
 	return func(w http.ResponseWriter, r *http.Request) {
 		m.collect(r.Context(), s)
-		gather.ServeHTTP(w, r)
+		w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+		if err := m.mtr.Write(w, meter.WriteProcessMetrics(true), meter.WriteFDMetrics(true)); err != nil {
+			log.Printf("metrics write: %v", err)
+		}
 	}
 }
 
-// serveMetrics runs a standalone Prometheus endpoint on addr (the
+// serveMetrics runs a standalone exposition endpoint on addr (the
 // -metrics flag: "host:port", exposition path /metrics), independent of
 // the admin API, until ctx is cancelled. This is the exporter address
 // VictoriaMetrics scrapes, e.g. -metrics 0.0.0.0:8080 -> /metrics.
@@ -670,7 +712,7 @@ func (m *clusterMetrics) serveMetricsListener(ctx context.Context, ln net.Listen
 		defer cancel()
 		_ = srv.Shutdown(shutCtx)
 	}()
-	logger.Printf("metrics (prometheus) on http://%s/metrics", ln.Addr())
+	logger.Printf("metrics (micro-meter-victoriametrics) on http://%s/metrics", ln.Addr())
 	if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		return err
 	}

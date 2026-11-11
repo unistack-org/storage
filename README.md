@@ -30,6 +30,8 @@
   Prometheus (скрейп VictoriaMetrics): состояние кластера, raft (состояние
   и участники), статус и диски всех OSD (в т.ч. удалённых — зонд StatFS),
   латентность/IOPS/BW, состояние PG и ёмкость томов, счётчики recovery.
+  Единственный путь — `go.unistack.org/micro-meter-victoriametrics/v5`
+  (реестр официальной библиотеки VictoriaMetrics), без prometheus-клиента.
   Экспорт только на отдельном `-metrics`-порту, REST API метрики не отдаёт.
   Детали: [`todos/runbook.md`](todos/runbook.md).
 - 🚧 Скелет репозитория: интерфейс-реестры `backend/`, `cache/`,
