@@ -178,6 +178,9 @@ func main() {
 	prealloc := flag.Bool("preallocate", false, "with -store: fallocate each new object to full size")
 	asyncRing := flag.Int("async-ring", 0, "with -store: route object reads/writes through the async I/O ring (io_uring on Linux, worker-pool fallback elsewhere); value = ring depth, e.g. 128; 0 = plain pread/pwrite")
 	ringPinCPU := flag.String("ring-pin-cpu", "", "with -async-ring: pin the ring's worker threads to this CPU set (Linux cpulist syntax, e.g. \"2\" or \"2-3\"); empty = scheduler default")
+	ringArenaSlots := flag.Int("ring-arena-slots", 0, "with -async-ring: registered buffer arena size in slots (io_uring fixed buffers: the kernel pins the arena once, ring ops skip per-I/O page pinning); 0 = plain buffers, e.g. 128")
+	ringArenaSlot := flag.Int("ring-arena-slot", 64<<10, "with -ring-arena-slots: slot size in bytes; I/O larger than a slot takes the plain path")
+	ringHugePages := flag.Bool("ring-hugepages", false, "with -ring-arena-slots: back the arena with huge pages (Linux MADV_HUGEPAGE; advisory) to shrink TLB pressure")
 	maxConns := flag.Int("max-conns", 0, "max concurrent client connections (0 = unlimited)")
 	metaDir := flag.String("meta-dir", "", "meta directory of a cluster (enables clustered exports backed by OSDs): holds the volume/OSD registry, crush epochs, export records and jobs - not the data, which lives in the OSD directories")
 	clusterDir := flag.String("cluster", "", "deprecated alias for -meta-dir")
@@ -517,28 +520,33 @@ func main() {
 		// the same data over a dedicated cluster client, so a reload
 		// never disturbs the handle the admin API and the exports use.
 		cp := clusterParams{
-			store:        ms,
-			metaDir:      clusterPath,
-			osds:         osdSpecs,
-			crushmap:     *crushPath,
-			epoch:        uint32(*epoch),
-			pgNum:        *pgNum,
-			replicas:     *replicas,
-			minSize:      *minSize,
-			rule:         *rule,
-			creates:      creates,
-			qosClasses:   qosClasses,
-			osdQoS:       *osdQoS,
-			commit:       commitMode,
-			fsyncBatch:   *fsyncBatch,
-			intentLog:    *intentLog,
-			atomicWrites: *atomicWrites,
-			atomicSize:   *atomicSize,
-			tlsDataSrv:   tlsDataServer,
-			tlsDataCli:   tlsDataClient,
-			disks:        disks,
-			metrics:      mreg,
-			logger:       logger,
+			store:         ms,
+			metaDir:       clusterPath,
+			osds:          osdSpecs,
+			crushmap:      *crushPath,
+			epoch:         uint32(*epoch),
+			pgNum:         *pgNum,
+			replicas:      *replicas,
+			minSize:       *minSize,
+			rule:          *rule,
+			creates:       creates,
+			qosClasses:    qosClasses,
+			osdQoS:        *osdQoS,
+			commit:        commitMode,
+			fsyncBatch:    *fsyncBatch,
+			intentLog:     *intentLog,
+			atomicWrites:  *atomicWrites,
+			atomicSize:    *atomicSize,
+			asyncRing:     *asyncRing,
+			ringPinCPUs:   *ringPinCPU,
+			ringArena:     *ringArenaSlots,
+			ringArenaSz:   *ringArenaSlot,
+			ringHugepages: *ringHugePages,
+			tlsDataSrv:    tlsDataServer,
+			tlsDataCli:    tlsDataClient,
+			disks:         disks,
+			metrics:       mreg,
+			logger:        logger,
 		}
 		var reloadCl *client.Cluster
 		if !witness {
@@ -703,7 +711,7 @@ func main() {
 				logger.Fatalf("bad size in -export %q: %v", spec, err)
 			}
 		}
-		b, err := newBackend(*storeMode, path, size, *direct, *prealloc, commitMode, *fsyncBatch, *asyncRing, *ringPinCPU, *intentLog, *atomicWrites, *atomicSize)
+		b, err := newBackend(*storeMode, path, size, *direct, *prealloc, commitMode, *fsyncBatch, *asyncRing, *ringPinCPU, *ringArenaSlots, *ringArenaSlot, *ringHugePages, *intentLog, *atomicWrites, *atomicSize)
 		if err != nil {
 			logger.Fatalf("export %s: %v", name, err)
 		}
@@ -812,28 +820,33 @@ func parseCreateSpec(spec string) (pool, name, sizeStr string, err error) {
 }
 
 type clusterParams struct {
-	store        meta.Store // shared meta store (dir-backed or raft), opened by the caller
-	metaDir      string     // for logs only
-	osds         []string
-	crushmap     string
-	epoch        uint32
-	pgNum        int
-	replicas     int
-	minSize      int
-	rule         string
-	creates      []string
-	qosClasses   []string         // -qos-class name=rates registrations
-	osdQoS       string           // per-OSD aggregate rates spec ("" = none)
-	commit       store.CommitMode // OSD commit mode
-	fsyncBatch   time.Duration    // OSD fsync coalescing window
-	intentLog    bool             // write intent log (ideas §2.1)
-	atomicWrites bool             // RWF_ATOMIC writes (ideas §2.2)
-	atomicSize   int64            // cap of one atomic write (bytes)
-	tlsDataSrv   *tls.Config      // OSD data plane server side (-tls-planes data; nil = plain)
-	tlsDataCli   *tls.Config      // client side for cluster pools (nil = plain)
-	disks        *diskRegistry    // hosted OSDs publish disk stats here (admin status)
-	metrics      *clusterMetrics  // prometheus registry (nil = metrics disabled)
-	logger       *log.Logger
+	store         meta.Store // shared meta store (dir-backed or raft), opened by the caller
+	metaDir       string     // for logs only
+	osds          []string
+	crushmap      string
+	epoch         uint32
+	pgNum         int
+	replicas      int
+	minSize       int
+	rule          string
+	creates       []string
+	qosClasses    []string         // -qos-class name=rates registrations
+	osdQoS        string           // per-OSD aggregate rates spec ("" = none)
+	commit        store.CommitMode // OSD commit mode
+	fsyncBatch    time.Duration    // OSD fsync coalescing window
+	intentLog     bool             // write intent log (ideas §2.1)
+	atomicWrites  bool             // RWF_ATOMIC writes (ideas §2.2)
+	atomicSize    int64            // cap of one atomic write (bytes)
+	asyncRing     int              // io_uring depth for hosted OSDs
+	ringPinCPUs   string           // OSD ring worker pinning
+	ringArena     int              // OSD registered-buffer arena slots
+	ringArenaSz   int              // arena slot bytes
+	ringHugepages bool             // arena on huge pages
+	tlsDataSrv    *tls.Config      // OSD data plane server side (-tls-planes data; nil = plain)
+	tlsDataCli    *tls.Config      // client side for cluster pools (nil = plain)
+	disks         *diskRegistry    // hosted OSDs publish disk stats here (admin status)
+	metrics       *clusterMetrics  // prometheus registry (nil = metrics disabled)
+	logger        *log.Logger
 }
 
 // clusterBoot brings up a single-process (or multi-process, shared
@@ -912,19 +925,25 @@ func clusterBoot(ctx context.Context, p clusterParams) error {
 			return fmt.Errorf("-osd %q: %w", spec, err)
 		}
 		d, err := osd.New(osd.Options{
-			ID:           id,
-			Addr:         addr,
-			CtrlAddr:     ctrlAddr,
-			DataDir:      dataDir,
-			Meta:         ms,
-			Aggregate:    aggSpec.pair(),
-			CommitMode:   p.commit,
-			FsyncBatch:   p.fsyncBatch,
-			Intent:       p.intentLog,
-			AtomicWrites: p.atomicWrites,
-			TLS:          p.tlsDataSrv,
-			Metrics:      p.metrics.osdServerMetrics(id),
-			Logf:         func(f string, a ...any) { p.logger.Printf("osd %d: %s", id, fmt.Sprintf(f, a...)) },
+			ID:             id,
+			Addr:           addr,
+			CtrlAddr:       ctrlAddr,
+			DataDir:        dataDir,
+			Meta:           ms,
+			Aggregate:      aggSpec.pair(),
+			CommitMode:     p.commit,
+			FsyncBatch:     p.fsyncBatch,
+			Intent:         p.intentLog,
+			AtomicWrites:   p.atomicWrites,
+			AtomicSize:     p.atomicSize,
+			AsyncRing:      p.asyncRing,
+			RingPinCPUs:    p.ringPinCPUs,
+			RingArenaSlots: p.ringArena,
+			RingArenaSlot:  p.ringArenaSz,
+			RingHugePages:  p.ringHugepages,
+			TLS:            p.tlsDataSrv,
+			Metrics:        p.metrics.osdServerMetrics(id),
+			Logf:           func(f string, a ...any) { p.logger.Printf("osd %d: %s", id, fmt.Sprintf(f, a...)) },
 		})
 		if err != nil {
 			return fmt.Errorf("osd %d: %w", id, err)
@@ -1157,7 +1176,7 @@ func parseOSDSpec(spec string) (id int32, dataDir, addr, ctrlAddr string, err er
 
 // newBackend builds the export backend: a plain sparse file (MVP
 // default) or, with -store, the phase-1 object-store data path.
-func newBackend(storeMode bool, path string, size uint64, direct, prealloc bool, commitMode store.CommitMode, fsyncBatch time.Duration, asyncRing int, ringPinCPU string, intentLog bool, atomicWrites bool, atomicSize int64) (nbd.Backend, error) {
+func newBackend(storeMode bool, path string, size uint64, direct, prealloc bool, commitMode store.CommitMode, fsyncBatch time.Duration, asyncRing int, ringPinCPU string, ringArenaSlots, ringArenaSlot int, ringHugePages bool, intentLog bool, atomicWrites bool, atomicSize int64) (nbd.Backend, error) {
 	if !storeMode {
 		return nbd.NewFileBackend(path, size)
 	}
@@ -1165,15 +1184,18 @@ func newBackend(storeMode bool, path string, size uint64, direct, prealloc bool,
 		return nil, fmt.Errorf("-store exports require an explicit :size")
 	}
 	return nbd.NewStoreBackend(path, size, store.Options{
-		Direct:       direct,
-		Preallocate:  prealloc,
-		CommitMode:   commitMode,
-		FsyncBatch:   fsyncBatch,
-		AsyncRing:    asyncRing,
-		RingPinCPUs:  ringPinCPU,
-		Intent:       intentLog,
-		AtomicWrites: atomicWrites,
-		AtomicSize:   atomicSize,
+		Direct:         direct,
+		Preallocate:    prealloc,
+		CommitMode:     commitMode,
+		FsyncBatch:     fsyncBatch,
+		AsyncRing:      asyncRing,
+		RingPinCPUs:    ringPinCPU,
+		RingArenaSlots: ringArenaSlots,
+		RingArenaSlot:  ringArenaSlot,
+		RingHugePages:  ringHugePages,
+		Intent:         intentLog,
+		AtomicWrites:   atomicWrites,
+		AtomicSize:     atomicSize,
 	})
 }
 

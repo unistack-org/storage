@@ -156,6 +156,23 @@ type Options struct {
 	// size every NVMe on the market supports). Writes larger than this
 	// use the plain path.
 	AtomicSize int64
+	// RingArenaSlots > 0 gives the ring a registered buffer arena
+	// (io_uring IORING_REGISTER_BUFFERS): a fixed set of equal slots the
+	// kernel pins once, so every I/O through the ring becomes
+	// READ_FIXED/WRITE_FIXED and skips per-I/O page pinning. The store
+	// copies the caller's buffer into a slot (memcpy of a block is far
+	// cheaper than the per-I/O get_user_pages the kernel repeats on
+	// every plain op), submits, and copies a read's result out. Slots
+	// come from a pool sized to the queue depth, so the arena is the
+	// queue's flow control. 0 keeps the plain (unregistered) path.
+	RingArenaSlots int
+	// RingArenaSlot is the slot size in bytes (default 64 KiB, rounded
+	// up to a page). Writes larger than a slot take the plain path.
+	RingArenaSlot int
+	// RingHugePages backs the arena with huge pages (Linux
+	// MADV_HUGEPAGE over an mmap). Advisory: a kernel with THP off
+	// keeps plain pages. Only meaningful with RingArenaSlots > 0.
+	RingHugePages bool
 	// Intent turns on the Write Intent Journal (see intent.go): every
 	// write is announced by a durable 24-byte intent record (oid/off/
 	// len/crc) before its data, and recovery verifies open intents
@@ -200,7 +217,8 @@ type Store struct {
 	intent *intentState
 
 	// ring is the async I/O ring (nil = plain pread/pwrite path).
-	ring iouring.Ring
+	ring  iouring.Ring
+	arena *ringArena // registered-buffer arena (nil = plain ops)
 
 	syncPasses atomic.Int64 // fsync passes performed (Sync + batches), for stats/tests
 
@@ -311,6 +329,14 @@ func New(dir string, opts Options) (*Store, error) {
 			opts.Logf("store: async ring unavailable (%v): using plain pread/pwrite", err)
 		} else {
 			s.ring = ring
+			if opts.RingArenaSlots > 0 {
+				if err := s.initRingArena(ring); err != nil {
+					opts.Logf("store: ring arena unavailable (%v): ring uses plain buffers", err)
+				} else {
+					opts.Logf("store: ring arena %d x %d bytes%s",
+						s.arena.ar.N(), s.arena.ar.Size(), hugeNote(s.arena.ar.Huge))
+				}
+			}
 		}
 	}
 	return s, nil
@@ -1047,6 +1073,17 @@ func (s *Store) Close() error {
 		if err := s.ring.Close(); err != nil {
 			firstErr = err
 		}
+	}
+	if s.arena != nil {
+		// The ring is drained, so no op references the arena any
+		// more: drop the registration, then the pages.
+		s.ring.UnregisterBuffer(s.arena.idx)
+		if err := s.arena.ar.Close(); err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+		}
+		s.arena = nil
 	}
 
 	s.mu.Lock()

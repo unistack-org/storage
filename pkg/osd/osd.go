@@ -60,6 +60,18 @@ type Options struct {
 	// AtomicWrites opts the object store into RWF_ATOMIC writes when
 	// the disk publishes an atomic write unit (see store.Options).
 	AtomicWrites bool
+	// AtomicSize caps one RWF_ATOMIC write (bytes, 0 = store default).
+	AtomicSize int64
+	// AsyncRing / RingPinCPUs / RingArena* / RingHugePages are passed
+	// through to the object store: the io_uring ring depth, its worker
+	// CPU pinning, and the registered (optionally huge-page backed)
+	// buffer arena that turns ring ops into READ_FIXED/WRITE_FIXED
+	// (see store.Options).
+	AsyncRing      int
+	RingPinCPUs    string
+	RingArenaSlots int
+	RingArenaSlot  int
+	RingHugePages  bool
 	// Aggregate caps this disk (one store directory): every op from
 	// every client/export passes it before touching the store. This is
 	// the "limit iops on the NVMe" knob that keeps one volume from
@@ -123,11 +135,18 @@ func (d *Daemon) Run(ctx context.Context) error {
 		return err
 	}
 	st, err := store.New(d.opts.DataDir, store.Options{
-		Direct:      d.opts.Direct,
-		Preallocate: d.opts.Preallocate,
-		CommitMode:  d.opts.CommitMode,
-		FsyncBatch:  d.opts.FsyncBatch,
-		Intent:      d.opts.Intent,
+		Direct:         d.opts.Direct,
+		Preallocate:    d.opts.Preallocate,
+		CommitMode:     d.opts.CommitMode,
+		FsyncBatch:     d.opts.FsyncBatch,
+		Intent:         d.opts.Intent,
+		AsyncRing:      d.opts.AsyncRing,
+		RingPinCPUs:    d.opts.RingPinCPUs,
+		RingArenaSlots: d.opts.RingArenaSlots,
+		RingArenaSlot:  d.opts.RingArenaSlot,
+		RingHugePages:  d.opts.RingHugePages,
+		AtomicWrites:   d.opts.AtomicWrites,
+		AtomicSize:     d.opts.AtomicSize,
 	})
 	if err != nil {
 		return fmt.Errorf("osd: store: %w", err)
