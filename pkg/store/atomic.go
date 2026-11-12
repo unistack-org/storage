@@ -51,6 +51,19 @@ type DiskAtomicInfo struct {
 	WriteZeroes       int64  // queue/write_zeroes (1 = HW zero blocks)
 	RWFAtomic         bool   // kernel interface: RWF_ATOMIC usable on this device
 	KernelSupported   bool   // sysfs publishes the atomic queue attributes at all
+
+	// Device identity (see DeviceID): what the operator needs to see
+	// before writing the mount config. FilesystemUUID is the stable
+	// id to put in fstab ("UUID=<uuid>"); FstabDevice shows how the
+	// mount is configured today (a /dev/sdX here is a swap hazard).
+	FilesystemUUID string // filesystem UUID of the mounted fs, "" if none
+	Serial         string // /dev/disk/by-id name of the device
+	WWID           string // /dev/disk/by-wwid name of the device
+	FSType         string // mounted filesystem type
+	MountSource    string // mount table's name for the device
+	MountPoint     string // mount point holding the probed path
+	FstabDevice    string // /etc/fstab source spec for that mount
+	StableIdentity string // canonical identity string (DeviceIdentity.Identity)
 }
 
 // ProbeDisk reports the atomic-write geometry of the block device

@@ -189,7 +189,7 @@ func main() {
 	var osds osdFlag
 	flag.Var(&osds, "osd", "with -meta-dir: start an in-process OSD as id@data-dir[@host:port[@ctrl-host:ctrl-port]], repeatable (full form; see -data-dir for the simple one)")
 	var dataDirs osdFlag
-	flag.Var(&dataDirs, "data-dir", "with -meta-dir: start an in-process OSD on a data directory (id auto-assigned: lowest free, pinned in <dir>/id), repeatable")
+	flag.Var(&dataDirs, "data-dir", "with -meta-dir: start an in-process OSD on a data directory, repeatable: plain <dir> gets the lowest free id (pinned in <dir>/id, device identity pinned in <dir>/device and re-checked at every boot - a disk swap is a fatal error, never silent data drift); uuid=<identity>@<dir> pins the id to a device identity from \"unistorctl disk probe\"")
 	crushPath := flag.String("crushmap", "", "with -meta-dir: crushmap file (text/json/binary) to publish")
 	epoch := flag.Uint("epoch", 0, "with -meta-dir: epoch to publish -crushmap under (0 = auto: latest+1, i.e. 1 on a fresh cluster)")
 	pgNum := flag.Int("pg-num", 0, "with -meta-dir: placement default for -create only (0 = cluster snapshot; pools carry their own pg_num)")
@@ -471,50 +471,127 @@ func main() {
 			logger.Printf("vacuum: autovacuum every %vs", *vacuumInterval)
 		}
 
-		// -data-dir entries carry no id: assign the lowest free one.
-		// The id is pinned in <dir>/id so a restart gets it back
-		// unchanged (the crush map, the objects on disk and the meta
-		// registration all key on it); ids already used by -osd specs
-		// and by OSDs registered in meta are skipped. On a raft cluster
-		// meta may not be readable yet (no leader), which is why the
-		// pin file is the primary source.
+		// -data-dir entries: assign ids and verify the disks. Every
+		// entry is a data directory, optionally bound to a device
+		// identity ("uuid=<identity>@<dir>"). The id is pinned in
+		// <dir>/id and the device identity in <dir>/device (plus
+		// <meta-dir>/devices.json), and every restart re-checks the
+		// pins and the meta registration against the live device, so
+		// an operator who mounts by /dev/sdX and boots after the
+		// enumeration swapped disks gets a fatal error instead of
+		// silently serving foreign data under the wrong ids.
 		var osdSpecs []string
 		osdSpecs = append(osdSpecs, osds...)
-		if len(dataDirs) > 0 {
-			pinned, err := pinnedOSDIDs(dataDirs)
+		osdDevice := map[int32]string{}
+		var dataDirSpecs []dataDirSpec
+		for _, spec := range dataDirs {
+			sp, perr := parseDataDirSpec(spec)
+			if perr != nil {
+				logger.Fatalf("-data-dir %q: %v", spec, perr)
+			}
+			dataDirSpecs = append(dataDirSpecs, sp)
+		}
+		// -osd specs claim their ids outright; a data dir pinned to a
+		// taken id is a collision the operator must resolve.
+		used := map[int32]bool{}
+		for _, spec := range osds {
+			id, dir, _, _, perr := parseOSDSpec(spec)
+			if perr != nil {
+				logger.Fatalf("-osd %q: %v", spec, perr)
+			}
+			used[id] = true
+			// An explicit -osd dir may carry a device pin from an
+			// earlier -data-dir boot (<dir>/device). Honour it: the
+			// operator chose this dir for this id, so a pin that does
+			// not match the live device means the disks moved.
+			if want := readDevicePin(dir); want != "" {
+				if live, derr := store.DeviceID(dir); derr == nil {
+					if verr := store.ValidateDeviceID(live, want); verr != nil {
+						logger.Fatalf("-osd %d@%s: %v", id, dir, verr)
+					}
+					osdDevice[id] = live.Identity()
+				}
+			}
+		}
+		// Meta registration is the cluster-wide view: an id registered
+		// here is taken (it may live on another node), and its recorded
+		// device is the strongest evidence of where an OSD belongs. On
+		// a raft cluster meta may not be readable yet (no leader); the
+		// pins stay primary and the meta checks are skipped.
+		registered := map[int32]meta.OSDInfo{}
+		if infos, rerr := meta.ListOSDs(ctx, ms); rerr == nil {
+			for _, in := range infos {
+				registered[in.ID] = in
+			}
+		} else if !meta.IsReadOnly(rerr) {
+			logger.Printf("meta: OSD registry unreadable (%v): id assignment relies on the dir pins alone", rerr)
+		}
+		if len(dataDirSpecs) > 0 {
+			pins, err := readOSDPins(dataDirSpecs)
 			if err != nil {
 				logger.Fatalf("-data-dir: %v", err)
 			}
-			used := map[int32]bool{}
-			for _, spec := range osds {
-				id, _, _, _, perr := parseOSDSpec(spec)
-				if perr != nil {
-					logger.Fatalf("-osd %q: %v", spec, perr)
+			for dir, p := range pins {
+				if p.id != 0 && used[p.id] {
+					logger.Fatalf("-data-dir %s: id pin %d is already used by an -osd spec", dir, p.id)
 				}
+				if p.id != 0 {
+					used[p.id] = true
+				}
+			}
+			// A registered id is taken cluster-wide (it may be served by
+			// another node), so a brand new dir must never draw it.
+			for id := range registered {
 				used[id] = true
 			}
-			for dir, id := range pinned {
-				if used[id] {
-					logger.Fatalf("-data-dir %s: id pin %d is already used by an -osd spec", dir, id)
-				}
-				used[id] = true
+			nodeMap, err := readDeviceMap(clusterPath)
+			if err != nil {
+				logger.Printf("meta: %v: device map unavailable, relying on the dir pins", err)
+				nodeMap = nil
 			}
-			if infos, rerr := meta.ListOSDs(ctx, ms); rerr == nil {
-				for _, in := range infos {
-					used[in.ID] = true
-				}
+			plans, err := detectDataDirs(dataDirSpecs, pins, nodeMap)
+			if err != nil {
+				logger.Fatalf("-data-dir: %v", err)
 			}
-			for _, dir := range dataDirs {
-				id, ok := pinned[dir]
-				if !ok {
-					id = firstFreeOSDID(used)
-					used[id] = true
+			for _, p := range plans {
+				logger.Printf("-data-dir %s: on %s%s", p.spec.dir, p.live.IdentityLabel(),
+					func() string {
+						if v := p.live.MountedByKernelName(); v != "" {
+							return fmt.Sprintf(" (fstab mounts it by kernel name %s: a reboot can swap disks between mount points - mount by UUID=... instead)", v)
+						}
+						return ""
+					}())
+			}
+			if err := checkDataDirSwaps(plans, registered, func(f string, a ...any) { logger.Printf(f, a...) }); err != nil {
+				logger.Fatalf("%v", err)
+			}
+			assigned, err := assignDataDirIDs(plans, used, func(f string, a ...any) { logger.Printf(f, a...) })
+			if err != nil {
+				logger.Fatalf("-data-dir: %v", err)
+			}
+			for _, a := range assigned {
+				if err := writeOSDPin(a.dir, a.id, liveIdentity(plans, a.dir)); err != nil {
+					logger.Fatalf("-data-dir %s: %v", a.dir, err)
 				}
-				if err := pinOSDID(dir, id); err != nil {
-					logger.Fatalf("-data-dir %s: %v", dir, err)
+				osdSpecs = append(osdSpecs, fmt.Sprintf("%d@%s", a.id, a.dir))
+				if id := liveIdentity(plans, a.dir); id != "" {
+					osdDevice[a.id] = id
 				}
-				osdSpecs = append(osdSpecs, fmt.Sprintf("%d@%s", id, dir))
-				logger.Printf("osd %d on %s (-data-dir)", id, dir)
+				logger.Printf("osd %d on %s (-data-dir)", a.id, a.dir)
+			}
+			if clusterPath != "" {
+				merged := map[string]string{}
+				for k, v := range nodeMap {
+					merged[k] = v
+				}
+				for _, p := range plans {
+					if p.live.Identity() != "" {
+						merged[mapKey(p.spec.dir)] = p.live.Identity()
+					}
+				}
+				if err := writeDeviceMap(clusterPath, merged); err != nil {
+					logger.Printf("meta: write %s: %v", deviceMapFile, err)
+				}
 			}
 		}
 
@@ -544,6 +621,7 @@ func main() {
 			store:         ms,
 			metaDir:       clusterPath,
 			osds:          osdSpecs,
+			osdDevice:     osdDevice,
 			crushmap:      *crushPath,
 			epoch:         uint32(*epoch),
 			pgNum:         *pgNum,
@@ -842,9 +920,13 @@ func parseCreateSpec(spec string) (pool, name, sizeStr string, err error) {
 }
 
 type clusterParams struct {
-	store         meta.Store // shared meta store (dir-backed or raft), opened by the caller
-	metaDir       string     // for logs only
-	osds          []string
+	store   meta.Store // shared meta store (dir-backed or raft), opened by the caller
+	metaDir string     // for logs only
+	osds    []string
+	// osdDevice maps an OSD id to the stable device identity of its
+	// data dir, resolved (and swap-checked) at boot. Registered in
+	// meta.OSDInfo.Device so the cluster sees where each OSD lives.
+	osdDevice     map[int32]string
 	crushmap      string
 	epoch         uint32
 	pgNum         int
@@ -952,6 +1034,7 @@ func clusterBoot(ctx context.Context, p clusterParams) error {
 			Addr:           addr,
 			CtrlAddr:       ctrlAddr,
 			DataDir:        dataDir,
+			DeviceID:       p.osdDevice[id],
 			Meta:           ms,
 			Aggregate:      aggSpec.pair(),
 			CommitMode:     p.commit,
@@ -1118,41 +1201,6 @@ func bootClusterDevices(ctx context.Context, ms meta.Store, typ string, specs []
 	return nil
 }
 
-// pinnedOSDIDs reads <dir>/id pins for -data-dir entries. A missing
-// file means the directory is new (its id is still to be assigned);
-// any other read/parse failure is an operator-visible error, since
-// silently re-assigning an id would orphan the data on disk.
-func pinnedOSDIDs(dirs []string) (map[string]int32, error) {
-	pinned := map[string]int32{}
-	seen := map[int32]string{}
-	for _, dir := range dirs {
-		b, err := os.ReadFile(filepath.Join(dir, "id"))
-		if err != nil {
-			if os.IsNotExist(err) {
-				continue
-			}
-			return nil, fmt.Errorf("%s: read id pin: %w", dir, err)
-		}
-		id, err := strconv.Atoi(strings.TrimSpace(string(b)))
-		if err != nil || id <= 0 {
-			return nil, fmt.Errorf("%s: id pin %q is not a positive id", dir, strings.TrimSpace(string(b)))
-		}
-		if other, dup := seen[int32(id)]; dup {
-			return nil, fmt.Errorf("%s: id pin %d collides with %s", dir, id, other)
-		}
-		seen[int32(id)] = dir
-		pinned[dir] = int32(id)
-	}
-	return pinned, nil
-}
-
-func pinOSDID(dir string, id int32) error {
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return err
-	}
-	return os.WriteFile(filepath.Join(dir, "id"), []byte(strconv.Itoa(int(id))+"\n"), 0o644)
-}
-
 // firstFreeOSDID returns the lowest positive id absent from used.
 func firstFreeOSDID(used map[int32]bool) int32 {
 	for id := int32(1); ; id++ {
@@ -1162,9 +1210,10 @@ func firstFreeOSDID(used map[int32]bool) int32 {
 	}
 }
 
-// parseOSDSpec parses an -osd/-data-dir entry. A bare path (no '@')
-// is a -data-dir entry: the OSD id is auto-assigned (id = -1, pinned
-// in <dir>/osd.id by the caller). The full form is
+// parseOSDSpec parses an -osd entry (and, for compatibility, a bare
+// -data-dir path: id = -1 marks the auto-assigned case, the boot
+// sequence pins the chosen id in <dir>/id, see osd_boot.go). The full
+// form is
 // "id@data-dir[@host:port[@ctrl-host:ctrl-port]]" (default
 // 127.0.0.1:0, no control plane). The 4th segment is the optional
 // control-plane listen address: pings/StatFS probes dial it instead of

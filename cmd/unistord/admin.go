@@ -60,6 +60,7 @@ import (
 	"github.com/unistack-org/storage/pkg/meta"
 	"github.com/unistack-org/storage/pkg/object"
 	"github.com/unistack-org/storage/pkg/qos"
+	"github.com/unistack-org/storage/pkg/store"
 )
 
 // reloadTimeout bounds one reload over the admin API. The sections are
@@ -381,17 +382,22 @@ func (a *adminAPI) handleStatus(w http.ResponseWriter, r *http.Request) {
 		warnings = append(warnings, fmt.Sprintf("meta: OSD registry unreadable, liveness unknown: %v", metaErr))
 	}
 	type osdView struct {
-		ID       int32   `json:"id"`
-		Addr     string  `json:"addr"`
-		CtrlAddr string  `json:"ctrl_addr,omitempty"`
-		Weight   float64 `json:"weight"`
-		Live     bool    `json:"live"`
-		Evicted  bool    `json:"evicted"`
+		ID       int32  `json:"id"`
+		Addr     string `json:"addr"`
+		CtrlAddr string `json:"ctrl_addr,omitempty"`
+		// Device is the stable identity of the disk hosting the OSD
+		// (filesystem UUID / serial / wwid); operators match it against
+		// `disk probe` when a mount is suspected to have swapped.
+		Device  string  `json:"device,omitempty"`
+		Weight  float64 `json:"weight"`
+		Live    bool    `json:"live"`
+		Evicted bool    `json:"evicted"`
 	}
 	views := make([]osdView, 0, len(infos))
 	liveCount := 0
 	for _, info := range infos {
-		v := osdView{ID: info.ID, Addr: info.Addr, CtrlAddr: info.CtrlAddr, Weight: info.Weight,
+		v := osdView{ID: info.ID, Addr: info.Addr, CtrlAddr: info.CtrlAddr,
+			Device: store.NormalizeIdentity(info.Device), Weight: info.Weight,
 			Live: probes[info.ID] == nil, Evicted: info.Weight <= 0}
 		if v.Live {
 			liveCount++

@@ -20,7 +20,7 @@
 //	qos put     <class> <riops:rbps:wiops:wbps>
 //	qos rm      <class>
 //	osd ls | out <id> | in <id> [-weight w]      (registry weight; 0 = out of placement)
-//	osd add <id> <addr> [-data P] [-uuid U]      (register an osd record by hand)
+//	osd add <id> <addr> [-data P] [-uuid U] [-device D]  (register an osd record by hand)
 //	map dump [-format raw|text|json|yaml|binary]  (latest crush map epoch; raw = as stored)
 //	map check   [file] [-pg-num n] [-replicas n] [-rule r] [-class ssd|hdd]  (compile + pg census + class validators)
 //	map publish <file> [-epoch n] [-force] [-pg-num n] [-replicas n] [-rule r]  (store a new epoch, default latest+1; validated unless -force)
@@ -62,6 +62,7 @@ import (
 	"github.com/unistack-org/storage/pkg/object"
 	"github.com/unistack-org/storage/pkg/placement"
 	"github.com/unistack-org/storage/pkg/qos"
+	"github.com/unistack-org/storage/pkg/store"
 	"github.com/unistack-org/storage/pkg/tlsconf"
 	"sigs.k8s.io/yaml"
 )
@@ -831,18 +832,19 @@ func qosCmd(ctx context.Context, cl *client.Cluster, args []string) error {
 func osdCmd(ctx context.Context, ms meta.Store, args []string) error {
 	if len(args) == 0 {
 		usage()
-		return errors.New("osd: subcommand required (ls | add <id> <addr> | out <id> | in <id> [-weight w])")
+		return errors.New("osd: subcommand required (ls | add <id> <addr> [-device D] | out <id> | in <id> [-weight w])")
 	}
 	switch args[0] {
 	case "add":
 		fs := flag.NewFlagSet("osd add", flag.ExitOnError)
 		data := fs.String("data", "", "data path the osd serves")
 		uuid := fs.String("uuid", "", "osd uuid (must match what the daemon reports)")
+		device := fs.String("device", "", "device identity the osd's data lives on (from \"unistorctl disk probe\", e.g. filesystem=<uuid>, serial=<serial> or wwid=<wwid>): the daemon refuses to start under this id on any other device")
 		wFlag := fs.Float64("weight", 1, "crush weight (> 0)")
 		parseMix(fs, args[1:])
 		if fs.NArg() != 2 {
 			fs.Usage()
-			return errors.New("osd add: <id> <addr> [-data P] [-uuid U] [-weight w]")
+			return errors.New("osd add: <id> <addr> [-data P] [-uuid U] [-device D] [-weight w]")
 		}
 		id, err := strconv.ParseInt(fs.Arg(0), 10, 32)
 		if err != nil {
@@ -850,6 +852,7 @@ func osdCmd(ctx context.Context, ms meta.Store, args []string) error {
 		}
 		if _, err := meta.PutOSD(ctx, ms, meta.OSDInfo{
 			ID: int32(id), Addr: fs.Arg(1), DataPath: *data, UUID: *uuid, Weight: *wFlag,
+			Device: store.NormalizeIdentity(*device),
 		}); err != nil {
 			return err
 		}
@@ -895,13 +898,13 @@ func osdCmd(ctx context.Context, ms meta.Store, args []string) error {
 	if err != nil {
 		return err
 	}
-	fmt.Printf("%-6s %-24s %8s %-10s %s\n", "ID", "ADDR", "WEIGHT", "UUID", "DATA")
+	fmt.Printf("%-6s %-24s %8s %-10s %-28s %s\n", "ID", "ADDR", "WEIGHT", "UUID", "DEVICE", "DATA")
 	for _, o := range infos {
 		uuid := o.UUID
 		if len(uuid) > 8 {
 			uuid = uuid[:8]
 		}
-		fmt.Printf("%-6d %-24s %8.3f %-10s %s\n", o.ID, o.Addr, o.Weight, uuid, o.DataPath)
+		fmt.Printf("%-6d %-24s %8.3f %-10s %-28s %s\n", o.ID, o.Addr, o.Weight, uuid, store.NormalizeIdentity(o.Device), o.DataPath)
 	}
 	rec, mapErr := meta.LatestMap(ctx, ms)
 	if mapErr == nil {
@@ -1542,7 +1545,7 @@ vol snap create <name> | vol snap ls <name> | vol snap rm <name> <gen> | vol sna
 pool create <name> [-replicas n] [-min-size n] [-pg-num n] [-rule r] [-qos class]  (cluster-wide placement policy; volumes created in it inherit it)
 pool ls | pool rm <name>  (rm is refused while volumes reference the pool)
 qos ls | qos put <class> <riops:rbps:wiops:wbps> | qos rm <class>
-osd ls | osd add <id> <addr> [-data P] [-uuid U] | osd out <id> | osd in <id> [-weight w]   (weight 0 = out of placement)
+osd ls | osd add <id> <addr> [-data P] [-uuid U] [-device D] | osd out <id> | osd in <id> [-weight w]   (weight 0 = out of placement)
 map dump [-format raw|text|json|yaml|binary] | map check [file] [-pg-num n] [-replicas n] [-rule r] | map publish <file> [-epoch n] [-force] [-pg-num n] [-replicas n] [-rule r] | map reweight <id> <w>
 vacuum [ls|run [vol]]  (M1.4: free deleted volumes' objects; run <vol> = targeted tombstone, live volume = punch out all-zero objects)
 recovery ls | recovery check <vol> | recovery run <vol> [-iops N] [-bps B]
@@ -1552,7 +1555,7 @@ export rm <name> [-type nbd|vduse|vhost-user-blk] [-http URL] [-token T]  (detac
 status [-http URL]  (reads unistord admin /v1/status; default http://127.0.0.1:8443)
 reload [-http URL] [-token T]  (re-applies the daemon's config: certificates, -qos-class, -crushmap, -create; the HTTP twin of SIGHUP)
 healthcheck [-http URL] [-json]  (verdict on unistord /healthcheck; exit 1 when the cluster is unhealthy)
-disk probe <path> [-json]  (atomic-write capability of the disk backing <path>: device, atomic_write_unit_max/min, kernel RWF_ATOMIC support)
+disk probe <path> [-json]  (disk backing <path>: atomic-write capability (atomic_write_unit_max/min, kernel RWF_ATOMIC) and stable device identity (fs uuid / serial / wwid) for unistord -data-dir uuid=<identity>@<dir> pinning)
 rebalance [-once] [-dry-run] [-interval 30s] [-threshold f]  (free-space rebalancer: CRUSH weights ∝ free space, publishes new map epochs; stateless)
 
 Global TLS flags (before the command), for a cluster whose data plane

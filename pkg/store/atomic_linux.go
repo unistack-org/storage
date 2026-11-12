@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"strings"
 	"syscall"
 	"unsafe"
 )
@@ -120,7 +119,7 @@ func deviceForPath(path string) (string, error) {
 			if major(st) == 0 {
 				return "", fmt.Errorf("store: %s sits on a virtual filesystem (no block device to probe)", abs)
 			}
-			dev = fmt.Sprintf("%d:%d", major(st), minor(st))
+			dev = deviceNumberText(st)
 		}
 		if abs == "/" {
 			break
@@ -139,36 +138,19 @@ func minor(rdev uint64) uint64 { return (rdev & 0xff) | ((rdev >> 12) & 0xfff00)
 
 // mountinfoDevice maps a "major:minor" st_dev to the device node named
 // in /proc/self/mountinfo for the (longest-prefix) mount it serves.
+// parseMountinfo reads the line correctly: after the " - " separator
+// mountinfo lists fstype first and the source device second (the old
+// hand-rolled scan here returned the fstype as the device).
 func mountinfoDevice(dev string) (string, error) {
 	b, err := os.ReadFile("/proc/self/mountinfo")
 	if err != nil {
 		return "", err
 	}
-	bestPath, bestDev := "", ""
-	for _, line := range strings.Split(string(b), "\n") {
-		fields := strings.Fields(line)
-		if len(fields) < 5 {
-			continue
-		}
-		if fields[2] != dev {
-			continue
-		}
-		mount := fields[4]
-		if len(mount) > len(bestPath) {
-			// The source device is the field after the " - "
-			// separator (fstype device options).
-			for i := 6; i+2 < len(fields); i++ {
-				if fields[i] == "-" {
-					bestPath, bestDev = mount, fields[i+1]
-					break
-				}
-			}
-		}
-	}
-	if bestDev == "" {
+	source, _, _, _, ok := parseMountinfo(string(b), dev)
+	if !ok {
 		return "", fmt.Errorf("store: no block device found for %s", dev)
 	}
-	return bestDev, nil
+	return source, nil
 }
 
 // queueDirFor maps a device node (/dev/nvme0n1, /dev/mapper/vg-lv, ...)
@@ -250,7 +232,8 @@ func (s *Store) atomicGeometry() (atomicMax, atomicUnit int64) {
 	return info.AtomicMax, info.AtomicMin
 }
 
-// probeDiskImpl fills the sysfs-backed part of the report.
+// probeDiskImpl fills the sysfs-backed part of the report, plus the
+// device identity (one mountinfo/by-* pass serves both).
 func probeDiskImpl(path string, info *DiskAtomicInfo) error {
 	dev, err := deviceForPath(path)
 	if err != nil {
@@ -267,5 +250,11 @@ func probeDiskImpl(path string, info *DiskAtomicInfo) error {
 	// RWF_ATOMIC (kernel >= 6.11) needs the device to publish a
 	// non-zero atomic write unit range.
 	info.RWFAtomic = info.KernelSupported && info.AtomicMax > 0 && info.AtomicMin > 0
+	var id DeviceIdentity
+	id.Device = dev
+	_ = deviceIDImpl(path, &id)
+	info.FilesystemUUID, info.Serial, info.WWID = id.Filesystem, id.Serial, id.WWID
+	info.FSType, info.MountSource, info.MountPoint = id.FSType, id.MountSource, id.MountPoint
+	info.FstabDevice, info.StableIdentity = id.FstabDevice, id.Identity()
 	return nil
 }

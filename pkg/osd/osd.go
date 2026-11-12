@@ -44,6 +44,13 @@ type Options struct {
 	CtrlAddr string
 	// DataDir holds the object store (one directory per OSD).
 	DataDir string
+	// DeviceID, when set, is the stable identity of the block device
+	// hosting DataDir ("filesystem=<uuid>", "serial=<s>", "wwid=<w>";
+	// see store.DeviceIdentity). The daemon records it in the meta
+	// registration and refuses to start when the OSD is registered to
+	// a different device: a disk mounted onto the wrong id is then
+	// caught cluster-wide, not only on the node that pinned it.
+	DeviceID string
 	// Meta is the cluster metadata store.
 	Meta meta.Store
 	// Direct / Preallocate are passed through to the object store.
@@ -326,6 +333,7 @@ func (d *Daemon) register() error {
 		Addr:     addr,
 		CtrlAddr: ctrl,
 		UUID:     uuid,
+		Device:   d.opts.DeviceID,
 		DataPath: d.opts.DataDir,
 		Weight:   1,
 		BootedAt: time.Now().Unix(),
@@ -336,6 +344,20 @@ func (d *Daemon) register() error {
 		info.Weight = prev.Weight
 		if prev.UUID != "" {
 			info.UUID = prev.UUID
+		}
+		if info.Device != "" {
+			// Cluster-wide swap guard: the id is already registered on
+			// a specific device; serving it from another disk means the
+			// mounts traded places.
+			if verr := store.ValidateIdentityStrings(prev.Device, info.Device); verr != nil {
+				return fmt.Errorf("osd %d is registered on device %q: %w", d.opts.ID, prev.Device, verr)
+			}
+		}
+		if info.Device == "" {
+			// No live identity on this platform (or none passed):
+			// keep the registered device so the cluster view and the
+			// swap checks of peers do not go blind.
+			info.Device = prev.Device
 		}
 	} else if !errors.Is(err, meta.ErrNotFound) {
 		return err

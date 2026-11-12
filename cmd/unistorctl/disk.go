@@ -4,7 +4,10 @@ package main
 // device) backing a path - the data an operator needs before enabling
 // unistord -atomic-writes (vitastor-ideas §2.2): does the device
 // publish an atomic write unit, is the kernel new enough to expose
-// RWF_ATOMIC, and what are the size/alignment rules.
+// RWF_ATOMIC, and what are the size/alignment rules - plus the stable
+// device identity (fs uuid / serial / wwid) that unistord -data-dir
+// pins an OSD's data directory to, and the fstab mount hazard that
+// pinning protects against.
 
 import (
 	"encoding/json"
@@ -77,5 +80,39 @@ func diskProbeCmd(args []string) error {
 	} else {
 		fmt.Println("\nno: the device publishes no atomic write unit; -atomic-writes stays inert on this disk")
 	}
+	printDiskIdentity(info)
 	return nil
+}
+
+// printDiskIdentity appends the device-identity section: the stable id
+// unistord pins a data directory to (-data-dir uuid=<identity>@<dir>),
+// the fs UUID to put in fstab, and the mount-hazard warning for an
+// fstab entry that names the device by kernel name (/dev/sdb), whose
+// enumeration order can change across a reboot.
+func printDiskIdentity(info store.DiskAtomicInfo) {
+	fmt.Print("\ndevice identity (unistord -data-dir pins):\n")
+	if info.StableIdentity == "" {
+		fmt.Println("identity:            (none: no filesystem UUID, serial or wwid is readable for this device)")
+	} else {
+		fmt.Printf("identity:            %s\n", info.StableIdentity)
+		fmt.Printf("                     unistord -data-dir uuid=%s@<dir>\n", info.StableIdentity)
+	}
+	if info.FilesystemUUID != "" {
+		fmt.Printf("fs uuid (fstab):     UUID=%s\n", info.FilesystemUUID)
+	}
+	if info.Serial != "" {
+		fmt.Printf("serial:              %s\n", info.Serial)
+	}
+	if info.WWID != "" {
+		fmt.Printf("wwid:                %s\n", info.WWID)
+	}
+	if info.MountPoint != "" {
+		fmt.Printf("mounted:             %s (%s) from %s\n", info.MountPoint, info.FSType, info.MountSource)
+	}
+	if info.FstabDevice != "" {
+		fmt.Printf("fstab entry:         %s\n", info.FstabDevice)
+	}
+	if warn := (store.DeviceIdentity{FstabDevice: info.FstabDevice}).MountedByKernelName(); warn != "" {
+		fmt.Printf("\nwarning: fstab mounts %s by kernel name (%s): the kernel assigns those names in probe order, so a reboot can swap disks between mount points and the data under them. Mount by UUID=<fs uuid above> instead.\n", info.MountPoint, warn)
+	}
 }

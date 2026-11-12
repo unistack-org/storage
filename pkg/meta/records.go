@@ -38,8 +38,15 @@ type OSDInfo struct {
 	// OSD has no separate control plane and control dials Addr. Keeping
 	// probes off the data network lets cluster health survive a fully
 	// saturated storage network.
-	CtrlAddr string  `json:"ctrl_addr,omitempty"`
-	UUID     string  `json:"uuid"`      // stable per-device identity
+	CtrlAddr string `json:"ctrl_addr,omitempty"`
+	UUID     string `json:"uuid"` // stable per-device identity
+	// Device is the stable identity of the block device (filesystem
+	// UUID, serial, wwid) hosting DataPath, in the store.DeviceIdentity
+	// "filesystem=..." form. Empty on OSDs registered before the field
+	// existed and on platforms that read no identity. The boot-time
+	// swap check and `osd add` device pinning compare against it, so a
+	// disk mounted onto the wrong OSD is caught cluster-wide.
+	Device   string  `json:"device,omitempty"`
 	DataPath string  `json:"data_path"` // human info only
 	Weight   float64 `json:"weight"`    // crush weight, 0 = out
 	BootedAt int64   `json:"booted_at"`
