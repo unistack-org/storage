@@ -57,6 +57,9 @@ type Options struct {
 	// Intent turns on the write intent log of the object store
 	// (vitastor-ideas §2.1); ignored in journal commit mode.
 	Intent bool
+	// AtomicWrites opts the object store into RWF_ATOMIC writes when
+	// the disk publishes an atomic write unit (see store.Options).
+	AtomicWrites bool
 	// Aggregate caps this disk (one store directory): every op from
 	// every client/export passes it before touching the store. This is
 	// the "limit iops on the NVMe" knob that keeps one volume from

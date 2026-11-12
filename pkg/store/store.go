@@ -26,6 +26,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/unistack-org/storage/pkg/cpu"
 	"github.com/unistack-org/storage/pkg/iouring"
 	"github.com/unistack-org/storage/pkg/object"
 )
@@ -130,6 +131,31 @@ type Options struct {
 	// ring cannot be created the store logs it and keeps the plain
 	// pread/pwrite path, so enabling AsyncRing never breaks a store.
 	AsyncRing int
+	// RingPinCPUs pins the ring's worker threads (the io_uring
+	// submit/completion loops) to a CPU set given in Linux cpulist
+	// syntax ("2" or "2-3"). Empty (the default) leaves the scheduler
+	// in charge. A store whose ring workers are pinned gets the same
+	// core every completion lands on: no migration, no cache bouncing
+	// between cores. Invalid sets are reported at Open; the store then
+	// runs with an unpinned ring.
+	RingPinCPUs string
+	// AtomicWrites enables RWF_ATOMIC writes: on Linux kernels >=
+	// 6.11 with NVMe drives publishing an atomic write unit
+	// (atomic_write_unit_max > 0 — Micron 7450/7500, Kioxia CD7/CD8:
+	// 256 KiB; most enterprise drives are atomic at 4 KiB), aligned
+	// writes of at most AtomicSize bytes go to the device as single
+	// atomic units. A torn power-loss write then cannot exist: the
+	// device commits the whole unit or nothing. The store detects the
+	// device geometry at Open; a device without an atomic unit (the
+	// common case: Samsung PM9A3 publishes 0) keeps the plain path,
+	// and so does a kernel that rejects RWF_ATOMIC. Journal mode never
+	// uses RWF_ATOMIC (the WAL is sequential and its records are
+	// checksummed anyway).
+	AtomicWrites bool
+	// AtomicSize caps an RWF_ATOMIC write (bytes, default 4096 — the
+	// size every NVMe on the market supports). Writes larger than this
+	// use the plain path.
+	AtomicSize int64
 	// Intent turns on the Write Intent Journal (see intent.go): every
 	// write is announced by a durable 24-byte intent record (oid/off/
 	// len/crc) before its data, and recovery verifies open intents
@@ -177,6 +203,13 @@ type Store struct {
 	ring iouring.Ring
 
 	syncPasses atomic.Int64 // fsync passes performed (Sync + batches), for stats/tests
+
+	// Atomic-write state: device geometry detected at Open (0 = no
+	// atomic path), and a latch cleared the first time the kernel
+	// rejects RWF_ATOMIC so the store stops paying for the bounce.
+	atomicMax    atomic.Int64
+	atomicUnit   atomic.Int64
+	atomicFailed atomic.Bool
 
 	// Write-activity counters (see stats.go): cumulative, lock-free.
 	clientBytes  atomic.Int64 // guest bytes accepted by WriteAt
@@ -247,8 +280,31 @@ func New(dir string, opts Options) (*Store, error) {
 		}
 		return nil, err
 	}
+	if opts.AtomicWrites && s.jrn == nil {
+		max, unit := s.atomicGeometry()
+		if max > 0 {
+			s.atomicMax.Store(max)
+			s.atomicUnit.Store(unit)
+			opts.Logf("store: atomic writes enabled (unit min %d, max %d bytes)", unit, max)
+		} else {
+			opts.Logf("store: -atomic-writes requested, but the device under %s publishes no atomic write unit: plain writes", s.dir)
+		}
+	}
 	if opts.AsyncRing > 0 && s.jrn == nil {
-		ring, err := iouring.New(opts.AsyncRing)
+		pin := func() {}
+		if opts.RingPinCPUs != "" {
+			cpus := opts.RingPinCPUs
+			if _, perr := cpu.ParseCPUs(cpus); perr != nil {
+				opts.Logf("store: ring pin-cpu %q invalid (%v): ring stays unpinned", cpus, perr)
+			} else {
+				pin = func() {
+					if perr := cpu.PinCurrent(cpus); perr != nil {
+						opts.Logf("store: ring worker pin %q: %v", cpus, perr)
+					}
+				}
+			}
+		}
+		ring, err := iouring.NewPinned(opts.AsyncRing, pin)
 		if err != nil {
 			// A missing ring is a performance loss, not a failure:
 			// plain pread/pwrite stays in charge.
@@ -547,7 +603,12 @@ func (s *Store) WriteAt(oid object.OID, p []byte, off int64) (int, error) {
 		return 0, err
 	}
 	var n int
-	if s.ring != nil {
+	if s.atomicWritePossible(off, len(p)) {
+		// Aligned, device-atomic size: one RWF_ATOMIC unit straight
+		// to the device (bypassing the ring — the point is the
+		// device's own atomicity, and the syscall is one-shot).
+		n, err = s.atomicWrite(e, p, off)
+	} else if s.ring != nil {
 		n, err = s.ringIO(e, p, off, true)
 	} else {
 		n, err = e.f.WriteAt(p, off)
@@ -757,6 +818,11 @@ func (s *Store) removeFile(oid object.OID) error {
 	delete(s.meta, oid)
 	s.mu.Unlock()
 	if e != nil {
+		// Drop the io_uring fixed-file slot before recycling the fd:
+		// a reused descriptor must not inherit the stale slot.
+		if s.ring != nil && e.fd >= 0 {
+			s.ring.UnregisterFile(e.fd)
+		}
 		e.f.Close()
 	}
 	if err := os.Remove(s.path(oid)); err != nil && !errors.Is(err, fs.ErrNotExist) {

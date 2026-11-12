@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -184,5 +185,54 @@ func TestAsyncRingCloseWithWork(t *testing.T) {
 	fi, err = os.Stat(filepath.Join(dir, fmt.Sprintf("%016x", uint64(oid))))
 	if err != nil || fi == nil || fi.Size() == 0 {
 		t.Fatalf("object file missing/empty after ring writes: %v", err)
+	}
+}
+
+// TestAsyncRingPinnedWorkers: RingPinCPUs opens the store, pins the
+// ring workers (a no-op off Linux) and the data path stays correct.
+// A nonsense pin list must not break the store: it opens with an
+// unpinned ring.
+func TestAsyncRingPinnedWorkers(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "s")
+	s, err := New(dir, Options{AsyncRing: 32, RingPinCPUs: "0"})
+	if err != nil {
+		t.Fatalf("new: %v", err)
+	}
+	payload := bytes.Repeat([]byte("pin"), 1000)
+	oid := object.OID(0x21)
+	if _, err := s.WriteAt(oid, payload, 0); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	got := make([]byte, len(payload))
+	if _, err := s.ReadAt(oid, got, 0); err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if !bytes.Equal(got, payload) {
+		t.Fatal("pinned-ring read-back mismatch")
+	}
+	if err := s.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	var logged int32
+	s2, err := New(filepath.Join(t.TempDir(), "s2"), Options{
+		AsyncRing:   32,
+		RingPinCPUs: "not-a-cpu-list",
+		Logf:        func(string, ...any) { atomic.AddInt32(&logged, 1) },
+	})
+	if err != nil {
+		t.Fatalf("new with bad pin list: %v", err)
+	}
+	if s2.ring == nil {
+		t.Fatal("ring should still be enabled with a bad pin list")
+	}
+	if _, err := s2.WriteAt(oid, payload, 0); err != nil {
+		t.Fatalf("bad-pin write: %v", err)
+	}
+	if atomic.LoadInt32(&logged) == 0 {
+		t.Fatal("bad pin list should be logged")
+	}
+	if err := s2.Close(); err != nil {
+		t.Fatalf("close: %v", err)
 	}
 }

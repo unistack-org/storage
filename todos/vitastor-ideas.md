@@ -117,7 +117,21 @@ Intent** на атомарных записях NVMe. Итог: WA ≈ 1.0, 176K
       (records/syncs/checked/mismatches) в том же exporter. Тесты:
       `intent_test.go` (torn write, потеря маркера, CommitNone+Sync,
       delete-фолд, zeroes, приоритет journal-режима). `[hl2025, 3.0.0]`
-- [ ] **2.2 Детект атомарности устройства** (`pkg/store`): читать AWUPF
+- [x] **2.2 Детект атомарности устройства** *(закрыто 2026-11-11)*: `pkg/store/atomic.go` +
+      `atomic_linux.go` — `ProbeDisk(path)` читает sysfs (устройство из st_dev +
+      mountinfo, разделы наследуют queue родителя, dm/raid — slaves), отдаёт
+      `atomic_write_unit_max/min`, блоки/физические размеры, признак ядра;
+      `unistorage probe-disk` = `unistorctl disk probe <path> [-json]`.
+      `unistord -atomic-writes [-atomic-size N]`: выровненные записи ≤ min(N,
+      unit_max) уходят `pwritev2(RWF_ATOMIC)` через page-aligned bounce-буфер
+      (ядро требует 512-выровненного буфера); устройство без unit (PM9A3=0)
+      или ядро без поддержки (EINVAL) — обычная запись, флаги гасятся
+      автоматически (latch). Journal-режим не затронут. WA→1 достигается на
+      дисках с atomic unit (Micron/Kioxia 256K, 4K везде); на стенде (PM9A3)
+      путь детектируется как недоступный и молча выключается — как и задумано.
+      Тесты: `pkg/store/atomic_test.go` (гейт размеров/выравнивания,
+      инертность без геометрии, probe). Оговорка Vitastor про сломанный
+      RWF_ATOMIC в старых ядрах учтена: EINVAL = деградация, не ошибка. (`pkg/store`): читать AWUPF
       (Atomic Write Unit Power Fail) + supported write size; писать через
       `RWF_ATOMIC` при наличии. Реальность по дискам: Micron 7450/7500 = 256K,
       Kioxia CD7/CD8-R = 256K, **Samsung PM9A3 = 0** (т.е. у нас на стенде
@@ -271,8 +285,17 @@ randread QD128: 41.6K против их 128K (×3). Their bottleneck = CPU + с�
 
 Порядок по полезности для нас, от дешёвых к дорогим:
 
-- [ ] **5.1 TLS/mTLS к meta/etcd** + поддержку DNS-имён в адресах (`pkg/meta`).
+- [x] **5.1 TLS/mTLS к meta/etcd** + поддержку DNS-имён в адресах (`pkg/meta`).
       У них не было TLS на etcd до 3.1.0. `[3.1.0]`
+      Закрыто: mTLS raft-транспорта (`RaftConfig.TLS`/`ProxyTLS` через
+      `pkg/tlsconf`), адреса peers — любые host:port, имя резолвится при
+      dial/listen, SNI/верификация = хост из адреса. Фикс: клиентская
+      сторона транспорта верифицирует peers по пулу `ClientCAs` когда
+      RootCAs пуст (mutual-конфиг из `tlsconf.ServerConfig`), иначе
+      кластер на собственном CA не собирался. Тесты: `dnspeers_test.go`
+      (транспорт по DNS-имени, отказ при несовпадении SAN, 3-узловой
+      mTLS-кластер на `localhost:port`, стабильность memberID от строки
+      адреса).
 - [ ] **5.2 Транспортное шифрование AES-GCM: по умолчанию только заголовки**,
       данные открыты (быстро), опция — шифровать всё. Это их компромисс по
       цене, и он правильный: см. 3.6 (12.6 GB/s на AES).
