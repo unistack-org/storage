@@ -271,9 +271,13 @@ func main() {
 
 	// -vub was the original short name of -vhost-user-blk. The export TYPE on
 	// the wire is "vhost-user-blk" too; the old spelling keeps working here.
+	tlsPlanesSet := false
 	flag.Visit(func(f *flag.Flag) {
 		if f.Name == "vub" {
 			logger.Printf("flag -vub is deprecated, it is the same as -vhost-user-blk")
+		}
+		if f.Name == "tls-planes" {
+			tlsPlanesSet = true
 		}
 	})
 
@@ -299,7 +303,15 @@ func main() {
 		MinVersion: *tlsMinVer,
 		SkipVerify: *tlsSkipVerify,
 	}
-	tlsState, err := setupTLS(tlsMaterial, *tlsClientCA, tlsconf.NewPlaneSet(planes...), logger)
+	planeSet := tlsconf.NewPlaneSet(planes...)
+	if !tlsMaterial.Any() && !tlsPlanesSet {
+		// The default of -tls-planes names every plane; without material
+		// that is not a contradiction to complain about, it is just the
+		// default. Only a planes list the operator typed is worth an
+		// error ("you asked to encrypt planes that have no certificate").
+		planeSet = nil
+	}
+	tlsState, err := setupTLS(tlsMaterial, *tlsClientCA, planeSet, logger)
 	if err != nil {
 		logger.Fatalf("tls: %v", err)
 	}
@@ -998,7 +1010,7 @@ func clusterBoot(ctx context.Context, p clusterParams) error {
 	// "auto": 1 on a fresh cluster; on a running one a map already
 	// exists, so publishing is skipped (use "unistorctl map publish", or
 	// a reload, to push a new generation).
-	if _, err := applyCrushmap(ctx, cl, ms, &spec, writeMeta, logf, publishBoot); err != nil {
+	if _, _, err := applyCrushmap(ctx, cl, ms, &spec, writeMeta, logf, publishBoot, nil); err != nil {
 		return err
 	}
 

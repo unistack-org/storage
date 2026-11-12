@@ -614,6 +614,23 @@
       `unistor_tls`. CA перечитывается только на старте. Детали:
       `runbook.md` §TLS; как это должен потреблять unistack —
       `tls-control-plane.md`
+- [x] **Перезагрузка всего декларативного (2026-11-12)**: SIGHUP и
+      `POST /v1/reload` (`unistorctl reload`) ведут один координатор
+      `cmd/unistord/reload.go`, который повторяет секции стартовой
+      декларации: сертификаты, `-qos-class`, `-crushmap` (публикует
+      `latest+1` только когда файл реально изменился и только пройдя
+      структурную проверку + компиляцию на живом реестре — битая карта
+      не попадает в meta; `-force` у `map publish` обходит проверку),
+      `-create`, `-gogc`.
+      Секции независимы и keep-last-good, отчёт всегда полный
+      (`tls, qos, crushmap, volumes, gogc` + `restart_required`),
+      HTTP 500 при упавшей секции; `unistorctl reload` печатает
+      построчно и выходит ненулевым кодом. `POST /v1/tls/reload` —
+      прежний TLS-only вариант. Наблюдаемость: `st.reload` и
+      `warnings` в `/v1/status`, `unistor_reload{name=enabled|
+      declarative|reloads|last_ok|last_reload_timestamp|last_error}`. Не перезагружается (только рестарт):
+      слушатели, бэкенды/OSD, CA, `-tls-planes`, `-tls-skip-verify`,
+      `-admin-token`. Детали: `runbook.md` §TLS
 - [x] **Разделение control/data сетей (2026-11-11)**: у OSD второй слушатель
       (`-osd id@dir@data@ctrl`, `OSDInfo.CtrlAddr` в регистрации, один
       sdsnet.Server на оба). Контрольные пробы (пинги prober'а, ProbeOSDs/

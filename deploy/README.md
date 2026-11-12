@@ -56,7 +56,8 @@
 | `vdpa dev add` вешается | залипший запрос с прошлой жизни → только reboot |
 | В логе `guest memory fault ... evicting mappings` | норма после смерти старого демона; демон жив |
 | Диск гостя читается, но висит `open()` | залипший request держит folio lock → reboot |
-| Сертификат TLS истёк/меняется | положить новые файлы, `systemctl kill -s HUP unistord` (или `POST /v1/tls/reload`) — без рестарта и без касания экспортов; CA перечитывается только на старте |
+| Сертификат TLS истёк/меняется | положить новые файлы, `systemctl kill -s HUP unistord` (или `unistorctl reload -http https://<узел>:8443` / `POST /v1/reload`) — без рестарта и без касания экспортов; CA перечитывается только на старте |
+| Поправил `-qos-class`/`-crushmap`/`-create` в конфиге | те же файлы на тех же путях + `systemctl kill -s HUP unistord` (или `unistorctl reload`) — демон перечитывает их без рестарта; слушатели, `-store`/`-osd`, `-admin-token` — только рестарт (см. `restart_required` в отчёте) |
 
 ## Сборка
 

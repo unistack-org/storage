@@ -23,7 +23,7 @@
 //	osd add <id> <addr> [-data P] [-uuid U]      (register an osd record by hand)
 //	map dump [-format raw|text|json|yaml|binary]  (latest crush map epoch; raw = as stored)
 //	map check   [file] [-pg-num n] [-replicas n] [-rule r] [-class ssd|hdd]  (compile + pg census + class validators)
-//	map publish <file> [-epoch n]                (store a new epoch; default latest+1)
+//	map publish <file> [-epoch n] [-force] [-pg-num n] [-replicas n] [-rule r]  (store a new epoch, default latest+1; validated unless -force)
 //	map reweight <id> <w>                        (vitastor-style alias of osd out/in)
 //	vacuum      [ls|run [vol]]                 (M1.4: deleted-volume garbage; run <vol> targets one tombstone or punches a live volume's all-zero objects)
 //	recovery    ls | check <vol> | run <vol>   (M6.3: heal diverged/missing replicas)
@@ -1070,14 +1070,42 @@ func mapCmd(ctx context.Context, cl *client.Cluster, ms meta.Store, args []strin
 	case "publish":
 		fs := flag.NewFlagSet("map publish", flag.ExitOnError)
 		epoch := fs.Int("epoch", -1, "new epoch (default: latest+1)")
+		force := fs.Bool("force", false, "publish without validating the map")
+		pgNum := fs.Uint("pg-num", 1024, "pg table width for the validation compile")
+		replicas := fs.Int("replicas", 3, "replicas per pg row for the validation compile")
+		rule := fs.String("rule", "", "crush rule name for the validation compile (default: lowest-id rule)")
 		parseMix(fs, rest)
 		if fs.NArg() != 1 {
 			fs.Usage()
-			return errors.New("map publish: <file> [-epoch n]")
+			return errors.New("map publish: <file> [-epoch n] [-force] [-pg-num n] [-replicas n] [-rule r]")
 		}
 		src, err := os.ReadFile(fs.Arg(0))
 		if err != nil {
 			return err
+		}
+		// A published epoch is adopted by every OSD and every client, so a
+		// broken map is cluster-wide damage. Structural check always, the
+		// compile only when osds are registered (map publish is how the very
+		// first map gets published, when the registry is legitimately empty).
+		if !*force {
+			ast, err := placement.DecodeMap(src)
+			if err != nil {
+				return fmt.Errorf("map publish %s: %w (use -force to publish anyway)", fs.Arg(0), err)
+			}
+			verdict := ast.Check()
+			fmt.Print(formatMapVerdict(verdict))
+			if !verdict.OK() {
+				return fmt.Errorf("map publish %s: %d structural error(s) (use -force to publish anyway)", fs.Arg(0), len(verdict.Errors))
+			}
+			if reg, rerr := cl.Registry(ctx); rerr != nil {
+				return fmt.Errorf("map publish: osd registry: %w", rerr)
+			} else if len(reg) == 0 {
+				fmt.Fprintln(os.Stderr, "warning: OSD registry is empty — validating map structure only")
+			} else if _, err := placement.Compile(0, src, reg, placement.Options{PGNum: uint32(*pgNum), Replicas: *replicas, Rule: *rule}); err != nil {
+				return fmt.Errorf("map publish %s: %w (use -force to publish anyway)", fs.Arg(0), err)
+			} else {
+				fmt.Println("map compiles against the live OSD registry")
+			}
 		}
 		newEpoch := uint32(*epoch)
 		if *epoch < 0 {
@@ -1515,7 +1543,7 @@ pool create <name> [-replicas n] [-min-size n] [-pg-num n] [-rule r] [-qos class
 pool ls | pool rm <name>  (rm is refused while volumes reference the pool)
 qos ls | qos put <class> <riops:rbps:wiops:wbps> | qos rm <class>
 osd ls | osd add <id> <addr> [-data P] [-uuid U] | osd out <id> | osd in <id> [-weight w]   (weight 0 = out of placement)
-map dump [-format raw|text|json|yaml|binary] | map check [file] [-pg-num n] [-replicas n] [-rule r] | map publish <file> [-epoch n] | map reweight <id> <w>
+map dump [-format raw|text|json|yaml|binary] | map check [file] [-pg-num n] [-replicas n] [-rule r] | map publish <file> [-epoch n] [-force] [-pg-num n] [-replicas n] [-rule r] | map reweight <id> <w>
 vacuum [ls|run [vol]]  (M1.4: free deleted volumes' objects; run <vol> = targeted tombstone, live volume = punch out all-zero objects)
 recovery ls | recovery check <vol> | recovery run <vol> [-iops N] [-bps B]
 export create <volume> [-type nbd|vduse|vhost-user-blk] [-devname N] [-ro] [-http URL] [-token T]  (attach a volume to a running unistord; -type vub is accepted as a shorthand)

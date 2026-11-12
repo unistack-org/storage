@@ -19,12 +19,15 @@
 # TLS: файлы сертификата читаются демоном при старте и при перезагрузке,
 # кладите их туда, где_unit_ имеет право чтения (каталог внутри
 # /etc/unistord подходит; ProtectSystem=strict не мешает чтению из /etc).
-# systemd сам не шлёт SIGHUP, поэтому обновить сертификат без рестарта
+# systemd сам не шлёт SIGHUP, поэтому перезагрузить конфиг без рестарта
 # (и без касания живых экспортов) так:
 #   systemctl kill -s HUP unistord
-#   # или curl -k -X POST https://<узел>:8443/v1/tls/reload
-# Перезагрузка перечитывает сертификат и ключ; CA перечитывается только
-# на старте (ротация CA = рестарт). См. todos/runbook.md, раздел TLS.
+#   # или curl -k -X POST https://<узел>:8443/v1/reload
+#   # или unistorctl reload -http https://<узел>:8443
+# SIGHUP перезагружает всё декларативное: сертификат и ключ, QoS-классы,
+# crushmap, -create, GOGC; CA перечитывается только на старте (ротация
+# CA = рестарт). Отчёт — в логе, в /v1/status (st.reload) и в
+# unistor_reload. См. todos/runbook.md, раздел TLS.
 
 [Unit]
 Description=Unistack SDS daemon (unistord: OSD + NBD/VDUSE exports)

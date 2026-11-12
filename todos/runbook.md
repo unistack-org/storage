@@ -95,6 +95,13 @@ v5-версии зависимостей, тест плагина починен
   `interval_seconds` = сколько автовакуум ещё не добирал).
   `bytes` — сколько места на дисках освободит вакуум; алерт:
   `oldest_seconds > 3*interval_seconds` — автовакуум отстаёт;
+- перезагрузка (см. §TLS): `unistor_reload{name=enabled|declarative|
+  reloads|last_ok|last_reload_timestamp|last_error}` — `reloads`
+  (счётчик всех попыток), `last_ok` (1/0 — итог последней),
+  `last_reload_timestamp` (unix-время), `last_error` (1, если у
+  последней были упавшие секции), `declarative` (1 — секции
+  qos/crushmap/volumes участвуют, то есть демон с `-meta-dir`). Алерт:
+  `unistor_reload{name="last_ok"} == 0`;
 - TLS (см. §TLS): `unistor_tls{name=enabled|expiry_seconds|
   not_after_timestamp|reloads|last_reload_timestamp|last_error|
   skip_verify|plane_data_enabled|plane_raft_enabled|plane_nbd_enabled|
@@ -418,7 +425,7 @@ Admin API с проверкой CA (без клиентского сертифи
 
 ```
 curl --cacert ca.pem https://10.0.0.1:8443/v1/status
-unistorctl -tls-ca ca.pem -http https://10.0.0.1:8443 status
+unistorctl -tls-ca ca.pem status -http https://10.0.0.1:8443
 ```
 
 `unistorctl` флаги: `-tls-ca` — доверять нашему CA (https к admin и
@@ -437,32 +444,54 @@ unistorctl -tls-ca ca.pem -http https://10.0.0.1:8443 status
 предупреждением на старте, показывает его в `/v1/status` и в
 `unistor_tls`. С `-tls-skip-verify` `-tls-ca` не обязателен.
 
-### Горячая перезагрузка сертификатов
+### Горячая перезагрузка: SIGHUP и POST /v1/reload
 
-Материал перечитывается без рестарта демона — сертификат сервера
-подаётся через `GetCertificate`, клиентский через
-`GetClientCertificate`, поэтому новое поколение файлов уходит в дело на
-следующем handshake, открытые соединения доезжают до конца на старых:
+Без рестарта демон перечитывает всё декларативное: сертификаты,
+QoS-классы, crushmap, список томов для `-create` и `GOGC`. Одна точка
+на все триггеры — `SIGHUP`, `POST /v1/reload` и `unistorctl reload`
+идут по одному пути; секции независимы и keep-last-good: битый crushmap
+не мешает перечитать сертификаты, упавшая секция не роняет кластер.
 
 ```
-# 1. положить новые cert/key на те же пути
-systemctl kill -s HUP unistord           # 2. SIGHUP (systemd сам HUP не шлёт)
+# 1. положить новые cert/key (или править файл -crushmap) на те же пути
+systemctl kill -s HUP unistord           # 2. SIGHUP = перезагрузить всё
+                                          # (systemd сам HUP не шлёт)
 
-# то же через API (заголовок Authorization: Bearer нужен, если задан
-# -admin-token; /v1/tls — такие же защищённые эндпоинты, как остальные /v1)
-curl --cacert ca.pem -X POST https://10.0.0.1:8443/v1/tls/reload
-curl --cacert ca.pem https://10.0.0.1:8443/v1/tls      # подробно
-unistorctl -tls-ca ca.pem -http https://10.0.0.1:8443 status   # st.tls
+# то же через API (Authorization: Bearer, если задан -admin-token)
+curl --cacert ca.pem -X POST https://10.0.0.1:8443/v1/reload
+unistorctl reload -http https://10.0.0.1:8443 -token T   # тот же отчёт
+curl --cacert ca.pem https://10.0.0.1:8443/v1/tls         # только TLS, подробно
+unistorctl -tls-ca ca.pem status -http https://10.0.0.1:8443   # st.tls, st.reload
 ```
 
-Неудачная перезагрузка безопасна: битый файл не роняет демон, материал
-остаётся последний хороший, ошибка видна в `last_error` (`/v1/tls`,
-`/v1/status`). Опция `-tls-reload-interval S` — поллинг mtime раз в S
-секунд для тех, кому неудобен сигнал (0 = выключен, дефолт).
+Отвечает всегда полным отчётом: секции идут в порядке
+`tls, qos, crushmap, volumes, gogc`, каждая помечена `applied` с
+`detail` либо пропущенной с причиной (пропуск — не ошибка; секция
+никогда не исчезает из отчёта молча). Упавшая секция даёт `error`,
+отчёт `ok:false`, HTTP 500 — и остальной кластер продолжает работать
+на старом материале; предупреждение попадает в `warnings` у
+`/v1/status` (то есть `healthcheck` становится нездоровым), а
+`restart_required` перечисляет флаги, которые перезагрузка не примет.
+Секция crushmap публикует карту (`latest+1`) только когда содержимое
+файла отличается от последней опубликованной — повторный reload ничего
+не переопубликовывает. Перед публикацией карта проходит тот же
+структурный контроль, что `unistorctl map check`, и компиляцию на
+живом реестре OSD (если реестр пуст — только структура: первый мап
+публикуют именно так). Битая карта не попадает в meta: опубликованная
+эпоха — это placement для всех osd и всех клиентов, а на старте её
+отбивает placement-проверка, которой у перезагрузки нет.
+
+Опция `-tls-reload-interval S` — поллинг mtime сертификатов раз в S
+секунд для тех, кому неудобен сигнал (0 = выключен, дефолт); она
+касается только материала TLS. `POST /v1/tls/reload` остаётся: это
+узкий TLS-only вариант того же пути.
 
 Ограничения: **CA перечитывается только на старте** — ротация CA требует
 рестарта; `-tls-planes` сменить на ходу нельзя (это состав слушателей,
-а не материал).
+а не материал). Слушатели (`-http`, `-listen`, `-raft`, `-metrics`),
+бэкенды/OSD (`-store`, `-osd`, `-data-dir`, ...), `-admin-token` —
+тоже только рестарт; они перечислены в `restart_required` каждого
+отчёта.
 
 ### Наблюдение
 
@@ -476,6 +505,16 @@ unistorctl -tls-ca ca.pem -http https://10.0.0.1:8443 status   # st.tls
 (или истекающий в сутки) сертификат и упавшая перезагрузка — это
 записи в `warnings`, то есть `healthcheck` становится нездоровым.
 Метрики — `unistor_tls` (см. §Метрики).
+
+### Наблюдение за перезагрузками
+
+Отчёт последней перезагрузки живёт в `/v1/status` (`st.reload`:
+`reloads`, `last_at`, `last_ok`, `last_error`) и в семействе
+`unistor_reload{name=enabled|declarative|reloads|last_ok|
+last_reload_timestamp|last_error}` (см.
+§Метрики). Алерт: `unistor_reload{name="last_ok"} == 0` — последняя
+перезагрузка упала, демон живёт на старом материале; состояние
+обновляется и SIGHUP, и REST, поэтому алерт ловит оба пути.
 
 ### Что TLS не покрывает
 

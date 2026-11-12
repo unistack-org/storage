@@ -7,7 +7,10 @@
 TLS) — плоскости TLS (`-tls-planes`), `-tls-skip-verify`, горячая
 перезагрузка материала (SIGHUP / `POST /v1/tls/reload` /
 `-tls-reload-interval`), `GET /v1/tls`, `notAfter` и предупреждения в
-`/v1/status`, метрика `unistor_tls`. Это «клиентская» половина задачи:
+`/v1/status`, метрика `unistor_tls`. SIGHUP и `POST /v1/reload`
+(`unistorctl reload`, `unistor_reload`) с тех пор перезагружают всё
+декларативное — сертификаты вместе с `-qos-class`, `-crushmap`,
+`-create`, `-gogc`. Это «клиентская» половина задачи:
 демон умеет принимать сертификаты на лету. Чего **нет** — кто эти файлы
 кладёт на узел и с чем они согласованы. Ниже — варианты такой связки с
 unistack (`/Users/vtolstov/Projects/unistack/unistack`) и открытые вопросы.

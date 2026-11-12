@@ -30,6 +30,7 @@ import (
 
 	"github.com/unistack-org/storage/pkg/client"
 	"github.com/unistack-org/storage/pkg/meta"
+	"github.com/unistack-org/storage/pkg/placement"
 	"github.com/unistack-org/storage/pkg/tlsconf"
 )
 
@@ -252,27 +253,50 @@ func (r *reloadState) reloadAll(ctx context.Context, reason string) reloadReport
 		add(sectionTLS, true, tlsSummary(r.tls.Status()), nil)
 	}
 
-	if r.spec != nil && r.spec.gogc > 0 {
-		debug.SetGCPercent(r.spec.gogc)
-		add(sectionGC, true, fmt.Sprintf("GOGC=%d", r.spec.gogc), nil)
-	}
-
 	if r.cl == nil || r.ms == nil || r.spec == nil {
+		// A daemon without -meta-dir (standalone exports) has no cluster
+		// state to re-apply: the sections are reported, not silently
+		// dropped, so the reply always shows what a reload covers.
+		const why = "not applied: the daemon runs without -meta-dir"
+		add(sectionQoS, false, why, nil)
+		add(sectionCrush, false, why, nil)
+		add(sectionVolumes, false, why, nil)
 		rep.RestartRequired = []string{"no cluster (-meta-dir): -qos-class, -crushmap and -create are not applied here"}
 	} else {
 		writeMeta := r.retryWriter(ctx)
 		logf := func(f string, a ...any) { r.logger.Printf(f, a...) }
 
-		detail, err := applyQoSClasses(ctx, r.cl, r.spec, writeMeta, logf)
-		add(sectionQoS, err == nil && detail != "", detail, err)
+		if len(r.spec.qosClasses) == 0 {
+			add(sectionQoS, false, "the daemon runs without -qos-class", nil)
+		} else {
+			detail, err := applyQoSClasses(ctx, r.cl, r.spec, writeMeta, logf)
+			add(sectionQoS, err == nil && detail != "", detail, err)
+		}
 
-		detail, err = applyCrushmap(ctx, r.cl, r.ms, r.spec, writeMeta, logf, publishReload)
-		add(sectionCrush, err == nil && detail != "", detail, err)
+		if r.spec.crushmap == "" {
+			add(sectionCrush, false, "the daemon runs without -crushmap (publish a map with \"unistorctl map publish\")", nil)
+		} else {
+			validate := newMapValidator(r.cl, r.spec)
+			detail, applied, err := applyCrushmap(ctx, r.cl, r.ms, r.spec, writeMeta, logf, publishReload, validate)
+			add(sectionCrush, applied, detail, err)
+		}
 
-		detail, err = applyCreates(ctx, r.cl, r.ms, r.spec, writeMeta, logf)
-		add(sectionVolumes, err == nil && detail != "", detail, err)
+		if len(r.spec.creates) == 0 {
+			add(sectionVolumes, false, "the daemon runs without -create", nil)
+		} else {
+			detail, err := applyCreates(ctx, r.cl, r.ms, r.spec, writeMeta, logf)
+			add(sectionVolumes, err == nil && detail != "", detail, err)
+		}
 
 		rep.RestartRequired = restartRequired(r.spec)
+	}
+
+	switch {
+	case r.spec == nil || r.spec.gogc <= 0:
+		add(sectionGC, false, "the daemon does not manage GOGC (-gogc 0)", nil)
+	default:
+		debug.SetGCPercent(r.spec.gogc)
+		add(sectionGC, true, fmt.Sprintf("GOGC=%d", r.spec.gogc), nil)
 	}
 
 	rep.OK = len(rep.failed()) == 0
@@ -346,6 +370,50 @@ func applyQoSClasses(ctx context.Context, cl *client.Cluster, spec *declarativeS
 	return fmt.Sprintf("%d class(es): %s", len(names), strings.Join(names, ", ")), nil
 }
 
+// mapValidator checks a crush map before it reaches meta. Boot has its own
+// safety net: a map that cannot be compiled fails the startup placement check
+// and the daemon refuses to start. Reload has no such net, so it validates
+// here -- a published epoch is consumed by every writer in the cluster, and
+// an unusable one is exactly the kind of damage a reload must not do.
+type mapValidator func(ctx context.Context, src []byte) error
+
+// newMapValidator builds the gate: the crush AST check (the same one
+// "unistorctl map check" runs) plus a real compile against the live OSD
+// registry. The compile is skipped when the daemon was started without
+// placement options (-pgnum/-replicas), because there it is not what the
+// data path uses.
+func newMapValidator(cl *client.Cluster, spec *declarativeSpec) mapValidator {
+	return func(ctx context.Context, src []byte) error {
+		// The messages carry no "crushmap:" prefix: the reload report
+		// already labels them with the section name.
+		ast, err := placement.DecodeMap(src)
+		if err != nil {
+			return err
+		}
+		verdict := ast.Check()
+		if !verdict.OK() {
+			return fmt.Errorf("%d structural error(s): %s", len(verdict.Errors), strings.Join(verdict.Errors, "; "))
+		}
+		if cl == nil || spec.pgNum == 0 || spec.replicas <= 0 {
+			return nil
+		}
+		reg, err := cl.Registry(ctx)
+		if err != nil {
+			return fmt.Errorf("osd registry: %w", err)
+		}
+		if len(reg) == 0 {
+			// No OSD has registered yet: the compile would fail for that
+			// reason alone, and a map is exactly what an operator needs to
+			// publish during an outage. Structural check only.
+			return nil
+		}
+		if _, err := placement.Compile(0, src, reg, placement.Options{PGNum: uint32(spec.pgNum), Replicas: spec.replicas, Rule: spec.rule}); err != nil {
+			return err
+		}
+		return nil
+	}
+}
+
 // publishMode is how the crushmap section chooses the epoch.
 type publishMode int
 
@@ -363,30 +431,33 @@ const (
 )
 
 // applyCrushmap publishes the -crushmap file over the meta write path.
-func applyCrushmap(ctx context.Context, cl *client.Cluster, ms meta.Store, spec *declarativeSpec, writeMeta metaWriter, logf func(string, ...any), mode publishMode) (string, error) {
+// It reports whether the map was published: "the file did not change" and
+// "a map is already live" are outcomes, not applications. A non-nil validate
+// runs on the bytes about to be published.
+func applyCrushmap(ctx context.Context, cl *client.Cluster, ms meta.Store, spec *declarativeSpec, writeMeta metaWriter, logf func(string, ...any), mode publishMode, validate mapValidator) (string, bool, error) {
 	if spec.crushmap == "" {
-		return "", nil
+		return "", false, nil
 	}
 	src, err := os.ReadFile(spec.crushmap)
 	if err != nil {
-		return "", fmt.Errorf("crushmap: %w", err)
+		return "", false, fmt.Errorf("crushmap: %w", err)
 	}
 	rec, err := meta.LatestMap(ctx, ms)
 	have := err == nil
 	if !have && !errors.Is(err, meta.ErrNotFound) {
-		return "", fmt.Errorf("crushmap: read latest epoch: %w", err)
+		return "", false, fmt.Errorf("crushmap: read latest epoch: %w", err)
 	}
 
 	var pubEpoch uint32
 	switch {
 	case spec.epoch == 0 && mode == publishBoot && have:
 		logf("crushmap already published (latest epoch %d): keeping it", rec.Epoch)
-		return fmt.Sprintf("keeping the live map (epoch %d)", rec.Epoch), nil
+		return fmt.Sprintf("keeping the live map (epoch %d)", rec.Epoch), false, nil
 	case spec.epoch == 0 && mode == publishBoot:
 		pubEpoch = 1
 	case spec.epoch == 0 && mode == publishReload && have:
 		if string(rec.Map) == string(src) {
-			return fmt.Sprintf("unchanged (latest epoch %d)", rec.Epoch), nil
+			return fmt.Sprintf("unchanged (latest epoch %d)", rec.Epoch), false, nil
 		}
 		pubEpoch = rec.Epoch + 1
 	case spec.epoch == 0:
@@ -395,16 +466,22 @@ func applyCrushmap(ctx context.Context, cl *client.Cluster, ms meta.Store, spec 
 		pubEpoch = spec.epoch
 		if have && rec.Epoch >= pubEpoch {
 			logf("crushmap epoch %d already present (latest %d)", pubEpoch, rec.Epoch)
-			return fmt.Sprintf("epoch %d already present (latest %d)", pubEpoch, rec.Epoch), nil
+			return fmt.Sprintf("epoch %d already present (latest %d)", pubEpoch, rec.Epoch), false, nil
+		}
+	}
+	if validate != nil {
+		if err := validate(ctx, src); err != nil {
+			logf("crushmap epoch %d NOT published: %v", pubEpoch, err)
+			return "", false, err
 		}
 	}
 	if err := writeMeta(fmt.Sprintf("crushmap epoch %d", pubEpoch), func() error {
 		return cl.MapEpoch(ctx, pubEpoch, src)
 	}); err != nil && !errors.Is(err, meta.ErrConflict) {
-		return "", fmt.Errorf("publish map epoch %d: %w", pubEpoch, err)
+		return "", false, fmt.Errorf("publish map epoch %d: %w", pubEpoch, err)
 	}
 	logf("published crushmap epoch %d (%d bytes)", pubEpoch, len(src))
-	return fmt.Sprintf("published epoch %d (%d bytes)", pubEpoch, len(src)), nil
+	return fmt.Sprintf("published epoch %d (%d bytes)", pubEpoch, len(src)), true, nil
 }
 
 // applyCreates runs the -create declarations. A volume that already
