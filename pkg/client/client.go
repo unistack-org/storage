@@ -1298,6 +1298,10 @@ type Volume struct {
 	mask  uint32
 	w     int // write quorum
 
+	// pgc caches resolved pg rows for the current placement snapshot
+	// (§3.2); zero value is ready to use.
+	pgc pgCache
+
 	mu sync.Mutex // guards limits and qosTemplate (SetQoS swaps under load)
 
 	// limits enforces the volume's QoS class (nil = unlimited, the
@@ -1615,6 +1619,14 @@ func (v *Volume) orderReadRefs(refs []placement.Ref) {
 
 func (v *Volume) targets(snap *placement.Snapshot, index uint64, scratch []placement.Ref) ([]placement.Ref, error) {
 	pg := v.pgFor(snap, index)
+	return v.pgc.resolve(snap, pg, scratch, func() ([]placement.Ref, error) {
+		return v.targetsRow(snap, pg, scratch)
+	})
+}
+
+// targetsRow resolves a pg row into refs (the uncached work behind
+// targets()).
+func (v *Volume) targetsRow(snap *placement.Snapshot, pg uint32, scratch []placement.Ref) ([]placement.Ref, error) {
 	row := snap.Row(pg)
 	refs := scratch[:0]
 	if len(scratch) >= len(row) {
