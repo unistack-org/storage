@@ -295,7 +295,7 @@
 
 ## Фаза 5 — Производительность до уровня Vitastor (постоянно, с замерами на каждую фазу)
 
-> Статус (2026-11-10): 171–177K 4K randread (цель 100K — перекрыта), отказоустойчивость (min_size/out_time/пресеты) закрыта; закрыты in-memory мета-индекс (ADR), замер WA в sdsbench (WA=2.01), метрика свободного места журнала, write-intent journal (`-intent`, damage report при восстановлении), упаковка journal-записей (packed-пачки в `pkg/journal`, intent-лог 40→24 Б/запись) и VDUSE read-ahead (§3.8: `-vduse-readahead`, окно 256 КиБ/очередь, portable-тесты; 2–3× подтвердить на Linux-стенде); закрыты ручки GC-давления (`-gogc`, `-ballast-mb`); открыто: AWUPF/`RWF_ATOMIC` (цель WA→1), бенч-стенд 3–5 нод, cpubench, per-CPU оптимизации (по perf-профилю), цель >200K.
+> Статус (2026-11-10): 171–177K 4K randread (цель 100K — перекрыта), отказоустойчивость (min_size/out_time/пресеты) закрыта; закрыты in-memory мета-индекс (ADR), замер WA в sdsbench (WA=2.01), метрика свободного места журнала, write-intent journal (`-intent`, damage report при восстановлении), упаковка journal-записей (packed-пачки в `pkg/journal`, intent-лог 40→24 Б/запись) и VDUSE read-ahead (§3.8: `-vduse-readahead`, окно 256 КиБ/очередь, portable-тесты; 2–3× подтвердить на Linux-стенде); закрыты ручки GC-давления (`-gogc`, `-ballast-mb`), AWUPF/`RWF_ATOMIC` (`disk probe`, `-atomic-writes`, цель WA→1 на атомарных дисках); открыто: бенч-стенд 3–5 нод, cpubench, per-CPU оптимизации (по perf-профилю), цель >200K.
 
 - [ ] **Чем обгоняем Vitastor (принято: они реально быстрее Ceph, мы целимся выше).**
       Их сильные стороны перенимаем 1:1: мета в RAM, journal-ring + кворум
@@ -363,12 +363,30 @@
       => Частично (2026-11-10): ручки GC-давления готовы — `-gogc N`
       (debug.SetGCPercent) и `-ballast-mb N` (удерживаемый балласт поднимает
       floor живучей кучи; проверено: RSS растёт на размер балласта).
+      => Pinned workers + registered fds/buffers (2026-11-11):
+      (1) `pkg/cpu` — парсер Linux-cpulist и `PinCurrent` (sched_setaffinity
+      + LockOSThread; номер syscall из платформенных таблиц: 203 amd64 /
+      122 arm64 — на arm64 проверка стендом VM), тесты на Linux.
+      (2) `iouring.NewPinned(entries, pin)` — pin() выполняется на OS-потоке
+      каждого ring-воркера (submit/completion) до работы; у fallback-кольца
+      та же точка. `store.Options.RingPinCPUs` + флаг unistord
+      `-ring-pin-cpu "2-3"`; некорректный список = логок и незакреплённое кольцо.
+      (3) Зарегистрированные fd и буферы io_uring: REGISTER_FILES/REGISTER_BUFFERS,
+      IOSQE_FIXED_FILE, READ_FIXED/WRITE_FIXED; индексные поля Op.BufIndex/слоты fd
+      1-база (нуль = обычный путь), любой отказ регистрации → постоянный
+      fixedOK=false, EINVAL на fixed-операции → деградация на обычный опкод и
+      повтор. removeFile unregister-ит fd до close (защита от переиспользования
+      слота). Тесты: TestRingFixedFilesBuffers (полный fixed roundtrip, SKIP где
+      ядро ломает register), TestRingFixedMixedFiles (микс fixed/plain, он же
+      тест деградации) — на Linux-VM пройдено (у apple-virt ядра 6.11
+      io_uring_register сломан: EFAULT/EBADF на всех pointer-операциях —
+      воспроизведено чистым C; наш деград-путь — корректная реакция).
       Остальное упирается в профиль: на стенде нужен `perf record` под
-      sdsbench-нагрузкой, по нему выбираем следующую точку (per-CPU workers
-      vs registered buffers vs hugepages). План замера: 1) perf под 4K
+      sdsbench-нагрузкой, по нему выбираем следующую точку (SO_REUSEPORT
+      acceptors vs hugepages). План замера: 1) perf под 4K
       randread 100K+, 2) grep по GC-фреймам (gcBgMarkWorker, runtime.mallocgc
       share), 3) только при >10% GC-доле — включать gogc/ballast в тестовый
-      профиль; при сетевой доле >40% — zero-copy/registered buffers.
+      профиль; при сетевой доле >40% — zero-copy.
 - [x] **In-memory мета-индекс объектов** — закрыто 2026-11-10 (ADR:
       `todos/adr-meta-index.md`). `objMeta{size,alloc,allocKnown}` — 24 Б на
       объект, `map` под `Store.mu`; инвариант «один объект — одна запись меты»
@@ -413,7 +431,8 @@
       Тесты: `pkg/sdsnet/nospace_test.go`, `pkg/client/quota_test.go`,
       `pkg/journal/space_linux_test.go`, `pkg/store/statinfo_test.go`.
       `pkg/store` + `pkg/osd` + `pkg/client`. Детали: `todos/vitastor-ideas.md` §4.2
-- [ ] **Write Intent Journal + атомарные записи NVMe (цель WA → 1)** — смысл их
+- [x] **Write Intent Journal + атомарные записи NVMe (цель WA → 1)** *(закрыто
+      2026-11-11: intent-журнал + AWUPF/RWF_ATOMIC, см. ниже)* — смысл их
       доклада Highload'2025: перед записью данных пишем намерение «обновлю
       блок X, новый CRC=Y»; при восстановлении нет записи / CRC не совпал ⇒
       блок считается старым. Лечит torn writes без двойной записи. Плюс
@@ -432,8 +451,14 @@
       закрытии; gauge `unistor_osd_intent` в том же exporter; тесты
       `pkg/store/intent_test.go` (в т.ч. torn write под `-race`).
       Стоимость ~1% трафика на 4K, WA не меняет (это про целостность,
-      не про усиление). Остаётся: AWUPF-детект + `RWF_ATOMIC` (§2.2) —
-      именно он даёт WA → 1 на атомарных 4K.
+      не про усиление). **AWUPF-детект + `RWF_ATOMIC` закрыт 2026-11-11**
+      (§2.2): `ProbeDisk` (sysfs: unit_max/min, разделы→родитель, dm/raid
+      slaves), `unistorctl disk probe <path> [-json]`, `unistord
+      -atomic-writes [-atomic-size]` — pwritev2(RWF_ATOMIC) через
+      page-aligned bounce, автоотключение при unit_max=0 (PM9A3 на стенде)
+      или EINVAL ядра; journal-режим не затронут; тесты
+      `pkg/store/atomic_test.go`. На дисках с atomic unit (4K везде,
+      256K у Micron/Kioxia) это путь к WA → 1.
       Детали: `todos/vitastor-ideas.md` §2.1–2.3
 - [x] **Клиентские I/O-потоки** (урок Vitastor: 7–8 GB/s линейно) — сделано:
       `sdsnet.Stream` (один конн = десятки горутин-сабмиттеров, один батч-
@@ -475,11 +500,23 @@
 - [ ] Тест-кейс «призрачные удаления» (их известный баг): create/delete
       тома в деградированном кластере + подъём вернувшихся OSD — удалённые
       объекты не должны воскреснуть (epoch fencing это покрывает — проверить)
-- [ ] Опционально: **монитор-ребалансировщик** (аналог Vitastor lp_solve,
+- [x] Опционально: **монитор-ребалансировщик** (аналог Vitastor lp_solve,
       равномерность 96–99%): stateless-демон поверх etcd правит веса CRUSH
       по free-space и публикует новые epoch; OSD с ним не общаются (только
       etcd). Наших χ²=25 при 65k pg хватает без LP — LP только для кластеров
-      с сильной неравномерностью дисков
+      с сильной неравномерностью дисков.
+      Реализовано (2026-11: `pkg/rebalance` + `unistorctl rebalance`):
+      целевые веса ∝ free-space (нормировка по самому свободному OSD —
+      чистая перенормировка не двигает данные), гистерезис -threshold
+      (по умолчанию 5%) против epoch-шторма, пол -floor (переполненный
+      OSD замедляется, но не выводится из placement — weight=0 решает
+      оператор). Пройти: probe (ProbeOSDsDisk) → plan → reweight crush map
+      (Decode→item weights→EncodeText) → MapEpoch(latest+1) + зеркало в
+      реестр (SetOSDWeight). Stateless: каждый проход заново из latest
+      epoch. Тесты pkg/rebalance: пропорции, гистерезис, пропуск out/без
+      probe, floor, публикация epoch+зеркало, dry-run ничего не пишет,
+      повторный проход = no-op. LP-солвера нет — осознанно (CRUSH
+      минимизирует movement по построению).
 - [x] Первый сравнительный отчёт против Vitastor 3.2.3 на общем стенде
       (unibench, 2×P4510 RAID1 — диск здоров, хост шумит LLM-инференсом):
       `todos/bench-stand.md`.
@@ -564,6 +601,19 @@
       Осталось (дорогая часть, по запросу): AES-GCM шифрование заголовков в
       sdsnet, транспортные/дисковые чексуммы xxh3, ACL пользователей,
       AES-256-XTS E2E (Phase 6). Детали: `vitastor-ideas.md` §5
+- [x] **TLS точечно по плоскостям + горячая перезагрузка (2026-11-09)**:
+      `-tls-planes data,raft,nbd,admin` (данные можно оставить открытыми,
+      контроль за mTLS — витастор-стиль), `-tls-skip-verify` (шифровать без
+      аутентификации; демон предупреждает в логе, `/v1/status` и
+      `unistor_tls`), `-tls-reload-interval` + SIGHUP + `POST
+      /v1/tls/reload` — сертификат/ключ перечитываются без рестарта и без
+      касания живых экспортов (подача через `GetCertificate`/
+      `GetClientCertificate`, неудачная перезагрузка сохраняет последний
+      хороший материал); наблюдаемость: `GET /v1/tls`, `st.tls` и
+      `warnings` в `/v1/status` (истечение < 24 ч = нездоров), метрика
+      `unistor_tls`. CA перечитывается только на старте. Детали:
+      `runbook.md` §TLS; как это должен потреблять unistack —
+      `tls-control-plane.md`
 - [x] **Разделение control/data сетей (2026-11-11)**: у OSD второй слушатель
       (`-osd id@dir@data@ctrl`, `OSDInfo.CtrlAddr` в регистрации, один
       sdsnet.Server на оба). Контрольные пробы (пинги prober'а, ProbeOSDs/

@@ -29,6 +29,7 @@
 //	recovery    ls | check <vol> | run <vol>   (M6.3: heal diverged/missing replicas)
 //	export      create <vol> [-type nbd|vduse|vhost-user-blk] | ls | rm <name>   (runtime exports via the admin API; shorthand: vub)
 //	status      -http URL                       (operational overview, see unistord)
+//	rebalance   [-once] [-dry-run] [-interval s] [-threshold f]  (free-space CRUSH reweighter)
 //
 // Bandwidth rates accept the K/M/G/T suffixes. A volume whose QoS class
 // is missing (or whose rates are all zero) is unlimited: that is the
@@ -71,6 +72,7 @@ func main() {
 	tlsCert := flag.String("tls-cert", "", "with a TLS-enabled cluster: PEM client certificate for the OSD data plane (with -tls-key, -tls-ca)")
 	tlsKey := flag.String("tls-key", "", "PEM private key for -tls-cert")
 	tlsCA := flag.String("tls-ca", "", "PEM CA certificate(s): verify server certificates (OSD data plane, admin -http https URLs)")
+	tlsSkipVerify := flag.Bool("tls-skip-verify", false, "encrypt the channel but do not verify the peer's certificate (same tradeoff as unistord's flag of the same name: anyone on the network can pose as a node); pair it with -tls-cert/-tls-key to present a certificate a server demands")
 	showVersion := flag.Bool("version", false, "print version and exit")
 	flag.Usage = usage
 	flag.Parse()
@@ -92,22 +94,16 @@ func main() {
 	}
 	defer ms.Close()
 	cl := client.NewCluster(ms)
-	if *tlsCA != "" {
-		cfg, err := tlsconf.CAOnlyConfig(*tlsCA, "")
+	if material := (tlsconf.Config{CertFile: *tlsCert, KeyFile: *tlsKey, CAFile: *tlsCA, SkipVerify: *tlsSkipVerify}); material.Any() {
+		cfg, err := material.ClientConfig()
 		if err != nil {
 			fatal("tls: %v", err)
 		}
-		if *tlsCert != "" || *tlsKey != "" {
-			if *tlsCert == "" || *tlsKey == "" {
-				fatal("-tls-cert and -tls-key must be set together")
-			}
-			cfg, err = tlsconf.Config{CertFile: *tlsCert, KeyFile: *tlsKey, CAFile: *tlsCA}.ClientConfig()
-			if err != nil {
-				fatal("tls: %v", err)
-			}
-		}
 		cl.SetTLS(cfg)
 		httpClient = &http.Client{Timeout: 30 * time.Minute, Transport: &http.Transport{TLSClientConfig: cfg}}
+		if *tlsSkipVerify {
+			fmt.Fprintln(os.Stderr, "unistorctl: WARNING -tls-skip-verify: the connection is encrypted but the peer is not authenticated")
+		}
 	}
 
 	if err := dispatch(ctx, cl, ms, args); err != nil {
@@ -141,6 +137,10 @@ func dispatch(ctx context.Context, cl *client.Cluster, ms meta.Store, args []str
 		return statusCmd(ctx, args[1:])
 	case "healthcheck":
 		return healthcheckCmd(ctx, args[1:])
+	case "disk":
+		return diskCmd(args[1:])
+	case "rebalance":
+		return rebalanceCmd(ctx, cl, args[1:])
 	default:
 		usage()
 		return fmt.Errorf("unknown command %q", args[0])
@@ -1520,6 +1520,17 @@ export ls [-json] [-http URL] [-token T]  (live exports per type)
 export rm <name> [-type nbd|vduse|vhost-user-blk] [-http URL] [-token T]  (detach; 409 when in use; -type vub accepted)
 status [-http URL]  (reads unistord admin /v1/status; default http://127.0.0.1:8443)
 healthcheck [-http URL] [-json]  (verdict on unistord /healthcheck; exit 1 when the cluster is unhealthy)
+disk probe <path> [-json]  (atomic-write capability of the disk backing <path>: device, atomic_write_unit_max/min, kernel RWF_ATOMIC support)
+rebalance [-once] [-dry-run] [-interval 30s] [-threshold f]  (free-space rebalancer: CRUSH weights ∝ free space, publishes new map epochs; stateless)
+
+Global TLS flags (before the command), for a cluster whose data plane
+is TLS-enabled (-tls-planes data on the daemon):
+  -tls-cert F -tls-key F  client certificate the OSDs demand
+  -tls-ca F               CA used to verify node certificates; also
+                          verifies https admin URLs
+  -tls-skip-verify        encrypt without verifying the peer (no
+                          authentication - a testing tool, not a
+                          deployment setting)
 
 Sizes and bandwidth accept K/M/G/T suffixes (10G, 200M). Rates are
 iops[:bytes/s]; all zero (or a missing class) = unlimited, the admin
