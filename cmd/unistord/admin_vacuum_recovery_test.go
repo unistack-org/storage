@@ -77,7 +77,7 @@ func startVacuumEnv(t *testing.T) *vacuumEnv {
 	if _, err := cl.Refresh(ctx); err != nil {
 		t.Fatal(err)
 	}
-	a, err := newAdminServer(ms, "127.0.0.1:0", log.New(io.Discard, "", 0), nil, newDiskRegistry(), nil, nil, "", nil)
+	a, err := newAdminServer(ms, "127.0.0.1:0", log.New(io.Discard, "", 0), nil, newDiskRegistry(), nil, nil, nil, nil, "", nil)
 	if err != nil {
 		t.Fatal(err)
 	}

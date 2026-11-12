@@ -25,7 +25,6 @@ package main
 import (
 	"context"
 	"crypto/tls"
-	"errors"
 	"flag"
 	"fmt"
 	"log"
@@ -178,6 +177,7 @@ func main() {
 	direct := flag.Bool("direct", false, "with -store: request O_DIRECT on object files")
 	prealloc := flag.Bool("preallocate", false, "with -store: fallocate each new object to full size")
 	asyncRing := flag.Int("async-ring", 0, "with -store: route object reads/writes through the async I/O ring (io_uring on Linux, worker-pool fallback elsewhere); value = ring depth, e.g. 128; 0 = plain pread/pwrite")
+	ringPinCPU := flag.String("ring-pin-cpu", "", "with -async-ring: pin the ring's worker threads to this CPU set (Linux cpulist syntax, e.g. \"2\" or \"2-3\"); empty = scheduler default")
 	maxConns := flag.Int("max-conns", 0, "max concurrent client connections (0 = unlimited)")
 	metaDir := flag.String("meta-dir", "", "meta directory of a cluster (enables clustered exports backed by OSDs): holds the volume/OSD registry, crush epochs, export records and jobs - not the data, which lives in the OSD directories")
 	clusterDir := flag.String("cluster", "", "deprecated alias for -meta-dir")
@@ -216,6 +216,8 @@ func main() {
 	commit := flag.String("commit", "none", "durability of OSD/-store writes: none (page cache; a guest FLUSH/FUA syncs the disk), flush (fsync every write/punch), sync (O_SYNC at open; on macOS degrades to flush semantics), journal (append to a write-ahead log + fsync per write, background flattening into objects; fastest safe mode for small random writes)")
 	fsyncBatch := flag.Duration("fsync-batch", 0, "with -commit none: coalesce Sync() calls that land within this window (e.g. 2ms) into one fsync pass (0 = fsync disk on every sync request)")
 	intentLog := flag.Bool("intent", false, "with -commit none|flush|sync (OSD and -store exports): keep a write intent log (vitastor-ideas §2.1) — every write is announced before its data and verified at reopen, so a power loss produces a loud damage report (status warnings, unistor_osd_intent mismatches) instead of silent corruption. Ignored in -commit journal mode (the WAL already rebuilds objects)")
+	atomicWrites := flag.Bool("atomic-writes", false, "OSD and -store exports: write with RWF_ATOMIC (power-loss atomicity, vitastor-ideas §2.2) on disks that publish an atomic write unit (Linux 6.11+; NVMe Micron 7450/7500, Kioxia CD7/CD8, ...). Auto-disabled per disk when the device has no atomic unit or the kernel refuses it. Not combined with the write journal (-commit journal)")
+	atomicSize := flag.Int64("atomic-size", 4096, "with -atomic-writes: largest write (bytes) issued as an atomic write; larger writes take the normal path (the device's atomic_write_unit_max is the hard ceiling)")
 	vacuumInterval := flag.Int("vacuum-interval", 0, "with -meta-dir: seconds between background vacuums that unlink deleted volumes' objects from the OSDs (0 = off; the admin API and unistorctl vacuum run are the manual triggers)")
 	raftAddr := flag.String("raft", "", "with -meta-dir: replicate meta over raft on this bind address (host:port). Reads always work; writes need a quorum, without one the meta is read-only (503 on the admin API). A node with -raft but no -osd is a storage-less witness voter")
 	raftPeers := flag.String("raft-peers", "", "with -raft: FULL voter set as comma-separated host:port (including this node), e.g. 10.0.0.1:9401,10.0.0.2:9401,10.0.0.3:9401")
@@ -227,6 +229,9 @@ func main() {
 	tlsCA := flag.String("tls-ca", "", "PEM CA certificate(s) that signed the peers'/clients' certificates; required for the OSD/raft planes; it is also used to verify admin API clients unless -tls-client-ca-file is set")
 	tlsClientCA := flag.String("tls-client-ca-file", "", "with -tls-ca: require admin API client certificates signed by this CA (by default the admin API presents a certificate but does not demand client certificates, so plain 'curl --cacert' works)")
 	tlsMinVer := flag.String("tls-min-version", "1.2", "minimum TLS version: 1.2 or 1.3")
+	tlsPlanes := flag.String("tls-planes", "data,raft,nbd,admin", "with -tls-cert: comma-separated planes TLS is enabled for: data (OSD-to-OSD replication/recovery), raft (meta transport + write forwarding), nbd (export START_TLS upgrade), admin (admin HTTP API). Drop a plane to keep it in the clear - \"raft,admin\" runs the bulk data path unencrypted (vitastor-style) with the control plane encrypted; every peer must be configured the same way per plane")
+	tlsSkipVerify := flag.Bool("tls-skip-verify", false, "encrypt the channels but authenticate nothing: a client does not verify the peer's certificate chain or address, a server accepts any client certificate. Meant for standing a cluster up (and for keeping it running through broken material) - a deployment in this state can be impersonated by anyone on the network, so the daemon warns at startup. Server side of the flag: peers presenting no certificate are accepted")
+	tlsReloadSecs := flag.Int("tls-reload-interval", 0, "with -tls-cert: seconds between polls of the certificate files that reload them when their mtime changes (0 = off; SIGHUP and POST /v1/tls/reload are the primary reload triggers; the CA file is never re-loaded - rotating a CA needs a restart)")
 	importAllowPrivate := flag.Bool("import-allow-private", false, "let URL imports (-import / job url) fetch from private, loopback and link-local networks. Off by default: the ingest fetch is an HTTP client driven by the control plane, so without this guard a supplied URL can reach cloud metadata, the placement plane on localhost, and other internal services. Overrides stay blocked (unspecified, multicast, CGNAT/overlay) and bare hostnames are always refused; set this only on an isolated storage net that legitimately imports from a private mirror")
 	importMaxSize := flag.String("import-max-size", "0", "cap on how many bytes one URL/stream import may land in a volume (suffixes K/M/G/T, e.g. 40G; 0 = unlimited). Guards against an unbounded source filling the cluster; a stream that would cross the cap fails the job")
 	showVersion := flag.Bool("version", false, "print version and exit")
@@ -277,43 +282,37 @@ func main() {
 		logger.Fatalf("commit: %v", err)
 	}
 
-	// TLS material: when any -tls-* flag is given, every network plane
-	// (OSD data, raft transport and write proxy, admin HTTP) switches to
-	// mutual TLS at once - a mixed plain/TLS fleet is not supported.
+	// TLS material: when any -tls-* flag is given, the planes named by
+	// -tls-planes (all of them by default) switch to mutual TLS. A plane
+	// outside the set stays in the clear - that is how a cluster runs the
+	// bulk data path plain, the way vitastor deployments do, while raft
+	// and the admin API stay encrypted. Peers must agree per plane: a
+	// plain listener and a TLS peer on the same plane cannot talk.
+	planes, err := tlsconf.ParsePlanes(*tlsPlanes)
+	if err != nil {
+		logger.Fatalf("tls: %v", err)
+	}
 	tlsMaterial := tlsconf.Config{
 		CertFile:   *tlsCert,
 		KeyFile:    *tlsKey,
 		CAFile:     *tlsCA,
 		MinVersion: *tlsMinVer,
+		SkipVerify: *tlsSkipVerify,
 	}
-	var tlsServer, tlsClient, tlsAdmin *tls.Config
-	if tlsMaterial.Any() {
-		if !tlsMaterial.Complete() {
-			logger.Fatalf("-tls-cert, -tls-key and -tls-ca must all be set together")
-		}
-		scfg, err := tlsMaterial.ServerConfig()
-		if err != nil {
-			logger.Fatalf("tls: %v", err)
-		}
-		ccfg, err := tlsMaterial.ClientConfig()
-		if err != nil {
-			logger.Fatalf("tls: %v", err)
-		}
-		// The admin API presents the certificate and, unlike the
-		// storage planes, does not demand client certificates by
-		// default: operators use plain "curl --cacert ca.pem".
-		// -tls-client-ca-file (a CA for operator/client certs) turns
-		// mutual TLS on for the admin API too.
-		adminCA := *tlsClientCA
-		if adminCA == "" {
-			adminCA = *tlsCA
-		}
-		acf, err := tlsconf.Config{CertFile: *tlsCert, KeyFile: *tlsKey, CAFile: adminCA, MinVersion: *tlsMinVer}.HTTPServerConfig()
-		if err != nil {
-			logger.Fatalf("tls: %v", err)
-		}
-		tlsServer, tlsClient, tlsAdmin = scfg, ccfg, acf
-		logger.Printf("tls: mutual TLS enabled (min %s, cert %s, ca %s)", *tlsMinVer, *tlsCert, *tlsCA)
+	tlsState, err := setupTLS(tlsMaterial, *tlsClientCA, tlsconf.NewPlaneSet(planes...), logger)
+	if err != nil {
+		logger.Fatalf("tls: %v", err)
+	}
+	// Per-plane configurations: nil means the plane runs in the clear.
+	var (
+		tlsDataServer, tlsDataClient *tls.Config
+		tlsRaftServer, tlsRaftClient *tls.Config
+		tlsNBDServer, tlsAdmin       *tls.Config
+	)
+	if tlsState != nil {
+		tlsDataServer, tlsDataClient = tlsState.dataServer, tlsState.dataClient
+		tlsRaftServer, tlsRaftClient = tlsState.raftServer, tlsState.raftClient
+		tlsNBDServer, tlsAdmin = tlsState.nbdServer, tlsState.adminSrv
 	}
 
 	// QoS: per-export limits (client side) and an optional per-OSD
@@ -345,6 +344,18 @@ func main() {
 
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
+
+	// Reload lifecycle: SIGHUP re-applies everything the daemon can
+	// adopt at runtime - the certificate material and the declarative
+	// cluster sections (-qos-class, -crushmap, -create) - so the
+	// operator's command is "systemctl kill -s HUP unistord" (or
+	// "kill -HUP <pid>") for any config change, not only for a new
+	// certificate. POST /v1/reload is the same path, and the optional
+	// poller below notices certificate files that changed on disk. Every
+	// section keeps its last good state when the new one is broken.
+	reloadSt := newReloadState(tlsState, *gogc, logger)
+	reloadSt.signalReload(ctx, logger)
+	tlsState.watchReload(ctx, *tlsReloadSecs, logger)
 
 	// Clustered mode: exports are volumes placed by CRUSH across OSDs
 	// (this process hosts -osd daemons; peers may run in other unistord).
@@ -390,8 +401,8 @@ func main() {
 				ProxyAddr:  *raftProxy,
 				ProxyPeers: proxyPeers,
 				Logger:     log.New(os.Stderr, "raft: ", log.LstdFlags|log.Lmsgprefix),
-				TLS:        tlsServer,
-				ProxyTLS:   tlsClient,
+				TLS:        tlsRaftServer,
+				ProxyTLS:   tlsRaftClient,
 			})
 			if err != nil {
 				logger.Fatalf("raft meta: %v", err)
@@ -416,8 +427,8 @@ func main() {
 		// admin API and unistorctl remain the manual triggers).
 		if *vacuumInterval > 0 {
 			cl := client.NewCluster(ms)
-			if tlsClient != nil {
-				cl.SetTLS(tlsClient)
+			if tlsDataClient != nil {
+				cl.SetTLS(tlsDataClient)
 			}
 			go cl.VacuumLoop(ctx, time.Duration(*vacuumInterval)*time.Second,
 				func(f string, a ...any) { logger.Printf(f, a...) })
@@ -489,17 +500,54 @@ func main() {
 		if *metricsAddr != "" {
 			mreg = newClusterMetrics()
 		}
+		// The boot parameters are also the reload spec: the declarative
+		// sections (-qos-class, -crushmap, -create) are re-applied from
+		// the same data over a dedicated cluster client, so a reload
+		// never disturbs the handle the admin API and the exports use.
+		cp := clusterParams{
+			store:        ms,
+			metaDir:      clusterPath,
+			osds:         osdSpecs,
+			crushmap:     *crushPath,
+			epoch:        uint32(*epoch),
+			pgNum:        *pgNum,
+			replicas:     *replicas,
+			minSize:      *minSize,
+			rule:         *rule,
+			creates:      creates,
+			qosClasses:   qosClasses,
+			osdQoS:       *osdQoS,
+			commit:       commitMode,
+			fsyncBatch:   *fsyncBatch,
+			intentLog:    *intentLog,
+			atomicWrites: *atomicWrites,
+			atomicSize:   *atomicSize,
+			tlsDataSrv:   tlsDataServer,
+			tlsDataCli:   tlsDataClient,
+			disks:        disks,
+			metrics:      mreg,
+			logger:       logger,
+		}
+		var reloadCl *client.Cluster
+		if !witness {
+			reloadCl = client.NewCluster(ms)
+			if tlsDataClient != nil {
+				reloadCl.SetTLS(tlsDataClient)
+			}
+			defer reloadCl.Close()
+			reloadSt.enableCluster(specFromParams(cp), reloadCl, ms)
+		}
 		var hub *exportHub
 		var admin *adminAPI
 		var vdm *vduseManager
 		var vubm *vubManager
 		if *metricsAddr != "" {
 			mcl := client.NewCluster(ms)
-			if tlsClient != nil {
-				mcl.SetTLS(tlsClient)
+			if tlsDataClient != nil {
+				mcl.SetTLS(tlsDataClient)
 			}
 			defer mcl.Close()
-			msrc := metricsSource{cl: mcl, ms: ms, raft: raftSt, disks: disks, vacuumInterval: *vacuumInterval}
+			msrc := metricsSource{cl: mcl, ms: ms, raft: raftSt, disks: disks, vacuumInterval: *vacuumInterval, tls: tlsState, reload: reloadSt}
 			go func() {
 				if err := mreg.serveMetrics(ctx, *metricsAddr, msrc, logger); err != nil {
 					logger.Printf("metrics http: %v", err)
@@ -518,7 +566,7 @@ func main() {
 			// (which needs a quorum), and the operator needs the status
 			// and write endpoints available throughout.
 			hub = newExportHub(nil, logger, vdm, vubm)
-			admin, err = newAdminServer(ms, *httpAddr, logger, raftSt, disks, tlsAdmin, tlsClient, *adminToken, hub)
+			admin, err = newAdminServer(ms, *httpAddr, logger, raftSt, disks, tlsAdmin, tlsDataClient, tlsState, reloadSt, *adminToken, hub)
 			if err != nil {
 				logger.Fatalf("admin http: %v", err)
 			}
@@ -541,28 +589,7 @@ func main() {
 			go admin.resumeJobs(ctx)
 		}
 		if !witness {
-			if err := clusterBoot(ctx, clusterParams{
-				store:      ms,
-				metaDir:    clusterPath,
-				osds:       osdSpecs,
-				crushmap:   *crushPath,
-				epoch:      uint32(*epoch),
-				pgNum:      *pgNum,
-				replicas:   *replicas,
-				minSize:    *minSize,
-				rule:       *rule,
-				creates:    creates,
-				qosClasses: qosClasses,
-				osdQoS:     *osdQoS,
-				commit:     commitMode,
-				fsyncBatch: *fsyncBatch,
-				intentLog:  *intentLog,
-				tlsServer:  tlsServer,
-				tlsClient:  tlsClient,
-				disks:      disks,
-				metrics:    mreg,
-				logger:     logger,
-			}); err != nil {
+			if err := clusterBoot(ctx, cp); err != nil {
 				logger.Fatalf("cluster: %v", err)
 			}
 		} else {
@@ -581,8 +608,8 @@ func main() {
 		// like admin-API exports.
 		bootCl := client.NewCluster(ms)
 		bootCl.SetPoolLimit(256)
-		if tlsClient != nil {
-			bootCl.SetTLS(tlsClient)
+		if tlsDataClient != nil {
+			bootCl.SetTLS(tlsDataClient)
 		}
 		defer bootCl.Close()
 		if vdm != nil {
@@ -634,7 +661,7 @@ func main() {
 			Logger:            logger,
 			EnableTrim:        *trim,
 			EnableWriteZeroes: *writeZeroes,
-			TLSServerConfig:   tlsServer,
+			TLSServerConfig:   tlsNBDServer,
 		}, es)
 		return
 	}
@@ -664,7 +691,7 @@ func main() {
 				logger.Fatalf("bad size in -export %q: %v", spec, err)
 			}
 		}
-		b, err := newBackend(*storeMode, path, size, *direct, *prealloc, commitMode, *fsyncBatch, *asyncRing, *intentLog)
+		b, err := newBackend(*storeMode, path, size, *direct, *prealloc, commitMode, *fsyncBatch, *asyncRing, *ringPinCPU, *intentLog, *atomicWrites, *atomicSize)
 		if err != nil {
 			logger.Fatalf("export %s: %v", name, err)
 		}
@@ -708,7 +735,7 @@ func main() {
 		Logger:            logger,
 		EnableTrim:        *trim,
 		EnableWriteZeroes: *writeZeroes,
-		TLSServerConfig:   tlsServer,
+		TLSServerConfig:   tlsNBDServer,
 	}, es)
 }
 
@@ -773,26 +800,28 @@ func parseCreateSpec(spec string) (pool, name, sizeStr string, err error) {
 }
 
 type clusterParams struct {
-	store      meta.Store // shared meta store (dir-backed or raft), opened by the caller
-	metaDir    string     // for logs only
-	osds       []string
-	crushmap   string
-	epoch      uint32
-	pgNum      int
-	replicas   int
-	minSize    int
-	rule       string
-	creates    []string
-	qosClasses []string         // -qos-class name=rates registrations
-	osdQoS     string           // per-OSD aggregate rates spec ("" = none)
-	commit     store.CommitMode // OSD commit mode
-	fsyncBatch time.Duration    // OSD fsync coalescing window
-	intentLog  bool             // write intent log (ideas §2.1)
-	tlsServer  *tls.Config      // mutual TLS for the OSD data plane (nil = plain)
-	tlsClient  *tls.Config      // client side for cluster pools (nil = plain)
-	disks      *diskRegistry    // hosted OSDs publish disk stats here (admin status)
-	metrics    *clusterMetrics  // prometheus registry (nil = metrics disabled)
-	logger     *log.Logger
+	store        meta.Store // shared meta store (dir-backed or raft), opened by the caller
+	metaDir      string     // for logs only
+	osds         []string
+	crushmap     string
+	epoch        uint32
+	pgNum        int
+	replicas     int
+	minSize      int
+	rule         string
+	creates      []string
+	qosClasses   []string         // -qos-class name=rates registrations
+	osdQoS       string           // per-OSD aggregate rates spec ("" = none)
+	commit       store.CommitMode // OSD commit mode
+	fsyncBatch   time.Duration    // OSD fsync coalescing window
+	intentLog    bool             // write intent log (ideas §2.1)
+	atomicWrites bool             // RWF_ATOMIC writes (ideas §2.2)
+	atomicSize   int64            // cap of one atomic write (bytes)
+	tlsDataSrv   *tls.Config      // OSD data plane server side (-tls-planes data; nil = plain)
+	tlsDataCli   *tls.Config      // client side for cluster pools (nil = plain)
+	disks        *diskRegistry    // hosted OSDs publish disk stats here (admin status)
+	metrics      *clusterMetrics  // prometheus registry (nil = metrics disabled)
+	logger       *log.Logger
 }
 
 // clusterBoot brings up a single-process (or multi-process, shared
@@ -809,8 +838,8 @@ func clusterBoot(ctx context.Context, p clusterParams) error {
 	// connections, so the default 64-per-OSD pool cap would queue ops
 	// inside the pool. Raise it; each connection is 256KB of bufio.
 	cl.SetPoolLimit(256)
-	if p.tlsClient != nil {
-		cl.SetTLS(p.tlsClient)
+	if p.tlsDataCli != nil {
+		cl.SetTLS(p.tlsDataCli)
 	}
 
 	// writeMeta runs a meta write that must land before the cluster is
@@ -838,24 +867,14 @@ func clusterBoot(ctx context.Context, p clusterParams) error {
 		}
 	}
 
-	// Register QoS classes so volumes can reference them by name.
-	for _, spec := range p.qosClasses {
-		name, rates, err := parseQoSNamed(spec)
-		if err != nil {
-			return fmt.Errorf("-qos-class %q: %w", spec, err)
-		}
-		riops, rbps, wiops, wbps, err := parseQoSRates(rates)
-		if err != nil {
-			return fmt.Errorf("-qos-class %q: %w", spec, err)
-		}
-		if err := writeMeta("qos class "+name, func() error {
-			return cl.PutQoSClass(ctx, meta.QoSClassRecord{
-				Name: name, ReadIOPS: riops, ReadBPS: rbps, WriteIOPS: wiops, WriteBPS: wbps,
-			})
-		}); err != nil {
-			return err
-		}
-		p.logger.Printf("qos class %q: r=%d/%s w=%d/%s", name, riops, humanSize(rbps), wiops, humanSize(wbps))
+	// Register QoS classes so volumes can reference them by name. The
+	// same code runs on reload: boot and reload share every declarative
+	// section, so a change made to the flags' source and pushed through
+	// /v1/reload lands the same records as a restart would.
+	spec := specFromParams(p)
+	logf := func(f string, a ...any) { p.logger.Printf(f, a...) }
+	if _, err := applyQoSClasses(ctx, cl, &spec, writeMeta, logf); err != nil {
+		return err
 	}
 
 	// Per-disk aggregate ceiling shared by all volumes on each hosted
@@ -881,18 +900,19 @@ func clusterBoot(ctx context.Context, p clusterParams) error {
 			return fmt.Errorf("-osd %q: %w", spec, err)
 		}
 		d, err := osd.New(osd.Options{
-			ID:         id,
-			Addr:       addr,
-			CtrlAddr:   ctrlAddr,
-			DataDir:    dataDir,
-			Meta:       ms,
-			Aggregate:  aggSpec.pair(),
-			CommitMode: p.commit,
-			FsyncBatch: p.fsyncBatch,
-			Intent:     p.intentLog,
-			TLS:        p.tlsServer,
-			Metrics:    p.metrics.osdServerMetrics(id),
-			Logf:       func(f string, a ...any) { p.logger.Printf("osd %d: %s", id, fmt.Sprintf(f, a...)) },
+			ID:           id,
+			Addr:         addr,
+			CtrlAddr:     ctrlAddr,
+			DataDir:      dataDir,
+			Meta:         ms,
+			Aggregate:    aggSpec.pair(),
+			CommitMode:   p.commit,
+			FsyncBatch:   p.fsyncBatch,
+			Intent:       p.intentLog,
+			AtomicWrites: p.atomicWrites,
+			TLS:          p.tlsDataSrv,
+			Metrics:      p.metrics.osdServerMetrics(id),
+			Logf:         func(f string, a ...any) { p.logger.Printf("osd %d: %s", id, fmt.Sprintf(f, a...)) },
 		})
 		if err != nil {
 			return fmt.Errorf("osd %d: %w", id, err)
@@ -976,33 +996,10 @@ func clusterBoot(ctx context.Context, p clusterParams) error {
 	// Publish the crush map if asked and not already present at this
 	// epoch (idempotent restarts keep the existing map). Epoch 0 means
 	// "auto": 1 on a fresh cluster; on a running one a map already
-	// exists, so publishing is skipped (use "unistorctl map publish"
-	// to push a new generation).
-	if p.crushmap != "" {
-		src, err := os.ReadFile(p.crushmap)
-		if err != nil {
-			return fmt.Errorf("crushmap: %w", err)
-		}
-		rec, err := meta.LatestMap(ctx, ms)
-		have := err == nil
-		pubEpoch := p.epoch
-		switch {
-		case p.epoch == 0 && have:
-			p.logger.Printf("crushmap already published (latest epoch %d): keeping it", rec.Epoch)
-			pubEpoch = 0
-		case p.epoch == 0:
-			pubEpoch = 1
-		}
-		if pubEpoch != 0 && (!have || rec.Epoch < pubEpoch) {
-			if err := writeMeta(fmt.Sprintf("crushmap epoch %d", pubEpoch), func() error {
-				return cl.MapEpoch(ctx, pubEpoch, src)
-			}); err != nil && !errors.Is(err, meta.ErrConflict) {
-				return fmt.Errorf("publish map epoch %d: %w", pubEpoch, err)
-			}
-			p.logger.Printf("published crushmap epoch %d (%d bytes)", pubEpoch, len(src))
-		} else if pubEpoch != 0 {
-			p.logger.Printf("crushmap epoch %d already present (latest %d)", pubEpoch, rec.Epoch)
-		}
+	// exists, so publishing is skipped (use "unistorctl map publish", or
+	// a reload, to push a new generation).
+	if _, err := applyCrushmap(ctx, cl, ms, &spec, writeMeta, logf, publishBoot); err != nil {
+		return err
 	}
 
 	// Placement options from flags, clamped by the map's own buckets.
@@ -1010,55 +1007,9 @@ func clusterBoot(ctx context.Context, p clusterParams) error {
 		return fmt.Errorf("placement: %w", err)
 	}
 
-	for _, spec := range p.creates {
-		pool, name, sizeStr, perr := parseCreateSpec(spec)
-		if perr != nil {
-			return fmt.Errorf("-create %q: %w", spec, perr)
-		}
-		size, err := sizeSuffix(sizeStr)
-		if err != nil {
-			return fmt.Errorf("-create %q: %w", spec, err)
-		}
-		if _, err := meta.GetVolume(ctx, ms, name); err == nil {
-			continue // already exists
-		}
-		// The flag values are 0/"" sentinels when unset: without a pool
-		// the compiled cluster snapshot fills them (built-in defaults
-		// when the daemon booted flagless); with a pool the pool record
-		// does, and the flags win over the pool.
-		var vspec meta.VolumeSpec
-		if err := writeMeta("create volume "+name, func() error {
-			var cerr error
-			if pool == "" && (p.replicas == 0 || p.pgNum == 0) {
-				// Flagless start: take the placement defaults from the
-				// compiled cluster snapshot (built-in defaults when the
-				// daemon booted without -replicas/-pg-num).
-				if snap, serr := cl.Refresh(ctx); serr == nil {
-					if p.replicas == 0 {
-						p.replicas = snap.Replicas
-					}
-					if p.pgNum == 0 {
-						p.pgNum = int(snap.PGNum)
-					}
-					if p.rule == "" {
-						p.rule = snap.Rule
-					}
-				}
-			}
-			if pool != "" {
-				vspec, cerr = cl.CreateVolumeInPool(ctx, pool, name, size, 0, p.replicas, p.minSize, p.pgNum, p.rule)
-			} else {
-				vspec, cerr = cl.CreateVolume(ctx, name, size, 0, p.replicas, p.minSize, p.pgNum, p.rule)
-			}
-			return cerr
-		}); err != nil {
-			return fmt.Errorf("create volume %q: %w", name, err)
-		}
-		poolTag := ""
-		if vspec.Pool != "" {
-			poolTag = " pool=" + vspec.Pool
-		}
-		p.logger.Printf("created volume %q (%s, r=%d, min_size=%d, pg=%d)%s", name, humanSize(size), vspec.Replicas, vspec.MinSize, vspec.PGNum, poolTag)
+	// Create the declared volumes (an existing volume is kept as is).
+	if _, err := applyCreates(ctx, cl, ms, &spec, writeMeta, logf); err != nil {
+		return err
 	}
 
 	return nil
@@ -1194,7 +1145,7 @@ func parseOSDSpec(spec string) (id int32, dataDir, addr, ctrlAddr string, err er
 
 // newBackend builds the export backend: a plain sparse file (MVP
 // default) or, with -store, the phase-1 object-store data path.
-func newBackend(storeMode bool, path string, size uint64, direct, prealloc bool, commitMode store.CommitMode, fsyncBatch time.Duration, asyncRing int, intentLog bool) (nbd.Backend, error) {
+func newBackend(storeMode bool, path string, size uint64, direct, prealloc bool, commitMode store.CommitMode, fsyncBatch time.Duration, asyncRing int, ringPinCPU string, intentLog bool, atomicWrites bool, atomicSize int64) (nbd.Backend, error) {
 	if !storeMode {
 		return nbd.NewFileBackend(path, size)
 	}
@@ -1202,12 +1153,15 @@ func newBackend(storeMode bool, path string, size uint64, direct, prealloc bool,
 		return nil, fmt.Errorf("-store exports require an explicit :size")
 	}
 	return nbd.NewStoreBackend(path, size, store.Options{
-		Direct:      direct,
-		Preallocate: prealloc,
-		CommitMode:  commitMode,
-		FsyncBatch:  fsyncBatch,
-		AsyncRing:   asyncRing,
-		Intent:      intentLog,
+		Direct:       direct,
+		Preallocate:  prealloc,
+		CommitMode:   commitMode,
+		FsyncBatch:   fsyncBatch,
+		AsyncRing:    asyncRing,
+		RingPinCPUs:  ringPinCPU,
+		Intent:       intentLog,
+		AtomicWrites: atomicWrites,
+		AtomicSize:   atomicSize,
 	})
 }
 

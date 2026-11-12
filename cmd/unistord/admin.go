@@ -62,6 +62,11 @@ import (
 	"github.com/unistack-org/storage/pkg/qos"
 )
 
+// reloadTimeout bounds one reload over the admin API. The sections are
+// local file reads and a handful of meta writes; a longer budget only
+// means a wedged raft election keeps the HTTP request waiting.
+const reloadTimeout = 30 * time.Second
+
 // importChunk is the streaming granularity for import/export: big
 // enough to keep the data path efficient, small enough that memory
 // stays flat regardless of the image size.
@@ -92,6 +97,13 @@ type adminAPI struct {
 	// recoveryRecord feeds the recovery counters when metrics are
 	// enabled (nil = no-op); it never exposes metrics over REST.
 	recoveryRecord func(copies int, bytes uint64)
+	// tls is the daemon's certificate state (nil = TLS off): it backs
+	// GET /v1/tls and POST /v1/tls/reload and feeds /v1/status.
+	tls *tlsSetup
+	// reload is the daemon's reload coordinator: it backs
+	// POST /v1/reload (the general reload, certificates included) and
+	// feeds /v1/status.
+	reload *reloadState
 }
 
 // newAdminServer binds the routes on the process-wide meta store (in
@@ -102,7 +114,7 @@ type adminAPI struct {
 // collects the OSDs hosted in this process (the admin starts before the
 // daemons; they register into the registry as they come up). It does not
 // start serving; call serve.
-func newAdminServer(ms meta.Store, addr string, logger *log.Logger, raftSt *meta.RaftStore, disks *diskRegistry, tlsCfg *tls.Config, clientTLS *tls.Config, token string, exports *exportHub) (*adminAPI, error) {
+func newAdminServer(ms meta.Store, addr string, logger *log.Logger, raftSt *meta.RaftStore, disks *diskRegistry, tlsCfg *tls.Config, clientTLS *tls.Config, tlsState *tlsSetup, reloadSt *reloadState, token string, exports *exportHub) (*adminAPI, error) {
 	cl := client.NewCluster(ms)
 	if clientTLS != nil {
 		// Import/export touch the OSDs over the data plane: dial it the
@@ -110,7 +122,7 @@ func newAdminServer(ms meta.Store, addr string, logger *log.Logger, raftSt *meta
 		cl.SetTLS(clientTLS)
 	}
 	a := &adminAPI{cl: cl, ms: ms, logger: logger, raft: raftSt, disks: disks, token: token, exports: exports,
-		jobs: newJobRegistry(), importHTTP: &http.Client{Timeout: 0}}
+		jobs: newJobRegistry(), importHTTP: &http.Client{Timeout: 0}, tls: tlsState, reload: reloadSt}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", a.handleHealthz)
 	mux.HandleFunc("GET /healthcheck", a.handleHealthcheck)
@@ -120,6 +132,9 @@ func newAdminServer(ms meta.Store, addr string, logger *log.Logger, raftSt *meta
 	mux.HandleFunc("GET /v1/jobs", a.handleJobs)
 	mux.HandleFunc("GET /v1/jobs/{id}", a.handleJob)
 	mux.HandleFunc("GET /v1/status", a.handleStatus)
+	mux.HandleFunc("GET /v1/tls", a.handleTLS)
+	mux.HandleFunc("POST /v1/tls/reload", a.handleTLSReload)
+	mux.HandleFunc("POST /v1/reload", a.handleReload)
 	mux.HandleFunc("GET /v1/osds", a.handleOSDs)
 	mux.HandleFunc("GET /v1/volumes", a.handleListVolumes)
 	mux.HandleFunc("POST /v1/volumes", a.handleCreateVolume)
@@ -456,11 +471,86 @@ func (a *adminAPI) handleStatus(w http.ResponseWriter, r *http.Request) {
 			st["disks"] = ds
 		}
 	}
+	if tv := a.tls.View(); tv.Enabled {
+		st["tls"] = tv
+		warnings = append(warnings, a.tls.warnings(time.Now())...)
+	}
+	if rv := a.reload.view(); rv.Enabled {
+		st["reload"] = rv
+		if rv.Reloads > 0 && !rv.LastOK {
+			warnings = append(warnings, "reload: the last reload did not apply every section, previous state stays in effect: "+rv.LastError)
+		}
+	}
 	st["healthy"] = len(warnings) == 0
 	if len(warnings) > 0 {
 		st["warnings"] = warnings
 	}
 	writeJSON(w, http.StatusOK, st)
+}
+
+// handleTLS reports which planes are encrypted and the live certificate
+// material (subject, expiry, reload counter, last reload error).
+func (a *adminAPI) handleTLS(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, a.tls.View())
+}
+
+// handleTLSReload re-reads the certificate files, the HTTP twin of
+// SIGHUP. It answers 200 with the new material on success and 500 with
+// the failure reason when the files are unusable - in that case the
+// daemon keeps serving with the previous material, so a failed reload
+// never takes TLS down.
+func (a *adminAPI) handleTLSReload(w http.ResponseWriter, r *http.Request) {
+	if a.tls == nil {
+		jsonError(w, http.StatusBadRequest, "tls: the daemon runs without -tls-cert, nothing to reload")
+		return
+	}
+	err := a.tls.Reload()
+	view := a.tls.View()
+	if err != nil {
+		a.logger.Printf("tls: reload over the admin API failed, keeping previous material: %v", err)
+		writeJSON(w, http.StatusInternalServerError, map[string]any{
+			"error":   err.Error(),
+			"tls":     view,
+			"message": "the previous certificate material stays in effect",
+		})
+		return
+	}
+	a.logger.Printf("tls: reloaded certificate material (admin API)")
+	writeJSON(w, http.StatusOK, view)
+}
+
+// handleReload re-applies everything the daemon can adopt at runtime:
+// the certificate material plus the declarative cluster sections
+// (-qos-class, -crushmap, -create). It is the HTTP twin of SIGHUP and
+// the same path the certificate watcher uses.
+//
+// Every section is independent and keep-last-good, so the reply is a
+// per-section report; 200 means every section applied, 500 that at least
+// one failed (the running cluster is unaffected either way). A node
+// whose meta is read-only (raft without a quorum) answers 503: the
+// sections that write meta cannot land there.
+func (a *adminAPI) handleReload(w http.ResponseWriter, r *http.Request) {
+	if a.reload == nil {
+		jsonError(w, http.StatusBadRequest, "reload: this daemon has nothing to reload")
+		return
+	}
+	if a.raft != nil && a.raft.Leader() == "" {
+		jsonError(w, http.StatusServiceUnavailable, "reload: meta is read-only here: no raft leader")
+		return
+	}
+	// The declarative sections retry while the meta is briefly read-only
+	// (an election in progress), so the request gets a fair chance to
+	// land before the client gives up.
+	ctx, cancel := context.WithTimeout(r.Context(), reloadTimeout)
+	defer cancel()
+	rep := a.reload.reloadAll(ctx, "admin API")
+	if rep.OK {
+		a.logger.Printf("reload (admin API): %s", rep)
+		writeJSON(w, http.StatusOK, rep)
+		return
+	}
+	a.logger.Printf("reload (admin API) incomplete, previous state stays in effect: %s", rep)
+	writeJSON(w, http.StatusInternalServerError, rep)
 }
 
 func (a *adminAPI) handleOSDs(w http.ResponseWriter, r *http.Request) {

@@ -214,6 +214,8 @@ type clusterMetrics struct {
 	gVolume     *gaugeVec // {name,metric} metric=writable|degraded|...
 	gQoSLimit   *gaugeVec // {export,rate} configured limits
 	gVacuum     *gaugeVec // {name} vacuum backlog + autovacuum config
+	gTLS        *gaugeVec // {name} TLS material: expiry, reload counters, plane state
+	gReload     *gaugeVec // {name} unified reload (/v1/reload, SIGHUP): counters and outcome
 
 	// Recovery traffic, filled by the RecoveryOpts.Record hook (runs
 	// started through this process).
@@ -263,6 +265,8 @@ func newClusterMetrics() *clusterMetrics {
 		gVolume:     newGaugeVec(mtr, "unistor_volume", "name", "metric"),
 		gQoSLimit:   newGaugeVec(mtr, "unistor_export_qos_limit", "export", "rate"),
 		gVacuum:     newGaugeVec(mtr, "unistor_vacuum", "name"),
+		gTLS:        newGaugeVec(mtr, "unistor_tls", "name"),
+		gReload:     newGaugeVec(mtr, "unistor_reload", "name"),
 
 		recoveryCopies: mtr.Counter("unistor_recovery_copies_total"),
 		recoveryBytes:  mtr.Counter("unistor_recovery_bytes_total"),
@@ -286,6 +290,14 @@ type metricsSource struct {
 	// unistor_vacuum{name="interval_seconds"} so a dashboard can
 	// compute "time until the backlog is cleaned" against it.
 	vacuumInterval int
+
+	// tls is the daemon's certificate state (nil = TLS off); the
+	// unistor_tls family reports it.
+	tls *tlsSetup
+
+	// reload is the daemon's reload coordinator (nil = no reload path);
+	// the unistor_reload family reports it.
+	reload *reloadState
 }
 
 // volumeUsage reads a volume's allocation (bitmap popcount x object
@@ -466,6 +478,8 @@ func (m *clusterMetrics) collect(ctx context.Context, s metricsSource) {
 	m.gVolume.purge()
 	m.gQoSLimit.purge()
 	m.gVacuum.purge()
+	m.gTLS.purge()
+	m.gReload.purge()
 
 	vols, err := s.cl.ListVolumes(ctx)
 	if err == nil {
@@ -655,6 +669,60 @@ func (m *clusterMetrics) collect(ctx context.Context, s metricsSource) {
 	m.exportsMu.Unlock()
 
 	m.gCluster.set(healthy, "healthy")
+	m.collectTLS(s.tls)
+	m.collectReload(s.reload)
+}
+
+// collectReload publishes the unified reload path: how often it has run
+// and how the last run ended. Alert on
+// unistor_reload{name="last_ok"} == 0 (a section failed and keeps its
+// previous state) and on unistor_reload{name="reloads"} stalling when
+// the automation is expected to fire. With no reload path the family
+// reports enabled=0 and nothing else.
+func (m *clusterMetrics) collectReload(r *reloadState) {
+	v := r.view()
+	if !v.Enabled {
+		m.gReload.set(0, "enabled")
+		return
+	}
+	m.gReload.set(1, "enabled")
+	m.gReload.set(b2f(v.Declarative), "declarative")
+	m.gReload.set(float64(v.Reloads), "reloads")
+	m.gReload.set(b2f(v.LastOK), "last_ok")
+	m.gReload.set(b2f(v.LastError != ""), "last_error")
+	if v.LastAt != "" {
+		if ts, err := time.Parse(time.RFC3339, v.LastAt); err == nil {
+			m.gReload.set(float64(ts.Unix()), "last_reload_timestamp")
+		}
+	}
+}
+
+// collectTLS publishes the certificate lifecycle as gauges: a
+// monitoring system alerts on unistor_tls{name="expiry_seconds"} (and
+// on unistor_tls{name="last_error"}) so a fleet gets a warning long
+// before a handshake starts failing. With TLS off the family reports
+// enabled=0 and nothing else.
+func (m *clusterMetrics) collectTLS(t *tlsSetup) {
+	if t == nil {
+		m.gTLS.set(0, "enabled")
+		return
+	}
+	st := t.Status()
+	if st == nil {
+		return
+	}
+	m.gTLS.set(1, "enabled")
+	m.gTLS.set(float64(st.NotAfter.Unix()), "not_after_timestamp")
+	m.gTLS.set(st.ExpirySeconds, "expiry_seconds")
+	m.gTLS.set(float64(st.Reloads), "reloads")
+	if !st.LastReload.IsZero() {
+		m.gTLS.set(float64(st.LastReload.Unix()), "last_reload_timestamp")
+	}
+	m.gTLS.set(b2f(st.SkipVerify), "skip_verify")
+	m.gTLS.set(b2f(st.LastError != ""), "last_error")
+	for _, p := range allPlaneOrder {
+		m.gTLS.set(b2f(t.enabled(p)), "plane_"+string(p)+"_enabled")
+	}
 }
 
 // b2f renders a bool as the 1/0 gauge value.

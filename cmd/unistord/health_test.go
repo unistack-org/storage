@@ -100,7 +100,7 @@ func TestHealthcheckPassesTokenGate(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { ms.Close() })
-	a, err := newAdminServer(ms, "127.0.0.1:0", log.New(io.Discard, "", 0), nil, newDiskRegistry(), nil, nil, "s3cr3t", nil)
+	a, err := newAdminServer(ms, "127.0.0.1:0", log.New(io.Discard, "", 0), nil, newDiskRegistry(), nil, nil, nil, nil, "s3cr3t", nil)
 	if err != nil {
 		t.Fatal(err)
 	}

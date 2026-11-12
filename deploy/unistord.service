@@ -15,6 +15,16 @@
 # гостевой I/O (unmount/quiesce), затем systemctl restart unistord.
 # A device that died mid-I/O needs a guest-visible reset — the unit's
 # Restart=always revives the daemon, not the stuck request.
+#
+# TLS: файлы сертификата читаются демоном при старте и при перезагрузке,
+# кладите их туда, где_unit_ имеет право чтения (каталог внутри
+# /etc/unistord подходит; ProtectSystem=strict не мешает чтению из /etc).
+# systemd сам не шлёт SIGHUP, поэтому обновить сертификат без рестарта
+# (и без касания живых экспортов) так:
+#   systemctl kill -s HUP unistord
+#   # или curl -k -X POST https://<узел>:8443/v1/tls/reload
+# Перезагрузка перечитывает сертификат и ключ; CA перечитывается только
+# на старте (ротация CA = рестарт). См. todos/runbook.md, раздел TLS.
 
 [Unit]
 Description=Unistack SDS daemon (unistord: OSD + NBD/VDUSE exports)

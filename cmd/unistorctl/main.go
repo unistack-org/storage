@@ -29,6 +29,7 @@
 //	recovery    ls | check <vol> | run <vol>   (M6.3: heal diverged/missing replicas)
 //	export      create <vol> [-type nbd|vduse|vhost-user-blk] | ls | rm <name>   (runtime exports via the admin API; shorthand: vub)
 //	status      -http URL                       (operational overview, see unistord)
+//	reload      -http URL [-token T]            (re-apply the daemon's config over /v1/reload)
 //	rebalance   [-once] [-dry-run] [-interval s] [-threshold f]  (free-space CRUSH reweighter)
 //
 // Bandwidth rates accept the K/M/G/T suffixes. A volume whose QoS class
@@ -135,6 +136,8 @@ func dispatch(ctx context.Context, cl *client.Cluster, ms meta.Store, args []str
 		return exportCmd(ctx, args[1:])
 	case "status":
 		return statusCmd(ctx, args[1:])
+	case "reload":
+		return reloadCmd(ctx, args[1:])
 	case "healthcheck":
 		return healthcheckCmd(ctx, args[1:])
 	case "disk":
@@ -1519,6 +1522,7 @@ export create <volume> [-type nbd|vduse|vhost-user-blk] [-devname N] [-ro] [-htt
 export ls [-json] [-http URL] [-token T]  (live exports per type)
 export rm <name> [-type nbd|vduse|vhost-user-blk] [-http URL] [-token T]  (detach; 409 when in use; -type vub accepted)
 status [-http URL]  (reads unistord admin /v1/status; default http://127.0.0.1:8443)
+reload [-http URL] [-token T]  (re-applies the daemon's config: certificates, -qos-class, -crushmap, -create; the HTTP twin of SIGHUP)
 healthcheck [-http URL] [-json]  (verdict on unistord /healthcheck; exit 1 when the cluster is unhealthy)
 disk probe <path> [-json]  (atomic-write capability of the disk backing <path>: device, atomic_write_unit_max/min, kernel RWF_ATOMIC support)
 rebalance [-once] [-dry-run] [-interval 30s] [-threshold f]  (free-space rebalancer: CRUSH weights ∝ free space, publishes new map epochs; stateless)
