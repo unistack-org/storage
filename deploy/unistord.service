@@ -58,6 +58,26 @@ DeviceAllow=char-vduse rw
 # Kernel vDPA char devices the QEMU side opens (created by udev/systemd).
 DeviceAllow=/dev/vhost-vdpa-* rw
 
+# NUMA / CPU affinity (todos/runbook.md, раздел «Эксплуатационная
+# гигиена»): на двухсокетной (или двух-CCX) машине держите демон на
+# одном узле — близость памяти к его ядрам решает. Два слоя, применять
+# вместе:
+#   1) Юнит (cgroup v2, ядро >= 5.0): AllowedCPUs ограничивает набор
+#      ядер процесса, AllowedMemoryNodes= — узлы памяти (numactl -H
+#      показывает соответствие CPU<->NUMA). Юнит действует и на детей,
+#      и переживает рестарты.
+#   AllowedCPUs=0-15
+#   AllowedMemoryNodes=0
+#   # альтернатива от systemd >= 246 (то же самое, через NUMAPolicy):
+#   # NUMAPolicy=bind
+#   # NUMAMask=0
+#   # CPUAffinity=0-15
+#   2) Процесc: -pin-cpus 0-15 пинит main-поток (наследуются всеми
+#      потоками Go), -gomaxprocs 16 убирает лишние потоки планировщика
+#      за пределами набора, -ring-pin-cpu даёт кольцу свои ядра,
+#      -ring-hugepages уменьшает TLB. Смысл имеет только вместе с
+#      аппаратными IRQNic-очередями того же узла (см. runbook).
+#
 # Guest memory fault isolation (deploy/README.md): the daemon survives
 # SIGBUS from stale IOTLB mappings, so never convert faults into kills.
 IgnoreSIGPIPE=yes

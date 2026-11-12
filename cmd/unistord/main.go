@@ -34,6 +34,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"runtime/debug"
 	"strconv"
 	"strings"
@@ -42,6 +43,7 @@ import (
 
 	"github.com/unistack-org/storage/internal/buildinfo"
 	"github.com/unistack-org/storage/pkg/client"
+	"github.com/unistack-org/storage/pkg/cpu"
 	"github.com/unistack-org/storage/pkg/meta"
 	"github.com/unistack-org/storage/pkg/nbd"
 	"github.com/unistack-org/storage/pkg/osd"
@@ -205,6 +207,8 @@ func main() {
 	vubQueues := flag.Int("vub-queues", 1, "vhost-user-blk request queues per export (num-queues)")
 	vubWorkers := flag.Int("vub-workers", 4, "vhost-user-blk concurrent in-flight requests per queue")
 	gogc := flag.Int("gogc", 0, "GOGC heap-growth percent (0 = runtime default 100; higher = fewer GC cycles, more memory)")
+	pinCPUs := flag.String("pin-cpus", "", "pin the daemon's main thread to this CPU set (Linux cpulist, e.g. \"0-7\"); threads created afterwards inherit the mask, so the whole process (rings, acceptors, GC) stays on the set — pair it with -gomaxprocs for NUMA locality; empty = scheduler default")
+	gomaxprocs := flag.Int("gomaxprocs", 0, "GOMAXPROCS (0 = runtime default = CPUs visible to the process); set it to the size of -pin-cpus so the Go scheduler never runs a worker on a CPU outside the set (cross-NUMA memory accesses)")
 	ballastMB := flag.Int("ballast-mb", 0, "steady-state ballast in MiB: a retained allocation that raises the live-heap floor so the GC runs proportionally less often")
 	pprofAddr := flag.String("pprof", "", "serve net/http/pprof on this address (e.g. :6061; empty = disabled)")
 	readWorkers := flag.Int("read-workers", 0, "max concurrent in-flight requests per NBD connection in structured-reply mode (0 = default 32)")
@@ -259,6 +263,22 @@ func main() {
 	}
 
 	logger := log.New(os.Stderr, "unistord: ", log.LstdFlags|log.Lmsgprefix)
+	if *pinCPUs != "" {
+		// Pinning the first thread shades the whole process: Linux
+		// sched_setaffinity masks are inherited by every thread the
+		// runtime creates afterwards (see pkg/cpu). A NUMA daemon
+		// wants this plus -gomaxprocs and the arena on the same node.
+		if _, perr := cpu.ParseCPUs(*pinCPUs); perr != nil {
+			logger.Printf("cpu: -pin-cpus %q invalid (%v): affinity left alone", *pinCPUs, perr)
+		} else if perr := cpu.PinCurrent(*pinCPUs); perr != nil {
+			logger.Printf("cpu: -pin-cpus %q: %v", *pinCPUs, perr)
+		}
+	}
+	if *gomaxprocs > 0 {
+		if n := runtime.GOMAXPROCS(*gomaxprocs); n != *gomaxprocs {
+			logger.Printf("sched: GOMAXPROCS %d -> %d", n, *gomaxprocs)
+		}
+	}
 
 	// -cluster was the original name of -meta-dir. It stays accepted (units
 	// and scripts in the field use it), but the canonical spelling is
