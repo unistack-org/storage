@@ -73,6 +73,7 @@ type Server struct {
 	conns   map[net.Conn]struct{}
 	opts    ServerOptions
 	ln      net.Listener
+	lns     []net.Listener
 	wg      sync.WaitGroup
 	closing bool
 }
@@ -155,14 +156,43 @@ func (s *Server) logf(format string, args ...any) {
 
 // Serve accepts connections on ln until Close is called.
 func (s *Server) Serve(ln net.Listener) error {
+	return s.ServeListeners([]net.Listener{ln})
+}
+
+// ServeListeners accepts on every listener, one goroutine each: with
+// SO_REUSEPORT sockets (sdsnet.ListenReusePort) the kernel spreads
+// connections over them by a flow hash, removing the single accept
+// queue and its lock — and letting each pinned worker group accept on
+// its own NUMA node. It returns nil when the server is closed and all
+// accept loops are done; the first non-closure accept error is kept.
+func (s *Server) ServeListeners(lns []net.Listener) error {
 	s.mu.Lock()
 	if s.ln != nil {
 		s.mu.Unlock()
 		return errors.New("nbd: server already serving")
 	}
-	s.ln = ln
+	s.ln = lns[0]
+	s.lns = lns
 	s.mu.Unlock()
 
+	var wg sync.WaitGroup
+	var errOnce sync.Once
+	var firstErr error
+	for _, ln := range lns {
+		wg.Add(1)
+		go func(ln net.Listener) {
+			defer wg.Done()
+			if err := s.acceptLoop(ln); err != nil {
+				errOnce.Do(func() { firstErr = err })
+			}
+		}(ln)
+	}
+	wg.Wait()
+	return firstErr
+}
+
+// acceptLoop is the per-listener accept loop of ServeListeners.
+func (s *Server) acceptLoop(ln net.Listener) error {
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
@@ -215,8 +245,10 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	}
 	s.closing = true
 	var lnErr error
-	if s.ln != nil {
-		lnErr = s.ln.Close()
+	for _, ln := range s.lns {
+		if e := ln.Close(); e != nil && lnErr == nil {
+			lnErr = e
+		}
 	}
 	s.mu.Unlock()
 
@@ -254,8 +286,8 @@ func (s *Server) Close() error {
 	}
 	s.closing = true
 	var errs []error
-	if s.ln != nil {
-		errs = append(errs, s.ln.Close())
+	for _, ln := range s.lns {
+		errs = append(errs, ln.Close())
 	}
 	for c := range s.conns {
 		errs = append(errs, c.Close())

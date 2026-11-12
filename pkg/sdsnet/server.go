@@ -108,12 +108,12 @@ type Server struct {
 	// elsewhere), and exit.
 	draining atomic.Bool
 
-	mu       sync.Mutex
-	listener net.Listener
-	closed   chan struct{}
-	closedF  bool
-	conns    map[net.Conn]*connLife
-	wg       sync.WaitGroup
+	mu        sync.Mutex
+	listeners []net.Listener
+	closed    chan struct{}
+	closedF   bool
+	conns     map[net.Conn]*connLife
+	wg        sync.WaitGroup
 }
 
 // connLife tracks whether a served connection is executing a request
@@ -177,13 +177,41 @@ func (s *Server) Serve(addr string) error {
 // cluster metadata, say — bind it themselves and use this, so the
 // advertised address is the one actually served.
 func (s *Server) ServeListener(ln net.Listener) error {
+	return s.ServeListeners([]net.Listener{ln})
+}
+
+// ServeListeners accepts on every listener in turn, one goroutine each:
+// with SO_REUSEPORT sockets (see ListenReusePort) the kernel spreads
+// connections over them, which removes the single accept-queue lock and
+// lets each pinned worker group accept on its own NUMA node. It returns
+// when the server is closed and all accept loops are done; the first
+// non-closure accept error is returned.
+func (s *Server) ServeListeners(lns []net.Listener) error {
 	s.mu.Lock()
-	s.listener = ln
+	s.listeners = lns
 	if s.closed == nil {
 		s.closed = make(chan struct{})
 	}
 	closed := s.closed
 	s.mu.Unlock()
+	var wg sync.WaitGroup
+	var errOnce sync.Once
+	var firstErr error
+	for _, ln := range lns {
+		wg.Add(1)
+		go func(ln net.Listener) {
+			defer wg.Done()
+			if err := s.acceptLoop(ln, closed); err != nil {
+				errOnce.Do(func() { firstErr = err })
+			}
+		}(ln)
+	}
+	wg.Wait()
+	return firstErr
+}
+
+// acceptLoop is the per-listener accept loop of ServeListeners.
+func (s *Server) acceptLoop(ln net.Listener, closed chan struct{}) error {
 	var wg sync.WaitGroup
 	for {
 		c, err := ln.Accept()
@@ -251,30 +279,34 @@ func (s *Server) ServeConn(c net.Conn) {
 	s.mu.Unlock()
 }
 
-// Addr returns the listen address (valid once Serve has started).
+// Addr returns the listen address (valid once Serve has started). With
+// several listeners (ServeListeners) they all share the address; the
+// first one answers.
 func (s *Server) Addr() string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.listener == nil {
+	if len(s.listeners) == 0 {
 		return ""
 	}
-	return s.listener.Addr().String()
+	return s.listeners[0].Addr().String()
 }
 
 // Close stops accepting and waits for per-connection goroutines. Call it
 // concurrently with Serve.
 func (s *Server) Close() error {
 	s.mu.Lock()
-	var err error
-	if s.listener != nil {
-		err = s.listener.Close()
-	}
 	if s.closed == nil {
 		s.closed = make(chan struct{})
 	}
 	if !s.closedF {
 		s.closedF = true
 		close(s.closed)
+	}
+	var err error
+	for _, ln := range s.listeners {
+		if e := ln.Close(); e != nil && err == nil {
+			err = e
+		}
 	}
 	// Close live connections: handlers blocked in Read must unblock,
 	// otherwise Close waits forever on idle/pooled clients.
@@ -306,8 +338,10 @@ func (s *Server) Shutdown(ctx context.Context) error {
 		close(s.closed)
 	}
 	var err error
-	if s.listener != nil {
-		err = s.listener.Close()
+	for _, ln := range s.listeners {
+		if e := ln.Close(); e != nil && err == nil {
+			err = e
+		}
 	}
 	s.mu.Unlock()
 	s.draining.Store(true)

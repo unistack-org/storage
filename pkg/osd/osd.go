@@ -72,6 +72,12 @@ type Options struct {
 	RingArenaSlots int
 	RingArenaSlot  int
 	RingHugePages  bool
+	// ReusePort binds N SO_REUSEPORT listeners on Addr and accepts on
+	// all of them: the kernel fans connections over the listeners by a
+	// flow hash, removing the single accept queue/lock. Pair with
+	// RingPinCPUs so each pinned worker group accepts on its own NUMA
+	// node. 0/1 keeps the single-listener behaviour.
+	ReusePort int
 	// Aggregate caps this disk (one store directory): every op from
 	// every client/export passes it before touching the store. This is
 	// the "limit iops on the NVMe" knob that keeps one volume from
@@ -153,14 +159,24 @@ func (d *Daemon) Run(ctx context.Context) error {
 	}
 	defer st.Close()
 
-	// Bind the listen socket up front (opts.Addr may use port 0) so the
+	// Bind the listen sockets up front (opts.Addr may use port 0) so the
 	// meta registration advertises the exact address we will serve on.
-	probe, err := net.Listen("tcp", d.opts.Addr)
+	// With ReusePort > 1 the sockets share the address via SO_REUSEPORT
+	// and the kernel load-balances connections over them.
+	limit := d.opts.ReusePort
+	if limit < 1 {
+		limit = 1
+	}
+	probes, err := sdsnet.ListenReusePort(d.opts.Addr, limit)
 	if err != nil {
 		return fmt.Errorf("osd: listen: %w", err)
 	}
-	defer probe.Close()
-	addr := probe.Addr().String()
+	defer func() {
+		for _, ln := range probes {
+			_ = ln.Close()
+		}
+	}()
+	addr := probes[0].Addr().String()
 
 	// Optional control-plane listener: the same sdsnet.Server serves it,
 	// so ping/StatFS answered there are identical to the data plane —
@@ -234,7 +250,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 
 	// Buffer for every listener's Serve error (data + optional ctrl).
 	serveErr := make(chan error, 2)
-	go func() { serveErr <- srv.ServeListener(probe) }()
+	go func() { serveErr <- srv.ServeListeners(probes) }()
 	if ctrlLn != nil {
 		go func() { serveErr <- srv.ServeListener(ctrlLn) }()
 	}

@@ -209,6 +209,7 @@ func main() {
 	gogc := flag.Int("gogc", 0, "GOGC heap-growth percent (0 = runtime default 100; higher = fewer GC cycles, more memory)")
 	pinCPUs := flag.String("pin-cpus", "", "pin the daemon's main thread to this CPU set (Linux cpulist, e.g. \"0-7\"); threads created afterwards inherit the mask, so the whole process (rings, acceptors, GC) stays on the set — pair it with -gomaxprocs for NUMA locality; empty = scheduler default")
 	gomaxprocs := flag.Int("gomaxprocs", 0, "GOMAXPROCS (0 = runtime default = CPUs visible to the process); set it to the size of -pin-cpus so the Go scheduler never runs a worker on a CPU outside the set (cross-NUMA memory accesses)")
+	reusePort := flag.Int("reuseport", 0, "bind N SO_REUSEPORT listeners for the NBD and every OSD data plane (Linux): the kernel fans connections over N accept queues (N per OSD), removing the single accept lock; pair with -ring-pin-cpu/-pin-cpus for per-node accepting; 0/1 = single listener")
 	ballastMB := flag.Int("ballast-mb", 0, "steady-state ballast in MiB: a retained allocation that raises the live-heap floor so the GC runs proportionally less often")
 	pprofAddr := flag.String("pprof", "", "serve net/http/pprof on this address (e.g. :6061; empty = disabled)")
 	readWorkers := flag.Int("read-workers", 0, "max concurrent in-flight requests per NBD connection in structured-reply mode (0 = default 32)")
@@ -562,6 +563,7 @@ func main() {
 			ringArena:     *ringArenaSlots,
 			ringArenaSz:   *ringArenaSlot,
 			ringHugepages: *ringHugePages,
+			reusePort:     *reusePort,
 			tlsDataSrv:    tlsDataServer,
 			tlsDataCli:    tlsDataClient,
 			disks:         disks,
@@ -695,7 +697,7 @@ func main() {
 		if admin != nil {
 			go admin.replayExports(ctx)
 		}
-		serve(ctx, logger, *listen, hub, nbd.ServerOptions{
+		serve(ctx, logger, *listen, *reusePort, hub, nbd.ServerOptions{
 			MaxConnections:    *maxConns,
 			MaxReadWorkers:    *readWorkers,
 			Logger:            logger,
@@ -769,7 +771,7 @@ func main() {
 		}()
 	}
 
-	serve(ctx, logger, *listen, nil, nbd.ServerOptions{
+	serve(ctx, logger, *listen, *reusePort, nil, nbd.ServerOptions{
 		MaxConnections:    *maxConns,
 		MaxReadWorkers:    *readWorkers,
 		Logger:            logger,
@@ -781,17 +783,17 @@ func main() {
 
 // serve runs the NBD server until ctx is cancelled. hub (nullable) is
 // bound to the server so the admin API can manage exports at runtime.
-func serve(ctx context.Context, logger *log.Logger, listen string, hub *exportHub, opts nbd.ServerOptions, es []*nbd.Export) {
+func serve(ctx context.Context, logger *log.Logger, listen string, reusePort int, hub *exportHub, opts nbd.ServerOptions, es []*nbd.Export) {
 	srv := nbd.NewServer(es, opts)
 	if hub != nil {
 		hub.setNBD(srv)
 	}
 
-	ln, err := net.Listen("tcp", listen)
+	lns, err := sdsnet.ListenReusePort(listen, reusePort)
 	if err != nil {
 		logger.Fatalf("listen %s: %v", listen, err)
 	}
-	logger.Printf("listening on %s", ln.Addr())
+	logger.Printf("listening on %s (%d listener(s))", lns[0].Addr(), len(lns))
 
 	go func() {
 		<-ctx.Done()
@@ -806,7 +808,7 @@ func serve(ctx context.Context, logger *log.Logger, listen string, hub *exportHu
 		}
 	}()
 
-	if err := srv.Serve(ln); err != nil && ctx.Err() == nil {
+	if err := srv.ServeListeners(lns); err != nil && ctx.Err() == nil {
 		logger.Fatalf("serve: %v", err)
 	}
 	// Drain the exports after the server stops: the store backend
@@ -862,6 +864,7 @@ type clusterParams struct {
 	ringArena     int              // OSD registered-buffer arena slots
 	ringArenaSz   int              // arena slot bytes
 	ringHugepages bool             // arena on huge pages
+	reusePort     int              // SO_REUSEPORT listeners per data plane
 	tlsDataSrv    *tls.Config      // OSD data plane server side (-tls-planes data; nil = plain)
 	tlsDataCli    *tls.Config      // client side for cluster pools (nil = plain)
 	disks         *diskRegistry    // hosted OSDs publish disk stats here (admin status)
@@ -961,6 +964,7 @@ func clusterBoot(ctx context.Context, p clusterParams) error {
 			RingArenaSlots: p.ringArena,
 			RingArenaSlot:  p.ringArenaSz,
 			RingHugePages:  p.ringHugepages,
+			ReusePort:      p.reusePort,
 			TLS:            p.tlsDataSrv,
 			Metrics:        p.metrics.osdServerMetrics(id),
 			Logf:           func(f string, a ...any) { p.logger.Printf("osd %d: %s", id, fmt.Sprintf(f, a...)) },
