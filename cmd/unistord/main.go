@@ -210,6 +210,8 @@ func main() {
 	pinCPUs := flag.String("pin-cpus", "", "pin the daemon's main thread to this CPU set (Linux cpulist, e.g. \"0-7\"); threads created afterwards inherit the mask, so the whole process (rings, acceptors, GC) stays on the set — pair it with -gomaxprocs for NUMA locality; empty = scheduler default")
 	gomaxprocs := flag.Int("gomaxprocs", 0, "GOMAXPROCS (0 = runtime default = CPUs visible to the process); set it to the size of -pin-cpus so the Go scheduler never runs a worker on a CPU outside the set (cross-NUMA memory accesses)")
 	reusePort := flag.Int("reuseport", 0, "bind N SO_REUSEPORT listeners for the NBD and every OSD data plane (Linux): the kernel fans connections over N accept queues (N per OSD), removing the single accept lock; pair with -ring-pin-cpu/-pin-cpus for per-node accepting; 0/1 = single listener")
+	writebackMB := flag.Int("writeback-mb", 0, "client-side writeback cache (vitastor-ideas §3.5) for volumes this daemon serves (NBD exports, -vduse/-vub, admin import/export jobs): MiB of dirty 4 KiB pages per volume, writes complete on memcpy and reach the OSDs in the background; 0 = off (every write goes to the replicas). A crash of THIS daemon loses unflushed pages, so enable it for guests whose OS journals and fsyncs (fsync = NBD FLUSH = -writeback flush); the cap is the writeback backpressure: a guest outrunning the OSDs is throttled when it fills")
+	writebackMS := flag.Int("writeback-ms", 500, "with -writeback-mb: background flush interval in milliseconds (how long a write may sit dirty before the flusher pushes it; Flush and Close always flush)")
 	ballastMB := flag.Int("ballast-mb", 0, "steady-state ballast in MiB: a retained allocation that raises the live-heap floor so the GC runs proportionally less often")
 	pprofAddr := flag.String("pprof", "", "serve net/http/pprof on this address (e.g. :6061; empty = disabled)")
 	readWorkers := flag.Int("read-workers", 0, "max concurrent in-flight requests per NBD connection in structured-reply mode (0 = default 32)")
@@ -700,6 +702,9 @@ func main() {
 			guard := newSSRFGuard(*importAllowPrivate, logger)
 			admin.importHTTP = &http.Client{Transport: guard.importTransport(), CheckRedirect: guard.checkRedirect, Timeout: 0}
 			admin.importMaxSize = int64(maxSize)
+			// The hub's exports, import/export jobs and runtime NBD
+			// exports all attach through the admin's cluster client.
+			admin.cluster().SetWriteback(int64(*writebackMB)<<20, time.Duration(*writebackMS)*time.Millisecond)
 			hub.setCluster(admin.cluster())
 			hub.setMetrics(mreg)
 			// Recovery runs started over the admin API feed the metrics
@@ -728,6 +733,7 @@ func main() {
 		// like admin-API exports.
 		bootCl := client.NewCluster(ms)
 		bootCl.SetPoolLimit(256)
+		bootCl.SetWriteback(int64(*writebackMB)<<20, time.Duration(*writebackMS)*time.Millisecond)
 		if tlsDataClient != nil {
 			bootCl.SetTLS(tlsDataClient)
 		}

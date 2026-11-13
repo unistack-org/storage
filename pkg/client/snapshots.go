@@ -81,6 +81,14 @@ func (v *Volume) Snapshot(ctx context.Context) (meta.SnapshotInfo, error) {
 // the vacuum. The volume's logical size never shrinks: blocks beyond
 // the frozen bitmap read as zeroes.
 func (v *Volume) Rollback(ctx context.Context, gen uint32) (meta.VolumeSpec, error) {
+	// Quiesce the writeback cache first: after the spec swap a cached
+	// page would be written into the new generation's ranges (wrong
+	// addressing) or into ranges the vacuum is about to free.
+	if v.wb != nil {
+		if err := v.wb.flushAll(ctx); err != nil {
+			return meta.VolumeSpec{}, fmt.Errorf("client: volume %q rollback to gen %d: flush: %w", v.spec.Name, gen, err)
+		}
+	}
 	spec, garbage, err := meta.RollbackVolume(ctx, v.cluster.meta, v.spec.Name, gen)
 	if err != nil {
 		return meta.VolumeSpec{}, fmt.Errorf("client: volume %q rollback to gen %d: %w", v.spec.Name, gen, err)

@@ -152,6 +152,39 @@ type Cluster struct {
 	// that prefer to observe degradation and decide for themselves.
 	// Atomic so the hot path (writeChunk/readChunk) reads it lock-free.
 	hardMode atomic.Bool
+
+	// Writeback cache defaults for volumes opened from now on
+	// (SetWriteback, ideas §3.5). Guarded by mu; a volume captures the
+	// settings at OpenVolume, so changing them never disturbs an open
+	// handle (the guest's durability contract must not move mid-life).
+	wbMaxBytes int64
+	wbEvery    time.Duration
+}
+
+// SetWriteback enables the client-side writeback cache for volumes
+// opened after this call (the Vitastor client_enable_writeback
+// analogue): WriteAt copies into a per-volume 4 KiB page cache and
+// completes immediately, the replicas are written in the background and
+// Flush is the fsync. maxBytes <= 0 (the default) keeps writes
+// synchronous. Durability contract: a crash of THIS client process
+// loses unflushed writes, so the cache is opt-in per client — enable it
+// for latency-hungry guests (a filesystem inside the VM journals and
+// fsyncs, and its fsync maps to Flush), leave it off for clients that
+// treat every write as durable. maxBytes caps dirty data per volume
+// (write pressure: when full, the flusher is awaited), every bounds the
+// background flush interval (0 = 500ms).
+func (c *Cluster) SetWriteback(maxBytes int64, every time.Duration) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.wbMaxBytes = maxBytes
+	c.wbEvery = every
+}
+
+// Writeback reports the current SetWriteback defaults.
+func (c *Cluster) Writeback() (int64, time.Duration) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.wbMaxBytes, c.wbEvery
 }
 
 // SetRefreshInterval overrides the placement refresh interval. The
@@ -1198,6 +1231,13 @@ func (c *Cluster) OpenVolume(ctx context.Context, name string) (*Volume, error) 
 	// volume's spec (SetVolumeQoS, or a class edit) is picked up on the
 	// already-open handle without a remount.
 	v.startQoSWatch()
+	// Opt-in writeback cache (SetWriteback): captured at open time.
+	if wbMax, wbEvery := c.Writeback(); wbMax > 0 {
+		if wbEvery <= 0 {
+			wbEvery = 500 * time.Millisecond
+		}
+		v.wb = newWriteback(v, wbMax, wbEvery)
+	}
 	return v, nil
 }
 
@@ -1353,6 +1393,11 @@ type Volume struct {
 	batchClosed   bool
 	batchWG       sync.WaitGroup
 	batchDisabled atomic.Bool
+
+	// wb is the optional writeback cache (Cluster.SetWriteback, ideas
+	// §3.5); nil on volumes opened while the cache is off. Immutable
+	// after OpenVolume, so it needs no locking.
+	wb *writeback
 }
 
 // SetQoS replaces the volume's limits at runtime (admin
@@ -1408,12 +1453,16 @@ func (v *Volume) Close() error {
 		v.stopQoSWatch()
 	}
 	v.closeBatchers()
+	var wbErr error
+	if v.wb != nil {
+		wbErr = v.wb.Close() // flush what the guest never fsynced
+	}
 	v.mu.Lock()
 	lim := v.limits
 	v.limits = nil
 	v.mu.Unlock()
 	lim.Close() // nil-safe
-	return nil
+	return wbErr
 }
 
 // Spec returns the volume's registered spec.
@@ -1679,6 +1728,9 @@ func (v *Volume) ReadAt(ctx context.Context, p []byte, off uint64) (int, error) 
 		if err := v.readChunk(ctx, p[total:total+n], index, inObj); err != nil {
 			return total, err
 		}
+		if v.wb != nil {
+			v.wb.overlay(p[total:total+n], cur) // read-your-writes
+		}
 		total += n
 	}
 	return total, nil
@@ -1848,6 +1900,15 @@ func (v *Volume) WriteAt(ctx context.Context, p []byte, off uint64) (int, error)
 			}
 			return 0, err
 		}
+	}
+	if v.wb != nil {
+		// Writeback path: report a previous background flush error once,
+		// then take the data into the page cache. QoS was charged above,
+		// so the guest stays rate-limited with the cache on.
+		if err := v.wb.takeErr(); err != nil {
+			return 0, err
+		}
+		return v.wb.submit(ctx, off, p)
 	}
 	total := 0
 	for total < len(p) {
@@ -2245,6 +2306,14 @@ func (v *Volume) WriteZeroes(ctx context.Context, off, n uint64, sparse bool) er
 	if size := v.Size(); off+n > size {
 		return fmt.Errorf("client: write zeroes at %d len %d past volume end %d", off, n, size)
 	}
+	// Discards go straight to the OSDs, so first push out the writeback
+	// cache: a background flush crossing a trim would rewrite zeroes
+	// with stale data.
+	if v.wb != nil {
+		if err := v.wb.flushAll(ctx); err != nil {
+			return err
+		}
+	}
 	if lim := v.limitsSnapshot(); lim != nil {
 		// Discard is coarse (a guest FITRIM can span the whole volume in
 		// one op); it charges the write axis as one op.
@@ -2297,8 +2366,15 @@ func (v *Volume) WriteZeroes(ctx context.Context, off, n uint64, sparse bool) er
 }
 
 // Flush syncs every OSD the volume may touch (cluster-wide sync: cheap
-// and correct for MVP; per-pg sync is a later optimization).
+// and correct for MVP; per-pg sync is a later optimization). With the
+// writeback cache on, Flush is the guest's fsync: dirty pages reach the
+// replicas (with their per-replica fdatasync) before the call returns.
 func (v *Volume) Flush(ctx context.Context) error {
+	if v.wb != nil {
+		if err := v.wb.flushAll(ctx); err != nil {
+			return err
+		}
+	}
 	snap, err := v.cluster.Refresh(ctx)
 	if err != nil {
 		return err
