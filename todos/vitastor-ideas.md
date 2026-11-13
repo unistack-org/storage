@@ -404,6 +404,12 @@ randread QD128: 41.6K против их 128K (×3). Their bottleneck = CPU + с�
       **резервирование места в журнале под commit**, пиннинг ISA-L
       (2.31 = порча данных) или свой Reed-Solomon с golden-векторами.
       `[2.4.x, 3.x]`
+      → **Разобрано по исходникам и git-истории Vitastor (v3.2.3, 122
+      EC-коммита 2019–2026): план, фазы E0–E6 и оценка — `todos/plan-ec.md`**.
+      Там же каталог их EC-проблем по классам: bitmap/parity corruption
+      (ISA-L 2.31, end-of-file RMW #116, degraded writes), зависания в
+      REPEERING/STOPPING, ENOSPC, peering-версии (правило «full set»),
+      rebalance × partial write, EC+снапшоты (#92 — 5 лет).
 - [x] **7.4 QoS и квоты** (per-volume IOPS/BPS лимиты) — сделано: per-volume
       лимиты IOPS/BPS (shared-бакет, sustained-рейты в метриках), квоты тома
       (soft/hard) с ENOSPC-семантикой при переполнении; управление
