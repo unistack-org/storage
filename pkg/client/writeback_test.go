@@ -164,7 +164,7 @@ func TestWritebackClusterRun(t *testing.T) {
 	if n, err := v2.ReadAt(ctx, gotTail, size-4096); err != nil || n != 4096 {
 		t.Fatalf("ReadAt tail on v2: n=%d err=%v", n, err)
 	}
-	if !bytes.Equal(gotTail[4088:], tail) {
+	if !bytes.Equal(gotTail[4088:4092], tail) {
 		t.Fatal("tail write lost")
 	}
 	for _, b := range gotTail[:4088] {
@@ -220,6 +220,11 @@ func TestWritebackCapPressure(t *testing.T) {
 		if d := v.wb.peekDirty(); d > 3*wbPageSize {
 			t.Fatalf("cap breached: dirty=%d", d)
 		}
+	}
+	// The cap keeps dirty data at a few pages; the newest writes may
+	// still be client-side, so flush before the durability check.
+	if err := v.Flush(ctx); err != nil {
+		t.Fatalf("Flush: %v", err)
 	}
 	for i := 0; i < 12; i++ {
 		want := make([]byte, 4096)

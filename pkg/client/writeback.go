@@ -125,6 +125,7 @@ func (wb *writeback) recordErr(err error) {
 	}
 	wb.mu.Unlock()
 }
+
 // objAt returns the live cache entry of an object, creating it and
 // moving it to the LRU tail. Callers must hold wb.mu.
 func (wb *writeback) objAt(index uint64) *wbObj {

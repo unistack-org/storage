@@ -214,10 +214,14 @@ randread QD128: 41.6K против их 128K (×3). Their bottleneck = CPU + с�
       (pipelined: writer-горутина батчит кадры, reader сопоставляет по seq,
       окно backpressure, ctx/дедлайны на оп, protocol-ошибки не убивают
       стрим); приём через io_uring — `store.Options.AsyncRing` (см. §1). `[3.0.x]`
-- [ ] **3.5 Клиентский writeback-буфер** (`pkg/client`) — `client_enable_writeback`.
-      Важно и для честности бенча: без writeback их rep3-запись падает до
-      3.4K IOPS QD32, а наш hard-режим сравнивать с их writeback-режимом
-      некорректно → в бенче прогонять оба режима. `[3.0.x]`
+- [x] **3.5 Клиентский writeback-буфер** (`pkg/client`) — сделано:
+      4KiB-страничный кэш в клиенте (`Cluster.SetWriteback`, unistord
+      `-writeback-mb`/`-writeback-ms`, опт-ин как
+      `client_enable_writeback`), read-your-writes оверлей при чтении,
+      сливание соседних страниц в один run, фоновый flush по таймеру,
+      backpressure по cap, Flush = fsync, Close/Zeroes/Snapshot/
+      Rollback сначала выталкивают кэш. Честность бенча: в bench-stand
+      прогонять оба режима (с и без writeback). `[3.0.x]`
 - [ ] **3.6 `cpubench`-аналог** (`storage/bench/cpubench`) — цена чексумм и
       шифрования на ядро: у них xxhash3 1M ≈ 104 GB/s, AES-XTS+GCM
       ≈ 12.6 GB/s на EPYC. Без этого числа нельзя включать csum/шифрование
