@@ -517,6 +517,23 @@
       probe, floor, публикация epoch+зеркало, dry-run ничего не пишет,
       повторный проход = no-op. LP-солвера нет — осознанно (CRUSH
       минимизирует movement по построению).
+- [x] **Drain/rm OSD** (аналог Vitastor-процедуры `modify-osd --reweight 0`
+      → recovery → `vitastor-disk purge`; у них отдельной команды drain нет,
+      это ручная последовательность): `unistorctl osd drain <id>` — оркестратор
+      одной командой: `osd out` (вес 0) → один проход `rebalance` (освободившееся
+      место распределяется по free-space) → цикл `recovery ls`/`run` до healthy
+      (или `-timeout`, по умолчанию 10m; неоткрываемый том = pseudo-отчёт →
+      выход с ошибкой, recovery его не починит) → по `-rm` удаление из реестра.
+      Флаги: `-iops`/`-bps` (темп recovery, по умолчанию 200 iops / 200M/s,
+      write-lane `qos.NewPair(0,0,iops,bps)`), `-dry-run` (показать план
+      rebalance+recovery, ничего не писать). `unistorctl osd rm <id>` — guard:
+      отказ при `weight != 0` (нельзя выкинуть из реестра OSD, который ещё в
+      placement — реплики «потеряются» без переноса), при weight 0 —
+      `meta.RemoveOSD` (`s.Delete(PrefixOSDs, id, -1)`, паттерн `DeleteVolume`).
+      Caveat: OSD при старте сам перечитывает запись из меты (сохраняя вес и
+      UUID) → `rm` только для остановленного OSD, иначе перерегистрируется.
+      Тесты: `pkg/meta` `TestRemoveOSD` (missing → ErrNotFound; Put→Remove→
+      Get ErrNotFound→ListOSDs пуст).
 - [x] Первый сравнительный отчёт против Vitastor 3.2.3 на общем стенде
       (unibench, 2×P4510 RAID1 — диск здоров, хост шумит LLM-инференсом):
       `todos/bench-stand.md`.
@@ -531,7 +548,7 @@
 
 ## Фаза 5b — Надёжность, безопасность, наблюдаемость (по урокам Vitastor)
 
-> Статус (2026-11-09): закрыто ядро Ops: HTTP API+OpenAPI, CLI-оболочка, status/healthcheck, метрики, TLS, commit-режимы, SIGTERM-дрейн, онлайн-resize, import/export по HTTP, пообъектный recovery; закрыто разделение control/data сетей OSD (2026-11-11). Открыто: хаос-CI с сидами, каталог багов-инвариантов, Grafana-дашборд, авторегулирование recovery, авто-детект параметров тома.
+> Статус (2026-11-09): закрыто ядро Ops: HTTP API+OpenAPI, CLI-оболочка, status/healthcheck, метрики, TLS, commit-режимы, SIGTERM-дрейн, онлайн-resize, import/export по HTTP, пообъектный recovery; закрыто разделение control/data сетей OSD (2026-11-11); drain/rm OSD (`osd drain`/`osd rm`, 2026-11). Открыто: хаос-CI с сидами, каталог багов-инвариантов, Grafana-дашборд, авторегулирование recovery, авто-детект параметров тома.
 
 Источник: полный разбор их ченджлогов 0.5.x → 3.2.3 и доклада Highload'2025 —
 `todos/vitastor-ideas.md` (там же нумерация §, релиз-источник каждой позиции и

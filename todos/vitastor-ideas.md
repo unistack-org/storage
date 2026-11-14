@@ -18,6 +18,7 @@
 | Идея Vitastor | Наш статус |
 |---|---|
 | `pg_minsize` / `osd_out_time` / `noout` [1.5.0, 2.3.x] | ✅ Phase 5: `min_size` (W=min_size, `ErrDegraded` fast-fail), `out_time` 600 с + prober, evict → weight 0 |
+| Drain/удаление OSD (у них процедура `modify-osd --reweight 0` → recovery → `vitastor-disk purge`, отдельной команды нет) | ✅ `unistorctl osd drain <id>` (out + rebalance + recovery до healthy, `-rm`/`-dry-run`/`-iops`/`-bps`/`-timeout`) + `osd rm <id>` (guard: только при weight 0) |
 | Failure-domain пресеты (rack/DC) [2.3.x] | ✅ `RackAwareRep3`, `EC2Plus2AcrossDCs`, `DCPreferred` |
 | «Hard» семантика записи (клиент ждёт кворум) | ✅ есть; «soft» (writeback) — нет, см. §4.1 |
 | Zero-alloc data path [у них 0 allocs нет как цель] | ✅ гейты 0 allocs/op на NBD и sdsnet; у них этого гейта нет — наше преимущество |
@@ -370,7 +371,9 @@ randread QD128: 41.6K против их 128K (×3). Their bottleneck = CPU + с�
       + ценз PG-таблицы: full/degraded/down; dump `-format
       raw|text|json|yaml|binary` — реинкодинг между форматами, текстовый
       энкодер написан у нас в pkg/placement, т.к. crushkv его не даёт),
-      `osd add/out/in/ls` (out = weight 0, без перевыпуска мапы),
+      `osd add/out/in/ls/rm/drain` (out = weight 0, без перевыпуска мапы;
+      rm = удаление из реестра, guard weight 0; drain = out + rebalance +
+      recovery до healthy, `-rm`/`-dry-run`),
       `vacuum ls/run` (пер-томный вакуум), `recovery ls/check/run`
       (пообъектный recovery). Осталось: `pg-list`, `raw-ls`, **kv-rescue**
       (дамп блоков меты в обход структуры). `[3.x]`

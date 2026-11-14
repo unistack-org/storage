@@ -211,6 +211,30 @@ func TestRecordsRoundTrip(t *testing.T) {
 	}
 }
 
+func TestRemoveOSD(t *testing.T) {
+	s := openStore(t)
+	ctx := context.Background()
+
+	if err := RemoveOSD(ctx, s, 7); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("RemoveOSD missing = %v, want ErrNotFound", err)
+	}
+
+	info := OSDInfo{ID: 7, Addr: "127.0.0.1:8007", UUID: "u7", Weight: 0}
+	if _, err := PutOSD(ctx, s, info); err != nil {
+		t.Fatal(err)
+	}
+	if err := RemoveOSD(ctx, s, 7); err != nil {
+		t.Fatalf("RemoveOSD: %v", err)
+	}
+	if _, err := GetOSD(ctx, s, 7); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("GetOSD after remove = %v, want ErrNotFound", err)
+	}
+	osds, err := ListOSDs(ctx, s)
+	if err != nil || len(osds) != 0 {
+		t.Fatalf("ListOSDs after remove = %+v, %v", osds, err)
+	}
+}
+
 // Stop must make the store forget the watcher: a Put after Stop used to
 // deliver into a closed events channel and panic the writer.
 func TestWatchStopThenPut(t *testing.T) {

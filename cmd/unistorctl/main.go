@@ -20,6 +20,8 @@
 //	qos put     <class> <riops:rbps:wiops:wbps>
 //	qos rm      <class>
 //	osd ls | out <id> | in <id> [-weight w]      (registry weight; 0 = out of placement)
+//	osd rm <id>                                   (delete the record; refused while weight > 0)
+//	osd drain <id> [-rm] [-iops N] [-bps S] [-timeout D] [-dry-run]  (out + rebalance + recovery + optional rm)
 //	osd add <id> <addr> [-data P] [-uuid U] [-device D]  (register an osd record by hand)
 //	map dump [-format raw|text|json|yaml|binary]  (latest crush map epoch; raw = as stored)
 //	map check   [file] [-pg-num n] [-replicas n] [-rule r] [-class ssd|hdd]  (compile + pg census + class validators)
@@ -62,6 +64,7 @@ import (
 	"github.com/unistack-org/storage/pkg/object"
 	"github.com/unistack-org/storage/pkg/placement"
 	"github.com/unistack-org/storage/pkg/qos"
+	"github.com/unistack-org/storage/pkg/rebalance"
 	"github.com/unistack-org/storage/pkg/store"
 	"github.com/unistack-org/storage/pkg/tlsconf"
 	"sigs.k8s.io/yaml"
@@ -126,7 +129,7 @@ func dispatch(ctx context.Context, cl *client.Cluster, ms meta.Store, args []str
 	case "qos":
 		return qosCmd(ctx, cl, args[1:])
 	case "osd":
-		return osdCmd(ctx, ms, args[1:])
+		return osdCmd(ctx, cl, ms, args[1:])
 	case "map":
 		return mapCmd(ctx, cl, ms, args[1:])
 	case "vacuum":
@@ -825,14 +828,18 @@ func qosCmd(ctx context.Context, cl *client.Cluster, args []string) error {
 // normal path is the OSD self-registering at startup — this is the
 // operator's rescue tool), "osd out <id>" sets weight 0 (the OSD leaves
 // placement: rows are rebuilt without it, its data needs recovery
-// elsewhere), "osd in <id> [-weight w]" brings it back. The registry is
-// what placement compiles pg rows from, so the change takes effect on
-// every client's next map refresh; publishing a fresh map epoch is not
-// required (it only moves the fence).
-func osdCmd(ctx context.Context, ms meta.Store, args []string) error {
+// elsewhere), "osd in <id> [-weight w]" brings it back, "osd rm <id>"
+// deletes the record from the registry (the Vitastor rm-osd equivalent;
+// refused while the OSD still has weight > 0), and "osd drain <id>"
+// orchestrates the full out-of-service procedure (out, rebalance,
+// recovery until healthy, optional rm). The registry is what placement
+// compiles pg rows from, so the change takes effect on every client's
+// next map refresh; publishing a fresh map epoch is not required (it
+// only moves the fence).
+func osdCmd(ctx context.Context, cl *client.Cluster, ms meta.Store, args []string) error {
 	if len(args) == 0 {
 		usage()
-		return errors.New("osd: subcommand required (ls | add <id> <addr> [-device D] | out <id> | in <id> [-weight w])")
+		return errors.New("osd: subcommand required (ls | add <id> <addr> [-device D] | out <id> | in <id> [-weight w] | rm <id> | drain <id>)")
 	}
 	switch args[0] {
 	case "add":
@@ -889,10 +896,32 @@ func osdCmd(ctx context.Context, ms meta.Store, args []string) error {
 			fmt.Printf("osd %d: weight %g — back in placement; rebuild data (`recovery run`) before trusting it alone\n", id, w)
 		}
 		return nil
+	case "rm":
+		if len(args) < 2 {
+			return errors.New("osd rm: <id>")
+		}
+		id, err := strconv.ParseInt(args[1], 10, 32)
+		if err != nil {
+			return fmt.Errorf("osd rm: bad id %q", args[1])
+		}
+		info, err := meta.GetOSD(ctx, ms, int32(id))
+		if err != nil {
+			return err
+		}
+		if info.Weight != 0 {
+			return fmt.Errorf("osd %d: weight %g — drain it first (`osd drain %d` or `osd out %d` + `recovery run`); removing a live osd from the registry loses its replicas without moving them", id, info.Weight, id, id)
+		}
+		if err := meta.RemoveOSD(ctx, ms, int32(id)); err != nil {
+			return err
+		}
+		fmt.Printf("osd %d: removed from the registry\n", id)
+		return nil
+	case "drain":
+		return osdDrain(ctx, cl, ms, args[1:])
 	case "ls":
 	default:
 		usage()
-		return fmt.Errorf("osd: unknown subcommand %q (ls | out <id> | in <id>)", args[0])
+		return fmt.Errorf("osd: unknown subcommand %q (ls | out <id> | in <id> | rm <id> | drain <id>)", args[0])
 	}
 	infos, err := meta.ListOSDs(ctx, ms)
 	if err != nil {
@@ -911,6 +940,164 @@ func osdCmd(ctx context.Context, ms meta.Store, args []string) error {
 		fmt.Printf("map epoch=%d\n", rec.Epoch)
 	} else {
 		fmt.Printf("map: %v\n", mapErr)
+	}
+	return nil
+}
+
+// osdDrain runs the full "take an OSD out of service" procedure in one
+// command (the Vitastor drain procedure as a tool):
+//
+//	osd drain <id> [-rm] [-iops N] [-bps S] [-timeout D] [-dry-run]
+//
+//  1. weight 0 (the OSD leaves placement; its replicas become
+//     recoverable elsewhere),
+//  2. one rebalance pass (the freed weight is spread over the rest,
+//     so the drained OSD's data is pulled off it),
+//  3. recovery until the scan is healthy (or -timeout),
+//  4. with -rm: delete the registry record (only when healthy).
+//
+// -dry-run does step 1 for real (it is the point of the command) but
+// only prints the rebalance plan and the recovery plan instead of
+// executing them.
+func osdDrain(ctx context.Context, cl *client.Cluster, ms meta.Store, args []string) error {
+	fs := flag.NewFlagSet("osd drain", flag.ExitOnError)
+	rm := fs.Bool("rm", false, "delete the osd record after recovery is healthy")
+	iops := fs.Uint64("iops", 200, "recovery write iops limit")
+	bps := fs.String("bps", "200M", "recovery write bps limit (K/M/G suffixes)")
+	timeout := fs.Duration("timeout", 10*time.Minute, "give up waiting for recovery after this long")
+	dryRun := fs.Bool("dry-run", false, "print the rebalance and recovery plans, execute nothing")
+	parseMix(fs, args)
+	if fs.NArg() != 1 {
+		return errors.New("osd drain: <id>")
+	}
+	id, err := strconv.ParseInt(fs.Arg(0), 10, 32)
+	if err != nil {
+		return fmt.Errorf("osd drain: bad id %q", fs.Arg(0))
+	}
+	bpsVal, err := sizeSuffix(*bps)
+	if err != nil {
+		return fmt.Errorf("osd drain: bad -bps %q", *bps)
+	}
+	if _, err := meta.GetOSD(ctx, ms, int32(id)); err != nil {
+		return err
+	}
+
+	// 1. Out of placement.
+	if err := meta.SetOSDWeight(ctx, ms, int32(id), 0); err != nil {
+		return err
+	}
+	fmt.Printf("osd %d: weight 0 — out of placement\n", id)
+
+	// 2. Rebalance the freed weight over the rest.
+	rep, err := rebalance.New(cl, rebalance.Options{DryRun: *dryRun}).Once(ctx)
+	if err != nil {
+		return fmt.Errorf("rebalance: %w", err)
+	}
+	if *dryRun {
+		fmt.Printf("rebalance (dry-run): %d change(s), %d probe failure(s), %d eligible\n", len(rep.Changes), rep.ProbeFail, rep.Eligible)
+		for _, c := range rep.Changes {
+			fmt.Printf("  osd %d: weight %.3f -> %.3f\n", c.OSD, c.Current, c.Target)
+		}
+	} else {
+		fmt.Printf("rebalance: %d change(s), %d probe failure(s), %d eligible, map epoch %d -> %d\n", len(rep.Changes), rep.ProbeFail, rep.Eligible, rep.Epoch, rep.NewEpoch)
+		for _, c := range rep.Changes {
+			fmt.Printf("  osd %d: weight %.3f -> %.3f\n", c.OSD, c.Current, c.Target)
+		}
+	}
+
+	// 3. Recover until healthy (or timeout).
+	deadline := time.Now().Add(*timeout)
+	if *dryRun {
+		reps, err := cl.RecoveryScan(ctx)
+		if err != nil {
+			return err
+		}
+		printRecoveryScan(reps)
+		fmt.Println("dry-run: recovery not executed")
+	} else {
+		for {
+			reps, err := cl.RecoveryScan(ctx)
+			if err != nil {
+				return err
+			}
+			printRecoveryScan(reps)
+			if allHealthy(reps) {
+				break
+			}
+			if time.Now().After(deadline) {
+				return fmt.Errorf("osd %d: recovery not healthy within %v", id, *timeout)
+			}
+			if err := recoverScan(ctx, cl, reps, *iops, bpsVal); err != nil {
+				return err
+			}
+		}
+	}
+
+	// 4. Optional removal.
+	if *rm {
+		if !*dryRun {
+			if err := meta.RemoveOSD(ctx, ms, int32(id)); err != nil {
+				return err
+			}
+			fmt.Printf("osd %d: removed from the registry\n", id)
+		} else {
+			fmt.Printf("osd %d: would be removed from the registry (dry-run)\n", id)
+		}
+	}
+	return nil
+}
+
+// allHealthy reports whether every volume in a scan report is healthy.
+func allHealthy(reps []client.RecoveryReport) bool {
+	for _, r := range reps {
+		if !r.Healthy() {
+			return false
+		}
+	}
+	return true
+}
+
+// printRecoveryScan renders a scan report the way `recovery ls` does.
+func printRecoveryScan(reps []client.RecoveryReport) {
+	if len(reps) == 0 {
+		fmt.Println("recovery: no volumes")
+		return
+	}
+	fmt.Printf("%-24s %8s %6s %6s %9s %-12s %s\n",
+		"VOLUME", "OBJECTS", "OK", "THIN", "TO_REPAIR", "DOWN", "HEALTHY")
+	for _, r := range reps {
+		fmt.Printf("%-24s %8d %6d %6d %9d %-12d %t\n",
+			r.Volume, r.Objects, r.Ok, r.Thin, len(r.Items), r.Down, r.Healthy())
+	}
+}
+
+// recoverScan recovers every unhealthy volume in a scan report, the
+// same way `recovery run` does (open, Recover, close). A pseudo-report
+// (OSD -1) means the volume could not be opened at all — that is an
+// error, not something to loop on.
+func recoverScan(ctx context.Context, cl *client.Cluster, reps []client.RecoveryReport, iops, bps uint64) error {
+	for i := range reps {
+		rep := &reps[i]
+		if rep.Healthy() {
+			continue
+		}
+		if len(rep.Items) > 0 && rep.Items[0].OSD < 0 {
+			return fmt.Errorf("volume %s: could not be opened (pseudo-report)", rep.Volume)
+		}
+		v, err := cl.OpenVolume(ctx, rep.Volume)
+		if err != nil {
+			return fmt.Errorf("open %s: %w", rep.Volume, err)
+		}
+		limit := qos.NewPair(0, 0, iops, bps)
+		st, err := v.Recover(ctx, rep, client.RecoveryOpts{Limit: limit})
+		limit.Close()
+		if err != nil {
+			v.Close()
+			return fmt.Errorf("recover %s: %w", rep.Volume, err)
+		}
+		v.Close()
+		fmt.Printf("  %s: copied %d (%s), failed %d, skipped %d\n",
+			rep.Volume, st.Copied, humanSize(st.Bytes), st.Failed, st.Skipped)
 	}
 	return nil
 }
@@ -1545,7 +1732,7 @@ vol snap create <name> | vol snap ls <name> | vol snap rm <name> <gen> | vol sna
 pool create <name> [-replicas n] [-min-size n] [-pg-num n] [-rule r] [-qos class]  (cluster-wide placement policy; volumes created in it inherit it)
 pool ls | pool rm <name>  (rm is refused while volumes reference the pool)
 qos ls | qos put <class> <riops:rbps:wiops:wbps> | qos rm <class>
-osd ls | osd add <id> <addr> [-data P] [-uuid U] [-device D] | osd out <id> | osd in <id> [-weight w]   (weight 0 = out of placement)
+osd ls | osd add <id> <addr> [-data P] [-uuid U] [-device D] | osd out <id> | osd in <id> [-weight w] | osd rm <id> | osd drain <id> [-rm] [-iops N] [-bps S] [-timeout D] [-dry-run]   (weight 0 = out of placement; drain = out + rebalance + recovery + optional rm)
 map dump [-format raw|text|json|yaml|binary] | map check [file] [-pg-num n] [-replicas n] [-rule r] | map publish <file> [-epoch n] [-force] [-pg-num n] [-replicas n] [-rule r] | map reweight <id> <w>
 vacuum [ls|run [vol]]  (M1.4: free deleted volumes' objects; run <vol> = targeted tombstone, live volume = punch out all-zero objects)
 recovery ls | recovery check <vol> | recovery run <vol> [-iops N] [-bps B]

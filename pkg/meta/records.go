@@ -248,6 +248,14 @@ func SetOSDWeight(ctx context.Context, s Store, id int32, w float64) error {
 	return err
 }
 
+// RemoveOSD deletes an OSD record from the registry (the Vitastor
+// rm-osd equivalent). Callers must drain the OSD first (weight 0, data
+// moved off); a running OSD re-registers itself on restart and would
+// undo the deletion.
+func RemoveOSD(ctx context.Context, s Store, id int32) error {
+	return s.Delete(ctx, PrefixOSDs, strconv.FormatInt(int64(id), 10), -1)
+}
+
 // ListOSDs reads every registered OSD, sorted by id.
 func ListOSDs(ctx context.Context, s Store) ([]OSDInfo, error) {
 	keys, err := s.List(ctx, PrefixOSDs)
