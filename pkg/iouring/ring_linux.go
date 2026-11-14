@@ -24,8 +24,10 @@ const (
 
 	iosqeFixedFile = 1 << 0 // SQE flags: fd indexes the fixed-file table
 
-	registerFiles   = 0 // IORING_REGISTER_FILES: int32 fd array
-	registerBuffers = 2 // IORING_REGISTER_BUFFERS: iovec array
+	registerBuffers   = 0 // IORING_REGISTER_BUFFERS: iovec array
+	unregisterBuffers = 1 // IORING_UNREGISTER_BUFFERS
+	registerFiles     = 2 // IORING_REGISTER_FILES: int32 fd array
+	unregisterFiles   = 3 // IORING_UNREGISTER_FILES
 
 	enterGetevents = 1 << 0
 
@@ -564,7 +566,7 @@ func (r *uring) RegisterFile(fd int32, f *os.File) {
 	}
 	r.fileSlots[fd] = slot
 	r.fixedFiles[slot-1] = fd
-	if err := r.registerSyscall(registerFiles, r.fixedFiles); err != nil {
+	if err := r.swapTable(unregisterFiles, registerFiles, r.fixedFiles, nil); err != nil {
 		// Fixed files unavailable (old/locked-down kernel): plain
 		// opcodes remain correct, so degrade permanently.
 		r.fixedOK.Store(false)
@@ -585,7 +587,11 @@ func (r *uring) UnregisterFile(fd int32) {
 	}
 	delete(r.fileSlots, fd)
 	r.fixedFiles[slot-1] = -1
-	if err := r.registerSyscall(registerFiles, r.fixedFiles); err != nil {
+	// Republish the table with the slot hole: UNREG then full REG.
+	// If that empties the table swapTable does a pure UNREG, which
+	// leaves the kernel table empty (no ENXIO surprise on the next
+	// RegisterFile).
+	if err := r.swapTable(unregisterFiles, registerFiles, r.fixedFiles, nil); err != nil {
 		r.fixedOK.Store(false)
 	}
 	// Drop the keep-alive reference only from the kernel side; the
@@ -607,7 +613,7 @@ func (r *uring) RegisterBuffer(data []byte) (int, error) {
 	r.bufs = append(r.bufs, data)
 	all := r.bufs
 	r.bufMu.Unlock()
-	if err := r.registerSyscall(registerBuffers, all); err != nil {
+	if err := r.swapTable(unregisterBuffers, registerBuffers, nil, all); err != nil {
 		r.bufMu.Lock()
 		r.bufs = all[:len(all)-1]
 		r.bufMu.Unlock()
@@ -633,13 +639,47 @@ func (r *uring) UnregisterBuffer(index int) {
 	r.bufs = next
 	all := r.bufs
 	r.bufMu.Unlock()
-	if err := r.registerSyscall(registerBuffers, all); err != nil {
+	if err := r.swapTable(unregisterBuffers, registerBuffers, nil, all); err != nil {
 		r.fixedOK.Store(false)
 	}
 }
 
-// registerSyscall replaces the kernel's files/buffers table. Callers
-// hold producerMu (registration serialises with SQE production).
+// swapTable atomically — from the ring's point of view — replaces the
+// kernel's fixed-files (files != nil) or fixed-buffers (bufs != nil)
+// table. The kernel refuses a plain REGISTER over a non-empty table
+// (EBUSY), so the protocol is UNREGISTER first, then a full REGISTER of
+// the new table. Two invariants make this safe for in-flight I/O:
+//
+//   - In-flight fixed ops hold the kernel's own reference to the
+//     file/buffer they were submitted against (the kernel pins at
+//     submission), so unregistering our registration does not disturb
+//     them; they complete against their snapshot.
+//   - This runs under producerMu, the same lock the sole SQE-filler
+//     (ringSubmit) takes. No SQE can be produced between the UNREG and
+//     the REG, and a caller's fixed slot is validated against the Go
+//     table under that same lock, so a slot can never be validated
+//     against one table and submitted against another.
+//
+// An UNREGISTER against an already-empty table returns ENXIO; that is
+// the "nothing to drop" case, not an error, so it is swallowed here. A
+// REGISTER with zero entries is never issued (it would return EFAULT),
+// so shrinking to empty is a pure UNREGISTER.
+func (r *uring) swapTable(unregOpcode, regOpcode int, files []int32, bufs [][]byte) error {
+	if _, _, errno := syscall.Syscall6(sysIoUringRegister, uintptr(r.ringFd),
+		uintptr(unregOpcode), 0, 0, 0, 0); errno != 0 && errno != syscall.ENXIO {
+		return errno
+	}
+	if len(files) > 0 {
+		return r.registerSyscall(regOpcode, files)
+	}
+	if len(bufs) > 0 {
+		return r.registerSyscall(regOpcode, bufs)
+	}
+	return nil
+}
+
+// registerSyscall issues a full io_uring_register. Callers hold
+// producerMu (registration serialises with SQE production).
 func (r *uring) registerSyscall(opcode int, arg any) error {
 	var ptr unsafe.Pointer
 	var n uint32
