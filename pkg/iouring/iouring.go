@@ -67,6 +67,13 @@ type Ring interface {
 	// into a single kernel submission. It does not block beyond the
 	// bounded queue and allocates nothing on the hot path.
 	Submit(ops []Op) error
+	// SubmitSingle submits one op. Semantics are exactly
+	// Submit([]Op{op}) — the same empty-buffer completion, the same
+	// closed-ring handling, and the same outstanding accounting. It
+	// exists so a caller that already has one op in hand does not need
+	// to wrap it in a slice (avoiding that per-I/O allocation); it is
+	// not required to be faster than Submit.
+	SubmitSingle(op Op) error
 	// RegisterFile associates an open file with the ring so its fd can
 	// be used in Op.Fd (fixed-file registration on Linux; keeping the
 	// *os.File alive elsewhere). On Linux the fd is added to the

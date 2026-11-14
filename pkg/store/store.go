@@ -220,6 +220,10 @@ type Store struct {
 	ring  iouring.Ring
 	arena *ringArena // registered-buffer arena (nil = plain ops)
 
+	// ioComps is the pooled ring-completion set (nil unless a ring is
+	// configured; see asyncio.go).
+	ioComps *ioCompPool
+
 	syncPasses atomic.Int64 // fsync passes performed (Sync + batches), for stats/tests
 
 	// Atomic-write state: device geometry detected at Open (0 = no
@@ -277,6 +281,9 @@ func New(dir string, opts Options) (*Store, error) {
 			return nil, err
 		}
 		s.jrn = js
+		// Seed the pooled encode buffer so the 4 KiB hot path never
+		// regrows it; larger records grow it on demand.
+		js.encodeBuf = make([]byte, 0, nextPow2(jrFixed+4096))
 		s.startApplier(js)
 	} else if opts.Intent {
 		// The intent log must recover before the meta index and before
@@ -329,6 +336,12 @@ func New(dir string, opts Options) (*Store, error) {
 			opts.Logf("store: async ring unavailable (%v): using plain pread/pwrite", err)
 		} else {
 			s.ring = ring
+			// Pool completions for the ring's concurrent in-flight
+			// ops. AsyncRing is both the ring depth and an upper
+			// bound on concurrent ringIO callers, so it is the
+			// natural pool size; a caller beyond the pool blocks on
+			// borrowComp (backpressure) rather than allocating.
+			s.ioComps = newIOCompPool(opts.AsyncRing)
 			if opts.RingArenaSlots > 0 {
 				if err := s.initRingArena(ring); err != nil {
 					opts.Logf("store: ring arena unavailable (%v): ring uses plain buffers", err)

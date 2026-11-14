@@ -92,15 +92,28 @@ type journalRec struct {
 	sparse bool   // zeroes requested sparseness
 }
 
-// encodeJournal builds a record payload from the fixed header + data.
-func encodeJournal(typ uint8, oid object.OID, off uint64, length uint32, data []byte) []byte {
-	buf := make([]byte, jrFixed+len(data))
-	buf[0] = typ
-	binary.BigEndian.PutUint64(buf[1:9], uint64(oid))
-	binary.BigEndian.PutUint64(buf[9:17], off)
-	binary.BigEndian.PutUint32(buf[17:21], length)
-	copy(buf[jrFixed:], data)
-	return buf
+// encodeJournalInto fills buf (which must have cap >= jrFixed+len(data))
+// with the record payload and returns the payload as buf[:jrFixed+len(data)].
+// The returned slice aliases buf, which the caller must not reuse until the
+// consumer has copied the payload (Journal.Append does).
+func encodeJournalInto(typ uint8, oid object.OID, off uint64, length uint32, data []byte, buf []byte) []byte {
+	p := buf[:jrFixed+len(data)]
+	p[0] = typ
+	binary.BigEndian.PutUint64(p[1:9], uint64(oid))
+	binary.BigEndian.PutUint64(p[9:17], off)
+	binary.BigEndian.PutUint32(p[17:21], length)
+	copy(p[jrFixed:], data)
+	return p
+}
+
+// nextPow2 is the smallest power of two >= n (n>0). Sizing the pooled
+// encode buffer to the next power of two keeps amortized regrowth O(1).
+func nextPow2(n int) int {
+	p := 1
+	for p < n {
+		p <<= 1
+	}
+	return p
 }
 
 // encodeRemove builds the checkpoint marker for a deleted object.
@@ -185,6 +198,13 @@ type journalState struct {
 	// the log must stay ahead of the objects, and the goroutine must
 	// stop touching the (temporary) data directory.
 	noDrain bool
+
+	// encodeBuf (guarded by mu): pooled scratch buffer for
+	// encodeJournalInto. journalAppend builds the payload into it under
+	// the lock and hands it to Journal.Append, which copies it into the
+	// writer (never retaining the slice), so one buffer serves every
+	// record on this state. Reused, never reallocated: it only grows.
+	encodeBuf []byte
 
 	appliedRecs atomic.Int64 // stats: records flattened into objects
 	truncations atomic.Int64 // stats: log truncations
@@ -330,12 +350,22 @@ func (s *Store) journalAppend(rec *journalRec) error {
 			typ = jrZeroSpa
 		}
 	}
-	var payload []byte
+	var data []byte
+	var length uint32
 	if typ == jrWrite {
-		payload = encodeJournal(typ, rec.oid, rec.off, uint32(len(rec.data)), rec.data)
+		data = rec.data
+		length = uint32(len(data))
 	} else {
-		payload = encodeJournal(typ, rec.oid, rec.off, uint32(rec.n), nil)
+		length = uint32(rec.n)
 	}
+	// Reuse the pooled scratch buffer: it is built into under js.mu and
+	// consumed by Append, which copies it into the writer, so it can be
+	// handed back to the next record.
+	need := jrFixed + len(data)
+	if cap(js.encodeBuf) < need {
+		js.encodeBuf = make([]byte, 0, nextPow2(need))
+	}
+	payload := encodeJournalInto(typ, rec.oid, rec.off, length, data, js.encodeBuf)
 	seq, err := js.j.Append(payload)
 	if err != nil {
 		js.mu.Unlock()

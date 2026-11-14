@@ -2,11 +2,12 @@ package store
 
 import (
 	"io"
+	"sync"
 
 	"github.com/unistack-org/storage/pkg/iouring"
 )
 
-// ringIO runs one pread/pwrite through the async ring and blocks for the
+// ringIO runs one pread/pwrite through the async I/O ring and blocks for the
 // completion. The result is byte-identical to the plain os.File calls:
 // a short transfer is reported as (n, io.EOF) for reads, errno as the
 // error (ENOSPC mapped to ErrNoSpace by the caller's classifier).
@@ -20,17 +21,20 @@ import (
 // write's data is copied in. Buffers larger than a slot take the
 // plain path.
 //
-// The stack-allocated completion is passed to the ring by pointer; the
-// ring contract guarantees Done fires exactly once, so after it the
-// stack frame is safe to unwind (the worker never touches it again) —
-// the slot is released exactly there, before this frame unwinds.
+// The per-op completion and []Op wrap are pooled (ioComp) and submitted
+// via SubmitSingle (no per-op slice), so the steady-state I/O performs no
+// per-op heap allocation: the completion and its callback are allocated
+// once at pool construction, and SubmitSingle copies the already-bound
+// callback pointer.
 func (s *Store) ringIO(e *entry, p []byte, off int64, write bool) (int, error) {
-	compl := &ringCompletion{signal: make(chan struct{}, 1)}
+	c := s.borrowComp()
+	defer s.returnComp(c)
+	c.wg.Add(1)
 	op := iouring.Op{
 		Fd:    e.fd,
 		Off:   off,
 		Write: write,
-		Done:  compl.done,
+		Done:  c.done,
 	}
 	if a := s.arena; a != nil && len(p) <= a.ar.Size() {
 		i, slot := a.acquire()
@@ -43,16 +47,35 @@ func (s *Store) ringIO(e *entry, p []byte, off int64, write bool) (int, error) {
 	} else {
 		op.Buf = p
 	}
-	if err := s.ring.Submit([]iouring.Op{op}); err != nil {
-		return 0, err
+	// SubmitSingle calls `done` (0, err) on ALL paths — including a
+	// synchronous ErrClosed rejection — so the comp is always resolved by
+	// the ring; we just wait, then surface the submit error if any.
+	submitErr := s.ring.SubmitSingle(op)
+	c.wg.Wait()
+	if submitErr != nil {
+		return 0, submitErr
 	}
-	<-compl.signal
-	n, err := compl.n, compl.err
-	if err == nil && !write && s.arena != nil && op.BufIndex != 0 {
+	return finishRing(c.n, c.err, p, write, s.arena != nil && op.BufIndex != 0, op.Buf)
+}
+
+// borrowComp / returnComp hand a pooled completion out and back. The free
+// set is a buffered channel — the same reuse idiom as ringArena.free.
+func (s *Store) borrowComp() *ioComp {
+	return <-s.ioComps.free
+}
+
+func (s *Store) returnComp(c *ioComp) {
+	s.ioComps.free <- c
+}
+
+// finishRing applies the shared post-completion semantics to a completed op:
+// arena-slot copy-out, short-read -> io.EOF, and ENOSPC -> ErrNoSpace.
+func finishRing(n int, err error, p []byte, write, viaArena bool, slot []byte) (int, error) {
+	if err == nil && !write && viaArena {
 		if n > len(p) {
 			n = len(p) // slot-aligned completion; the caller asked for len(p)
 		}
-		copy(p, op.Buf[:n])
+		copy(p, slot[:n])
 	}
 	if n == 0 && err == nil && !write && len(p) > 0 {
 		// A ring completion with zero bytes is a short read at EOF;
@@ -65,13 +88,44 @@ func (s *Store) ringIO(e *entry, p []byte, off int64, write bool) (int, error) {
 	return n, err
 }
 
-type ringCompletion struct {
-	n      int
-	err    error
-	signal chan struct{}
+// ioComp is a pooled ring completion. Its `done`
+// callback is bound ONCE at pool construction, not per I/O: `op.Done =
+// c.done` then copies a pre-existing func pointer, so a steady-state op
+// that reports into a pooled completion allocates nothing. Each comp is
+// checked out for the lifetime of one in-flight op and returned
+// afterwards, so no completion (or its callback) is created on the
+// steady-state I/O path.
+//
+// INVARIANT: the ring's Submit/SubmitSingle contract is that `done` fires
+// exactly once on every submission path, including a synchronous ErrClosed
+// rejection (via DoneGo on a fresh goroutine). ringIO relies on that:
+// it never balances the WaitGroup itself, it only waits. A double `Done`
+// (e.g. manually balancing on the submit-error path) would panic.
+type ioComp struct {
+	wg   sync.WaitGroup
+	n    int
+	err  error
+	done func(int, error) // bound once in newIOCompPool
 }
 
-func (c *ringCompletion) done(n int, err error) {
-	c.n, c.err = n, err
-	c.signal <- struct{}{}
+// ioCompPool hands out ioComp instances via a buffered free channel — the
+// same reuse idiom as ringArena.free (arena.go).
+type ioCompPool struct {
+	free chan *ioComp
+}
+
+// newIOCompPool builds n completions. n should be at least the expected
+// number of concurrent in-flight ringIO calls; a caller that finds the free
+// set empty blocks on borrowComp (backpressure) rather than allocating.
+func newIOCompPool(n int) *ioCompPool {
+	p := &ioCompPool{free: make(chan *ioComp, n)}
+	for i := 0; i < n; i++ {
+		c := &ioComp{}
+		c.done = func(n int, e error) {
+			c.n, c.err = n, e
+			c.wg.Done()
+		}
+		p.free <- c
+	}
+	return p
 }

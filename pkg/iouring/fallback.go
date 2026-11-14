@@ -136,6 +136,22 @@ func (r *fallbackRing) Submit(ops []Op) error {
 	return nil
 }
 
+// SubmitSingle is Submit of one op. The fallback enqueues every op
+// (empty buffers included) onto the worker channel, so it does not get
+// the synchronous empty-buffer completion of the uring path.
+func (r *fallbackRing) SubmitSingle(op Op) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.closed {
+		if op.Done != nil {
+			go op.Done(0, ErrClosed)
+		}
+		return ErrClosed
+	}
+	r.work <- op
+	return nil
+}
+
 func (r *fallbackRing) Close() error {
 	r.mu.Lock()
 	if r.closed {

@@ -273,15 +273,16 @@ func regionMatches(p string, off int64, length uint32, want uint32) (bool, error
 // CRC at oid/off. syncIt makes the record durable immediately (flush /
 // sync modes); in CommitNone the caller's Sync() covers it.
 func (is *intentState) appendIntent(oid object.OID, off int64, length int, want uint32, syncIt bool) error {
-	rec := make([]byte, intentRecSize)
-	rec[0] = 0
+	// The record is 24 B: it fits the stack and AppendPacked copies it
+	// out, so the hot write path needs no heap allocation for it.
+	var rec [intentRecSize]byte
 	binary.BigEndian.PutUint64(rec[4:12], uint64(oid))
 	binary.BigEndian.PutUint32(rec[12:16], uint32(off))
 	binary.BigEndian.PutUint32(rec[16:20], uint32(length))
 	binary.BigEndian.PutUint32(rec[20:24], want)
 
 	is.recorded.Lock()
-	_, err := is.j.AppendPacked(rec)
+	_, err := is.j.AppendPacked(rec[:])
 	if err == nil && syncIt {
 		err = is.j.Sync()
 	}
@@ -300,12 +301,12 @@ func (is *intentState) appendIntent(oid object.OID, off int64, length int, want 
 // durability of the marker is not required (recovery re-verifies an
 // uncommitted intent and a CRC match is free).
 func (is *intentState) appendCommit(oid object.OID, off int64) {
-	rec := make([]byte, intentRecSize)
+	var rec [intentRecSize]byte // stack: AppendPacked copies it out
 	rec[0] = intentFlagCommit
 	binary.BigEndian.PutUint64(rec[4:12], uint64(oid))
 	binary.BigEndian.PutUint32(rec[12:16], uint32(off))
 	is.recorded.Lock()
-	_, _ = is.j.AppendPacked(rec) // best effort by design
+	_, _ = is.j.AppendPacked(rec[:]) // best effort by design
 	is.recorded.Unlock()
 	is.records.Add(1)
 }
@@ -338,11 +339,11 @@ func (is *intentState) closeClean() error {
 // would make recovery chase regions of a gone object and report a false
 // mismatch). CommitNone keeps it buffered: Sync covers it.
 func (is *intentState) appendDelete(oid object.OID, syncIt bool) error {
-	rec := make([]byte, intentRecSize)
+	var rec [intentRecSize]byte // stack: AppendPacked copies it out
 	rec[0] = intentFlagDelete
 	binary.BigEndian.PutUint64(rec[4:12], uint64(oid))
 	is.recorded.Lock()
-	_, err := is.j.AppendPacked(rec)
+	_, err := is.j.AppendPacked(rec[:])
 	if err == nil && syncIt {
 		err = is.j.Sync()
 	}

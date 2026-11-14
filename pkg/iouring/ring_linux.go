@@ -495,6 +495,21 @@ func (r *uring) completionLoop() {
 	}
 }
 
+// enqueueOp adds a single op to the ring. It assumes submitMu is held
+// and the closed check has been done by the caller. An op with an empty
+// buffer is completed synchronously (no I/O to issue).
+func (r *uring) enqueueOp(op Op) {
+	if len(op.Buf) == 0 {
+		op.DoneGo(nil)
+		return
+	}
+	// Counted before enqueue: from here until the CQE (or kick's
+	// reclaim) the op is outstanding and completionLoop must stay
+	// alive to resolve it.
+	r.outstanding.Add(1)
+	r.work <- op
+}
+
 // Submit queues ops to the ring. Senders serialise against Close on
 // submitMu: once Close has closed the work channel, no Send can slip
 // in behind it, so every op that reaches the channel is drained and
@@ -509,16 +524,22 @@ func (r *uring) Submit(ops []Op) error {
 		return ErrClosed
 	}
 	for _, op := range ops {
-		if len(op.Buf) == 0 {
-			op.DoneGo(nil)
-			continue
-		}
-		// Counted before enqueue: from here until the CQE (or kick's
-		// reclaim) the op is outstanding and completionLoop must stay
-		// alive to resolve it.
-		r.outstanding.Add(1)
-		r.work <- op
+		r.enqueueOp(op)
 	}
+	r.submitMu.Unlock()
+	return nil
+}
+
+// SubmitSingle is Submit of one op: same empty-buffer and closed-ring
+// handling, no per-I/O []Op wrap.
+func (r *uring) SubmitSingle(op Op) error {
+	r.submitMu.Lock()
+	if r.closed.Load() {
+		r.submitMu.Unlock()
+		op.DoneGo(ErrClosed)
+		return ErrClosed
+	}
+	r.enqueueOp(op)
 	r.submitMu.Unlock()
 	return nil
 }
