@@ -176,7 +176,7 @@ func main() {
 	vduseReadAheadWindow := flag.Int("vduse-readahead-window", 0, "with -vduse-readahead: prefetch window bytes per queue (default 262144 = 256 KiB)")
 	vduseQueues := flag.Int("vduse-queues", 1, "with -vduse: virtqueues per device (VIRTIO_BLK_F_MQ multi-queue); 1 = single queue (default)")
 	storeMode := flag.Bool("store", false, "treat export paths as object-store directories (phase-1 data path) instead of sparse files")
-	direct := flag.Bool("direct", false, "with -store: request O_DIRECT on object files")
+	direct := flag.Bool("direct", false, "request O_DIRECT (Linux) on object files: with -store for export backends, and for hosted -data-dir OSDs in a cluster (data I/O goes through the store's alignment-safe direct path, and the async ring is disabled for those stores)")
 	prealloc := flag.Bool("preallocate", false, "with -store: fallocate each new object to full size")
 	asyncRing := flag.Int("async-ring", 0, "with -store: route object reads/writes through the async I/O ring (io_uring on Linux, worker-pool fallback elsewhere); value = ring depth, e.g. 128; 0 = plain pread/pwrite")
 	ringPinCPU := flag.String("ring-pin-cpu", "", "with -async-ring: pin the ring's worker threads to this CPU set (Linux cpulist syntax, e.g. \"2\" or \"2-3\"); empty = scheduler default")
@@ -633,6 +633,7 @@ func main() {
 			creates:       creates,
 			qosClasses:    qosClasses,
 			osdQoS:        *osdQoS,
+			direct:        *direct,
 			commit:        commitMode,
 			fsyncBatch:    *fsyncBatch,
 			intentLog:     *intentLog,
@@ -942,6 +943,7 @@ type clusterParams struct {
 	creates       []string
 	qosClasses    []string         // -qos-class name=rates registrations
 	osdQoS        string           // per-OSD aggregate rates spec ("" = none)
+	direct        bool             // O_DIRECT on hosted-OSD object files
 	commit        store.CommitMode // OSD commit mode
 	fsyncBatch    time.Duration    // OSD fsync coalescing window
 	intentLog     bool             // write intent log (ideas §2.1)
@@ -1043,6 +1045,7 @@ func clusterBoot(ctx context.Context, p clusterParams) error {
 			DeviceID:       p.osdDevice[id],
 			Meta:           ms,
 			Aggregate:      aggSpec.pair(),
+			Direct:         p.direct,
 			CommitMode:     p.commit,
 			FsyncBatch:     p.fsyncBatch,
 			Intent:         p.intentLog,

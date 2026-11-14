@@ -475,7 +475,7 @@ func (s *Store) applyOne(r *journalRec) error {
 		e.dirty.Add(1)
 		return nil
 	}
-	if _, err := e.f.WriteAt(r.data, int64(r.off)); err != nil {
+	if _, err := s.directWrite(e.f, r.data, int64(r.off)); err != nil {
 		if isNoSpace(err) {
 			return ErrNoSpace
 		}

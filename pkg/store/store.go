@@ -216,6 +216,12 @@ type Store struct {
 	// see intent.go).
 	intent *intentState
 
+	// direct is true when the data fd is O_DIRECT (opts.Direct on a
+	// platform that imposes the 512-byte alignment contract; see
+	// direct.go). In direct mode all data I/O goes through the
+	// alignment-safe helpers and the async ring is not used.
+	direct bool
+
 	// ring is the async I/O ring (nil = plain pread/pwrite path).
 	ring  iouring.Ring
 	arena *ringArena // registered-buffer arena (nil = plain ops)
@@ -273,7 +279,13 @@ func New(dir string, opts Options) (*Store, error) {
 	}
 	s := &Store{
 		dir: dir, opts: opts, files: map[object.OID]*entry{},
-		meta: map[object.OID]objMeta{},
+		meta:   map[object.OID]objMeta{},
+		direct: opts.Direct && directPlatformOK,
+	}
+	if s.direct {
+		opts.Logf("store: O_DIRECT active: data I/O routed through the alignment-safe path, async ring disabled")
+	} else if opts.Direct {
+		opts.Logf("store: -direct on this platform opens data files without the page cache, but the platform's direct open has no 512-byte alignment contract: plain pread/pwrite, no bounce")
 	}
 	if opts.CommitMode == CommitJournal {
 		js, err := openJournal(dir, opts.Logf)
@@ -315,7 +327,7 @@ func New(dir string, opts Options) (*Store, error) {
 			opts.Logf("store: -atomic-writes requested, but the device under %s publishes no atomic write unit: plain writes", s.dir)
 		}
 	}
-	if opts.AsyncRing > 0 && s.jrn == nil {
+	if opts.AsyncRing > 0 && s.jrn == nil && !s.direct {
 		pin := func() {}
 		if opts.RingPinCPUs != "" {
 			cpus := opts.RingPinCPUs
@@ -580,7 +592,7 @@ func (s *Store) ReadAt(oid object.OID, p []byte, off int64) (int, error) {
 	if s.ring != nil {
 		return s.ringIO(e, p, off, false)
 	}
-	return e.f.ReadAt(p, off)
+	return s.directRead(e.f, p, off)
 }
 
 // journalReadAt serves a read in journal mode: overlay the staged
@@ -594,14 +606,14 @@ func (s *Store) journalReadAt(oid object.OID, p []byte, off int64) (int, error) 
 		if err != nil {
 			return 0, err
 		}
-		return e.f.ReadAt(p, off)
+		return s.directRead(e.f, p, off)
 	}
 	// Start from the file contents (a missing object is all zeroes),
 	// then stamp the overlay on top in seq order.
 	e, err := s.open(oid, false)
 	switch {
 	case err == nil:
-		if _, err := e.f.ReadAt(p, off); err != nil && !errors.Is(err, io.EOF) {
+		if _, err := s.directRead(e.f, p, off); err != nil && !errors.Is(err, io.EOF) {
 			return 0, err
 		}
 	case errors.Is(err, ErrNoSuchObject):
@@ -650,7 +662,7 @@ func (s *Store) WriteAt(oid object.OID, p []byte, off int64) (int, error) {
 	} else if s.ring != nil {
 		n, err = s.ringIO(e, p, off, true)
 	} else {
-		n, err = e.f.WriteAt(p, off)
+		n, err = s.directWrite(e.f, p, off)
 		if isNoSpace(err) {
 			err = ErrNoSpace
 		}
@@ -795,7 +807,7 @@ func (s *Store) zeroFill(oid object.OID, e *entry, off, n uint64) error {
 		if n-written < ch {
 			ch = n - written
 		}
-		if _, err := e.f.WriteAt(buf[:ch], int64(off+written)); err != nil {
+		if _, err := s.directWrite(e.f, buf[:ch], int64(off+written)); err != nil {
 			if isNoSpace(err) {
 				err = ErrNoSpace
 			}

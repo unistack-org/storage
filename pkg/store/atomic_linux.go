@@ -26,7 +26,9 @@ func (s *Store) atomicWrite(e *entry, p []byte, off int64) (int, error) {
 	// bounce the request through a page-aligned scratch buffer.
 	buf, err := alignedScratch(len(p))
 	if err != nil {
-		return e.f.WriteAt(p, off)
+		// On an O_DIRECT fd the raw heap buffer is unaligned; route
+		// through the alignment-safe helper (a passthrough otherwise).
+		return s.directWrite(e.f, p, off)
 	}
 	once := true
 	copy(buf, p)
@@ -43,9 +45,10 @@ func (s *Store) atomicWrite(e *entry, p []byte, off int64) (int, error) {
 		if errno != 0 {
 			if errno == syscall.EINVAL && written == 0 && once {
 				// Kernel/device refuses RWF_ATOMIC: latch the
-				// failure (stop paying the bounce) and write plain.
+				// failure (stop paying the bounce) and write plain
+				// through the alignment-safe helper.
 				s.atomicFailed.Store(true)
-				return e.f.WriteAt(p, off)
+				return s.directWrite(e.f, p, off)
 			}
 			return written, errno
 		}
